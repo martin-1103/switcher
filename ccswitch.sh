@@ -6,7 +6,7 @@
 set -euo pipefail
 
 # Version
-readonly VERSION="0.3.1"
+readonly VERSION="0.3.2"
 
 # Configuration
 readonly BACKUP_DIR="$HOME/.claude-switch-backup"
@@ -19,6 +19,7 @@ readonly LOCK_DIR="$BACKUP_DIR/.switch.lock"
 # check re-fetches from the usage API so headless (`claude -p`) runs aren't stale.
 # Override per-install with .rateLimit.cacheTtl in sequence.json.
 readonly DEFAULT_CACHE_TTL=60
+readonly DEFAULT_COORD_LEASE_TTL=150
 
 # Global flags (set during argument parsing)
 DRY_RUN=false
@@ -187,6 +188,253 @@ check_dependencies() {
         echo "Install with: apt install jq (Linux) or brew install jq (macOS)"
         exit 1
     fi
+}
+
+coord_enabled() {
+    [[ -f "$SEQUENCE_FILE" ]] || return 1
+    [[ "$(jq -r '.coordination.mode // empty' "$SEQUENCE_FILE" 2>/dev/null || true)" != "" ]]
+}
+
+coord_config_value() {
+    local path="$1"
+    [[ -f "$SEQUENCE_FILE" ]] || return 1
+    jq -r "$path // empty" "$SEQUENCE_FILE" 2>/dev/null
+}
+
+coord_mode() {
+    coord_config_value '.coordination.mode'
+}
+
+coord_server_id() {
+    local configured
+    configured=$(coord_config_value '.coordination.serverId' 2>/dev/null || true)
+    if [[ -n "$configured" ]]; then
+        printf '%s\n' "$configured"
+    else
+        hostname 2>/dev/null || echo "unknown-server"
+    fi
+}
+
+coord_lease_ttl() {
+    local ttl
+    ttl=$(coord_config_value '.coordination.leaseTtlSeconds' 2>/dev/null || true)
+    if [[ "$ttl" =~ ^[0-9]+$ ]] && [[ "$ttl" -gt 0 ]]; then
+        printf '%s\n' "$ttl"
+    else
+        printf '%s\n' "$DEFAULT_COORD_LEASE_TTL"
+    fi
+}
+
+coord_http_ready() {
+    [[ "$(coord_mode)" == "http" ]] || return 1
+    command -v curl >/dev/null 2>&1 || return 1
+    local url token
+    url=$(coord_config_value '.coordination.http.url')
+    token=$(coord_config_value '.coordination.http.token')
+    [[ -n "$url" && -n "$token" ]]
+}
+
+coord_http_request() {
+    local method="$1"
+    local path="$2"
+    local body="${3:-}"
+    coord_http_ready || return 1
+    local url token response http_code payload
+    url="$(coord_config_value '.coordination.http.url')$path"
+    token=$(coord_config_value '.coordination.http.token')
+
+    if [[ -n "$body" ]]; then
+        response=$(curl -sS -w "\n%{http_code}" \
+            -X "$method" \
+            -H "Authorization: Bearer $token" \
+            -H "Content-Type: application/json" \
+            --data "$body" \
+            "$url" 2>/dev/null) || return 1
+    else
+        response=$(curl -sS -w "\n%{http_code}" \
+            -X "$method" \
+            -H "Authorization: Bearer $token" \
+            "$url" 2>/dev/null) || return 1
+    fi
+
+    http_code=$(echo "$response" | tail -n1)
+    payload=$(echo "$response" | sed '$d')
+    [[ "$http_code" =~ ^2 ]] || return 1
+    printf '%s\n' "$payload"
+}
+
+coord_mysql_ready() {
+    [[ "$(coord_mode)" == "mysql" ]] || return 1
+    command -v mysql >/dev/null 2>&1 || return 1
+    local host port db user password
+    host=$(coord_config_value '.coordination.mysql.host')
+    port=$(coord_config_value '.coordination.mysql.port')
+    db=$(coord_config_value '.coordination.mysql.database')
+    user=$(coord_config_value '.coordination.mysql.user')
+    password=$(coord_config_value '.coordination.mysql.password')
+    [[ -n "$host" && -n "$port" && -n "$db" && -n "$user" && -n "$password" ]]
+}
+
+coord_mysql_exec() {
+    local sql="$1"
+    coord_mysql_ready || return 1
+    local host port db user password
+    host=$(coord_config_value '.coordination.mysql.host')
+    port=$(coord_config_value '.coordination.mysql.port')
+    db=$(coord_config_value '.coordination.mysql.database')
+    user=$(coord_config_value '.coordination.mysql.user')
+    password=$(coord_config_value '.coordination.mysql.password')
+    MYSQL_PWD="$password" mysql --batch --raw --skip-column-names \
+        -h "$host" -P "$port" -u "$user" "$db" -e "$sql"
+}
+
+coord_mysql_exec_no_db() {
+    local sql="$1"
+    coord_mysql_ready || return 1
+    local host port user password
+    host=$(coord_config_value '.coordination.mysql.host')
+    port=$(coord_config_value '.coordination.mysql.port')
+    user=$(coord_config_value '.coordination.mysql.user')
+    password=$(coord_config_value '.coordination.mysql.password')
+    MYSQL_PWD="$password" mysql --batch --raw --skip-column-names \
+        -h "$host" -P "$port" -u "$user" -e "$sql"
+}
+
+sql_escape() {
+    printf '%s' "$1" | sed "s/'/''/g"
+}
+
+coord_ensure_schema() {
+    coord_mysql_ready || return 1
+    local db
+    db=$(coord_config_value '.coordination.mysql.database')
+    coord_mysql_exec_no_db "CREATE DATABASE IF NOT EXISTS \`$db\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" >/dev/null
+    coord_mysql_exec "
+CREATE TABLE IF NOT EXISTS account_leases (
+    email VARCHAR(255) NOT NULL PRIMARY KEY,
+    server_id VARCHAR(191) NOT NULL,
+    account_number INT NULL,
+    account_type VARCHAR(32) NULL,
+    active_limit INT NULL,
+    five_hour INT NULL,
+    seven_day INT NULL,
+    reset_at_5h VARCHAR(64) NULL,
+    reset_at_7d VARCHAR(64) NULL,
+    observed_at BIGINT NULL,
+    lease_expires_at BIGINT NOT NULL,
+    updated_at BIGINT NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+" >/dev/null
+}
+
+coord_publish_account_state() {
+    local account_num="$1"
+    local email="$2"
+    local account_type five_hour seven_day active_limit reset_at_5h reset_at_7d observed_at
+    account_type=$(jq -r --arg num "$account_num" '.accounts[$num].accountType // ""' "$SEQUENCE_FILE" 2>/dev/null || true)
+    five_hour=$(jq -r --arg num "$account_num" '.accounts[$num].lastKnownUsage.fiveHour // 0' "$SEQUENCE_FILE" 2>/dev/null || echo 0)
+    seven_day=$(jq -r --arg num "$account_num" '.accounts[$num].lastKnownUsage.sevenDay // 0' "$SEQUENCE_FILE" 2>/dev/null || echo 0)
+    active_limit=$(jq -r --arg num "$account_num" '.accounts[$num].lastKnownUsage.activeLimit // 0' "$SEQUENCE_FILE" 2>/dev/null || echo 0)
+    reset_at_5h=$(jq -r --arg num "$account_num" '.accounts[$num].lastKnownUsage.resetAt5h // ""' "$SEQUENCE_FILE" 2>/dev/null || true)
+    reset_at_7d=$(jq -r --arg num "$account_num" '.accounts[$num].lastKnownUsage.resetAt7d // ""' "$SEQUENCE_FILE" 2>/dev/null || true)
+    observed_at=$(jq -r --arg num "$account_num" '.accounts[$num].lastKnownUsage.observedAt // 0' "$SEQUENCE_FILE" 2>/dev/null || echo 0)
+
+    local now lease_expires server_id
+    now=$(date +%s)
+    lease_expires=$((now + $(coord_lease_ttl)))
+    server_id=$(coord_server_id)
+
+    if coord_http_ready; then
+        local payload
+        payload=$(jq -n \
+            --arg email "$email" \
+            --arg serverId "$server_id" \
+            --argjson accountNumber "${account_num:-0}" \
+            --arg accountType "$account_type" \
+            --argjson activeLimit "${active_limit:-0}" \
+            --argjson fiveHour "${five_hour:-0}" \
+            --argjson sevenDay "${seven_day:-0}" \
+            --arg resetAt5h "$reset_at_5h" \
+            --arg resetAt7d "$reset_at_7d" \
+            --argjson observedAt "${observed_at:-0}" \
+            --argjson leaseTtlSeconds "$(coord_lease_ttl)" \
+            '
+            {
+              email: $email,
+              serverId: $serverId,
+              accountNumber: $accountNumber,
+              accountType: (if $accountType == "" then null else $accountType end),
+              activeLimit: $activeLimit,
+              fiveHour: $fiveHour,
+              sevenDay: $sevenDay,
+              resetAt5h: (if $resetAt5h == "" then null else $resetAt5h end),
+              resetAt7d: (if $resetAt7d == "" then null else $resetAt7d end),
+              observedAt: $observedAt,
+              leaseTtlSeconds: $leaseTtlSeconds
+            }
+            ')
+        coord_http_request POST "/v1/leases/claim" "$payload" >/dev/null 2>&1 || true
+        return 0
+    fi
+
+    coord_mysql_ready || return 0
+    coord_ensure_schema >/dev/null 2>&1 || return 0
+    coord_mysql_exec "
+REPLACE INTO account_leases (
+    email, server_id, account_number, account_type,
+    active_limit, five_hour, seven_day,
+    reset_at_5h, reset_at_7d, observed_at,
+    lease_expires_at, updated_at
+) VALUES (
+    '$(sql_escape "$email")',
+    '$(sql_escape "$server_id")',
+    ${account_num:-NULL},
+    $(if [[ -n "$account_type" ]]; then printf "'%s'" "$(sql_escape "$account_type")"; else printf "NULL"; fi),
+    ${active_limit:-0},
+    ${five_hour:-0},
+    ${seven_day:-0},
+    $(if [[ -n "$reset_at_5h" ]]; then printf "'%s'" "$(sql_escape "$reset_at_5h")"; else printf "NULL"; fi),
+    $(if [[ -n "$reset_at_7d" ]]; then printf "'%s'" "$(sql_escape "$reset_at_7d")"; else printf "NULL"; fi),
+    ${observed_at:-0},
+    ${lease_expires},
+    ${now}
+);
+" >/dev/null 2>&1 || true
+}
+
+coord_publish_active_state() {
+    coord_enabled || return 0
+    [[ -f "$SEQUENCE_FILE" ]] || return 0
+    local active_num active_email
+    active_num=$(jq -r '.activeAccountNumber // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
+    [[ -n "$active_num" && "$active_num" != "null" ]] || return 0
+    active_email=$(jq -r --arg num "$active_num" '.accounts[$num].email // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
+    [[ -n "$active_email" ]] || return 0
+    coord_publish_account_state "$active_num" "$active_email"
+}
+
+coord_remote_lease_owner() {
+    local email="$1"
+    if coord_http_ready; then
+        local encoded
+        encoded=$(printf '%s' "$email" | jq -sRr @uri)
+        coord_http_request GET "/v1/leases/owner?email=${encoded}&serverId=$(printf '%s' "$(coord_server_id)" | jq -sRr @uri)" 2>/dev/null \
+            | jq -r '.owner.serverId // empty' 2>/dev/null
+        return 0
+    fi
+
+    coord_mysql_ready || return 1
+    coord_ensure_schema >/dev/null 2>&1 || return 1
+    local server_id
+    server_id=$(coord_server_id)
+    coord_mysql_exec "
+SELECT server_id
+FROM account_leases
+WHERE email = '$(sql_escape "$email")'
+  AND lease_expires_at > UNIX_TIMESTAMP()
+  AND server_id <> '$(sql_escape "$server_id")'
+LIMIT 1;
+" 2>/dev/null | head -n1
 }
 
 # Setup backup directories
@@ -392,6 +640,7 @@ update_account_usage_snapshot() {
 
     [[ -n "$updated" ]] || return 0
     write_json "$SEQUENCE_FILE" "$updated" >/dev/null 2>&1 || true
+    coord_publish_account_state "$account_num" "$email"
 }
 
 iso_to_epoch() {
@@ -588,13 +837,25 @@ cmd_warm_loop() {
 
 account_snapshot_usage() {
     local account_num="$1"
+    local reset_at reset_epoch now_epoch
+    reset_at=$(jq -r --arg num "$account_num" '.accounts[$num].lastKnownUsage.resetAt5h // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
+    if [[ -n "$reset_at" ]]; then
+        reset_epoch=$(iso_to_epoch "$reset_at")
+        now_epoch=$(date +%s)
+        if [[ "$reset_epoch" -gt 0 && "$reset_epoch" -le "$now_epoch" ]]; then
+            echo "0"
+            return
+        fi
+    fi
+
     jq -r --arg num "$account_num" '
-        if ((.accounts[$num].lastKnownUsage.activeLimit // 0) > 0) then
-            (.accounts[$num].lastKnownUsage.activeLimit // 0)
+        (.accounts[$num].lastKnownUsage // {}) as $u |
+        if (($u.activeLimit // 0) > 0) then
+            ($u.activeLimit // 0)
         else
             [
-                (.accounts[$num].lastKnownUsage.fiveHour // 0),
-                (.accounts[$num].lastKnownUsage.sevenDay // 0)
+                ($u.fiveHour // 0),
+                ($u.sevenDay // 0)
             ] | max
         end
     ' "$SEQUENCE_FILE" 2>/dev/null || echo "0"
@@ -610,7 +871,7 @@ emit_group_ladder_candidates() {
     local active_account="$2"
     local entries=()
     local ord=0
-    local num type usage target=""
+    local num type usage target="" email lease_owner
 
     while IFS= read -r num; do
         [[ -n "$num" ]] || continue
@@ -620,6 +881,15 @@ emit_group_ladder_candidates() {
         fi
         type=$(account_group_type "$num")
         if [[ "$type" == "$group" ]]; then
+            email=$(jq -r --arg num "$num" '.accounts[$num].email // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
+            lease_owner=""
+            if [[ -n "$email" ]]; then
+                lease_owner=$(coord_remote_lease_owner "$email" 2>/dev/null || true)
+            fi
+            if [[ -n "$lease_owner" ]]; then
+                ord=$((ord + 1))
+                continue
+            fi
             usage=$(account_snapshot_usage "$num")
             entries+=("${usage}|${ord}|${num}")
         fi
@@ -870,6 +1140,261 @@ init_sequence_file() {
 }'
         write_json "$SEQUENCE_FILE" "$init_content"
     fi
+}
+
+cmd_coord_setup() {
+    local mode="http"
+    local api_url=""
+    local api_token=""
+    local host="127.0.0.1"
+    local port="3306"
+    local database="ccs"
+    local user="ccs"
+    local password=""
+    local server_id=""
+    local lease_ttl="$DEFAULT_COORD_LEASE_TTL"
+    local disable=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --mode)
+                mode="$2"
+                shift 2
+                ;;
+            --api-url)
+                api_url="$2"
+                shift 2
+                ;;
+            --api-token)
+                api_token="$2"
+                shift 2
+                ;;
+            --host)
+                host="$2"
+                shift 2
+                ;;
+            --port)
+                port="$2"
+                shift 2
+                ;;
+            --database)
+                database="$2"
+                shift 2
+                ;;
+            --user)
+                user="$2"
+                shift 2
+                ;;
+            --password)
+                password="$2"
+                shift 2
+                ;;
+            --server-id)
+                server_id="$2"
+                shift 2
+                ;;
+            --lease-ttl)
+                lease_ttl="$2"
+                shift 2
+                ;;
+            --disable)
+                disable=true
+                shift
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    setup_directories
+    init_sequence_file
+
+    if [[ "$disable" == "true" ]]; then
+        local disabled
+        disabled=$(jq '
+            .coordination = {}
+        ' "$SEQUENCE_FILE")
+        write_json "$SEQUENCE_FILE" "$disabled"
+        echo "Coordination disabled."
+        return 0
+    fi
+
+    [[ "$lease_ttl" =~ ^[0-9]+$ ]] || { echo "Error: --lease-ttl must be numeric"; exit 1; }
+    [[ -n "$server_id" ]] || server_id=$(hostname 2>/dev/null || echo "unknown-server")
+
+    local updated
+    if [[ "$mode" == "http" ]]; then
+        [[ -n "$api_url" ]] || { echo "Error: --api-url is required for http mode"; exit 1; }
+        [[ -n "$api_token" ]] || { echo "Error: --api-token is required for http mode"; exit 1; }
+        updated=$(jq \
+            --arg sid "$server_id" \
+            --arg url "$api_url" \
+            --arg token "$api_token" \
+            --argjson ttl "$lease_ttl" \
+            '
+            .coordination = {
+                mode: "http",
+                serverId: $sid,
+                leaseTtlSeconds: $ttl,
+                http: {
+                    url: $url,
+                    token: $token
+                }
+            }
+            ' "$SEQUENCE_FILE")
+        write_json "$SEQUENCE_FILE" "$updated"
+        coord_publish_active_state
+        echo "Coordination enabled."
+        echo "  Mode: http"
+        echo "  Server ID: $server_id"
+        echo "  API: $api_url"
+        echo "  Lease TTL: ${lease_ttl}s"
+        return 0
+    fi
+
+    [[ "$mode" == "mysql" ]] || { echo "Error: --mode must be http or mysql"; exit 1; }
+    [[ -n "$password" ]] || { echo "Error: --password is required for mysql mode"; exit 1; }
+    updated=$(jq \
+        --arg host "$host" \
+        --arg port "$port" \
+        --arg db "$database" \
+        --arg user "$user" \
+        --arg pass "$password" \
+        --arg sid "$server_id" \
+        --argjson ttl "$lease_ttl" \
+        '
+        .coordination = {
+            mode: "mysql",
+            serverId: $sid,
+            leaseTtlSeconds: $ttl,
+            mysql: {
+                host: $host,
+                port: $port,
+                database: $db,
+                user: $user,
+                password: $pass
+            }
+        }
+        ' "$SEQUENCE_FILE")
+    write_json "$SEQUENCE_FILE" "$updated"
+
+    if ! coord_ensure_schema; then
+        echo "Error: failed to initialize coordination schema"
+        exit 1
+    fi
+
+    coord_publish_active_state
+    echo "Coordination enabled."
+    echo "  Mode: mysql"
+    echo "  Server ID: $server_id"
+    echo "  MySQL: ${user}@${host}:${port}/${database}"
+    echo "  Lease TTL: ${lease_ttl}s"
+}
+
+cmd_coord_sync() {
+    if ! coord_enabled; then
+        echo "Coordination not configured."
+        exit 1
+    fi
+    if coord_mysql_ready; then
+        coord_ensure_schema >/dev/null
+    fi
+    coord_publish_active_state
+    echo "Coordination sync complete."
+}
+
+cmd_coord_client_setup() {
+    local api_url=""
+    local api_token=""
+    local server_id=""
+    local threshold="95"
+    local lease_ttl="$DEFAULT_COORD_LEASE_TTL"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --api-url)
+                api_url="$2"
+                shift 2
+                ;;
+            --api-token)
+                api_token="$2"
+                shift 2
+                ;;
+            --server-id)
+                server_id="$2"
+                shift 2
+                ;;
+            --threshold)
+                threshold="$2"
+                shift 2
+                ;;
+            --lease-ttl)
+                lease_ttl="$2"
+                shift 2
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    [[ -n "$api_url" ]] || { echo "Error: --api-url is required"; exit 1; }
+    [[ -n "$api_token" ]] || { echo "Error: --api-token is required"; exit 1; }
+    [[ -n "$server_id" ]] || server_id=$(hostname 2>/dev/null || echo "unknown-server")
+
+    cmd_coord_setup --mode http --api-url "$api_url" --api-token "$api_token" --server-id "$server_id" --lease-ttl "$lease_ttl"
+    cmd_rate_setup --threshold "$threshold"
+    cmd_statusline_setup
+
+    echo "Client setup complete."
+    echo "  Coordinator: $api_url"
+    echo "  Server ID:   $server_id"
+    echo "  Threshold:   ${threshold}%"
+}
+
+cmd_coord_token() {
+    local token=""
+
+    if [[ -f "$SEQUENCE_FILE" ]]; then
+        token=$(jq -r '.coordination.http.token // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
+    fi
+
+    if [[ -z "$token" && -f /etc/default/ccs-coordinator ]]; then
+        token=$(sed -n 's/^CCS_COORD_TOKEN=//p' /etc/default/ccs-coordinator | head -n1)
+    fi
+
+    if [[ -z "$token" ]]; then
+        echo "Error: coordination token not found"
+        exit 1
+    fi
+
+    printf '%s\n' "$token"
+}
+
+cmd_coord_client_command() {
+    local api_url=""
+    local server_id='$(hostname)'
+    local threshold="95"
+    local token=""
+
+    if [[ -f "$SEQUENCE_FILE" ]]; then
+        api_url=$(jq -r '.coordination.http.url // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
+    fi
+    [[ -n "$api_url" ]] || api_url="https://ccs.dev.gass.web.id"
+
+    token=$(cmd_coord_token 2>/dev/null) || {
+        echo "Error: coordination token not found"
+        exit 1
+    }
+
+    cat <<EOF
+ccs --allow-root coord-client-setup \\
+  --api-url ${api_url} \\
+  --api-token '${token}' \\
+  --server-id "${server_id}" \\
+  --threshold ${threshold}
+EOF
 }
 
 # Get next account number
@@ -1137,6 +1662,9 @@ cmd_status() {
     fi
     if [[ -n "$account_type" ]]; then
         echo "Account type:    $account_type"
+    fi
+    if coord_enabled; then
+        echo "Coordination:    $(coord_mode) ($(coord_server_id))"
     fi
 
     # Last switch timestamp
@@ -1900,6 +2428,8 @@ perform_switch() {
         rm -f "$live_cache" 2>/dev/null || true
     fi
 
+    coord_publish_account_state "$target_account" "$target_email"
+
     # Switch is committed; release the lock before any interactive display/restart
     # so we never hold it while waiting on the user.
     release_switch_lock
@@ -2472,6 +3002,11 @@ show_usage() {
     echo "  statusline-setup --disable       Remove the ccs statusline"
     echo "  warm-check                       Refresh all accounts, ping just-reset 5h windows once"
     echo "  warm-loop                        Run warm-check every 60s"
+    echo "  coord-setup                      Configure HTTP/MySQL coordination"
+    echo "  coord-client-setup               One-command client setup for other servers"
+    echo "  coord-client-command             Print copy-paste command for other servers"
+    echo "  coord-token                      Print coordinator API token"
+    echo "  coord-sync                       Publish current active lease to coordinator"
     echo ""
     echo "Diagnostics:"
     echo "  check                            Verify backup integrity (JSON, permissions, keychain)"
@@ -2595,6 +3130,24 @@ main() {
         warm-loop)
             shift
             cmd_warm_loop "$@"
+            ;;
+        coord-setup)
+            shift
+            cmd_coord_setup "$@"
+            ;;
+        coord-client-setup)
+            shift
+            cmd_coord_client_setup "$@"
+            ;;
+        coord-client-command)
+            cmd_coord_client_command
+            ;;
+        coord-token)
+            cmd_coord_token
+            ;;
+        coord-sync)
+            shift
+            cmd_coord_sync "$@"
             ;;
         check|--check)
             cmd_check

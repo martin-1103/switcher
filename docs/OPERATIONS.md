@@ -40,6 +40,25 @@ ccs warm-check
 ccs warm-loop
 ```
 
+## Multi-server client setup
+
+For another server that should join same coordinator:
+
+```bash
+ccs --allow-root coord-client-setup \
+  --api-url https://ccs.dev.gass.web.id \
+  --api-token 'YOUR_SHARED_TOKEN' \
+  --server-id "$(hostname)" \
+  --threshold 95
+```
+
+Then verify:
+
+```bash
+ccs status
+ccs coord-sync
+```
+
 Notes:
 
 - `warm-check` only trusts the active account

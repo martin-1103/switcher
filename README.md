@@ -199,6 +199,57 @@ Current meaning:
 
 This is a lightweight scheduler. It does **not** ping Claude every minute. It only checks state every minute.
 
+## Multi-server Setup
+
+If multiple servers share the same Claude accounts, use the HTTP coordinator.
+
+### Coordinator server
+
+This server already exposes:
+
+- coordinator API:
+  - `https://ccs.dev.gass.web.id`
+- internal service:
+  - `ccs-coordinator`
+- internal port:
+  - `19090`
+
+The public endpoint is fronted by reverse proxy, so other servers should use the HTTPS domain, not the raw port.
+
+### Other servers: 3 steps
+
+1. install `ccs`
+2. add all Claude accounts with `ccs add`
+3. run one setup command:
+
+```bash
+ccs --allow-root coord-client-setup \
+  --api-url https://ccs.dev.gass.web.id \
+  --api-token 'YOUR_SHARED_TOKEN' \
+  --server-id "$(hostname)" \
+  --threshold 95
+```
+
+That one command will:
+
+- configure HTTP coordination
+- enable the rate hook
+- enable the statusline
+- keep the local threshold at `95`
+
+### Verify on another server
+
+```bash
+ccs status
+ccs rate-check --refresh
+```
+
+Healthy signs:
+
+- `Coordination:    http (...)`
+- hook and statusline already installed
+- account lease appears on coordinator after `ccs coord-sync`
+
 ## Commands
 
 ### Account management
@@ -230,6 +281,7 @@ ccs rate-setup --threshold 95
 ccs statusline-setup
 ccs warm-check
 ccs warm-loop
+ccs coord-client-setup --api-url https://ccs.dev.gass.web.id --api-token 'YOUR_SHARED_TOKEN' --server-id "$(hostname)" --threshold 95
 ```
 
 ### Diagnostics

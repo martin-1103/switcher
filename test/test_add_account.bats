@@ -113,3 +113,127 @@ teardown() {
     [ "$status" -eq 1 ]
     [[ "$output" == *"Invalid account type"* ]]
 }
+
+@test "test_coord_setup_persists_mysql_configuration" {
+    setup_fake_account "user1@example.com" "uuid-1"
+    run run_ccswitch --add-account
+    [ "$status" -eq 0 ]
+
+    cat > "$MOCK_BIN/mysql" << 'MOCK_EOF'
+#!/bin/bash
+exit 0
+MOCK_EOF
+    chmod +x "$MOCK_BIN/mysql"
+
+    run run_ccswitch coord-setup --mode mysql --host 127.0.0.1 --port 3306 --database ccs --user ccs --password secret --server-id srv-a --lease-ttl 180
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Coordination enabled."* ]]
+
+    run jq -r '.coordination.serverId' "$SEQUENCE_FILE"
+    [ "$status" -eq 0 ]
+    [ "$output" = "srv-a" ]
+
+    run jq -r '.coordination.mysql.password' "$SEQUENCE_FILE"
+    [ "$status" -eq 0 ]
+    [ "$output" = "secret" ]
+}
+
+@test "test_coord_setup_persists_http_configuration" {
+    setup_fake_account "user1@example.com" "uuid-1"
+    run run_ccswitch --add-account
+    [ "$status" -eq 0 ]
+
+    cat > "$MOCK_BIN/curl" << 'MOCK_EOF'
+#!/bin/bash
+echo '{"ok":true}'
+echo "200"
+MOCK_EOF
+    chmod +x "$MOCK_BIN/curl"
+
+    run run_ccswitch coord-setup --mode http --api-url http://127.0.0.1:19090 --api-token token-123 --server-id srv-http --lease-ttl 180
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Mode: http"* ]]
+
+    run jq -r '.coordination.mode' "$SEQUENCE_FILE"
+    [ "$status" -eq 0 ]
+    [ "$output" = "http" ]
+
+    run jq -r '.coordination.http.url' "$SEQUENCE_FILE"
+    [ "$status" -eq 0 ]
+    [ "$output" = "http://127.0.0.1:19090" ]
+}
+
+@test "test_coord_client_setup_configures_http_hook_and_statusline" {
+    setup_fake_account "user1@example.com" "uuid-1"
+    run run_ccswitch --add-account
+    [ "$status" -eq 0 ]
+
+    cat > "$MOCK_BIN/curl" << 'MOCK_EOF'
+#!/bin/bash
+echo '{"ok":true}'
+echo "200"
+MOCK_EOF
+    chmod +x "$MOCK_BIN/curl"
+
+    run run_ccswitch coord-client-setup --api-url https://ccs.dev.gass.web.id --api-token token-xyz --server-id srv-client --threshold 95
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Client setup complete."* ]]
+
+    run jq -r '.coordination.mode' "$SEQUENCE_FILE"
+    [ "$status" -eq 0 ]
+    [ "$output" = "http" ]
+
+    run jq -r '.rateLimit.threshold' "$SEQUENCE_FILE"
+    [ "$status" -eq 0 ]
+    [ "$output" = "95" ]
+
+    run jq -r '.statusLine.command' "$HOME/.claude/settings.local.json"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"ccs-statusline.sh"* ]]
+
+    run jq -r '.hooks.PreToolUse[0].hooks[0].command' "$HOME/.claude/settings.local.json"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"ccs-rate-hook.sh"* ]]
+}
+
+@test "test_coord_token_prints_http_token_from_sequence_file" {
+    setup_fake_account "user1@example.com" "uuid-1"
+    run run_ccswitch --add-account
+    [ "$status" -eq 0 ]
+
+    cat > "$MOCK_BIN/curl" << 'MOCK_EOF'
+#!/bin/bash
+echo '{"ok":true}'
+echo "200"
+MOCK_EOF
+    chmod +x "$MOCK_BIN/curl"
+
+    run run_ccswitch coord-setup --mode http --api-url https://ccs.dev.gass.web.id --api-token token-abc --server-id srv-token --lease-ttl 180
+    [ "$status" -eq 0 ]
+
+    run run_ccswitch coord-token
+    [ "$status" -eq 0 ]
+    [ "$output" = "token-abc" ]
+}
+
+@test "test_coord_client_command_prints_copy_paste_setup_command" {
+    setup_fake_account "user1@example.com" "uuid-1"
+    run run_ccswitch --add-account
+    [ "$status" -eq 0 ]
+
+    cat > "$MOCK_BIN/curl" << 'MOCK_EOF'
+#!/bin/bash
+echo '{"ok":true}'
+echo "200"
+MOCK_EOF
+    chmod +x "$MOCK_BIN/curl"
+
+    run run_ccswitch coord-setup --mode http --api-url https://ccs.dev.gass.web.id --api-token token-cmd --server-id srv-cmd --lease-ttl 180
+    [ "$status" -eq 0 ]
+
+    run run_ccswitch coord-client-command
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"coord-client-setup"* ]]
+    [[ "$output" == *"--api-url https://ccs.dev.gass.web.id"* ]]
+    [[ "$output" == *"--api-token 'token-cmd'"* ]]
+}
