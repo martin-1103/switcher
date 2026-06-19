@@ -7,286 +7,263 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20WSL-brightgreen)](https://github.com/fairy-pitta/cc-account-switcher)
 [![Shell](https://img.shields.io/badge/shell-bash%203.2%2B-89e051)](https://github.com/fairy-pitta/cc-account-switcher)
-[![Tests](https://img.shields.io/badge/tests-85%20passing-success)](https://github.com/fairy-pitta/cc-account-switcher/actions)
 
-> Forked from [ming86/cc-account-switcher](https://github.com/ming86/cc-account-switcher) — thank you for the original work!
+> Forked from [ming86/cc-account-switcher](https://github.com/ming86/cc-account-switcher).
 
-A simple tool to manage and switch between multiple Claude Code accounts on macOS, Linux, and WSL.
+Manage multiple Claude Code accounts, switch quickly, and auto-rotate when usage gets high.
 
-## Demo
+This fork also adds compatibility fixes for newer Claude Code credential formats and newer usage API behavior.
 
-![demo](assets/demo.gif)
+## What This Fork Adds
 
-## Features
+- Reads both legacy and current Claude Code credential layouts
+- Reads usage from active limits first, then falls back to `max(5h, 7d)`
+- Adds account types such as `team` and `max20`
+- Prioritizes `team` accounts before `max20`
+- Supports team ladder rotation: `20 -> 40 -> 60 -> 80 -> 95`
+- Stores last known usage snapshots, including `resetAt5h` and `resetAt7d`
+- Adds `warm-check` and `warm-loop` helpers for active-account usage refresh
 
-- **Multi-account management** — Add, remove, and list Claude Code accounts
-- **Quick switching** — Rotate accounts or switch to a specific one by number, email, or profile name
-- **Named profiles** — Give accounts friendly names like `work` or `personal`
-- **Directory-based auto-switching** — Map directories to accounts and auto-switch when you `cd`
-- **Dry-run mode** — Preview what a switch would do without making changes
-- **Rollback** — Automatic rollback if a switch fails mid-way
-- **Rate limit auto-switch** — Automatically switch accounts when usage limits are hit, via Claude Code hooks
-- **Diagnostics** — Health checks, status, and per-account usage statistics
-- **Cross-platform** — Works on macOS, Linux, and WSL
-- **Secure storage** — Uses system keychain (macOS) or protected files (Linux/WSL)
-- **Settings preservation** — Only switches authentication; themes, settings, and preferences stay unchanged
+## Quick Install
 
-## Installation
-
-![install](assets/install.gif)
-
-### curl (quickest)
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/fairy-pitta/cc-account-switcher/main/ccswitch.sh -o /usr/local/bin/ccs
-chmod +x /usr/local/bin/ccs
-```
-
-### Homebrew (macOS)
-
-```bash
-brew install fairy-pitta/tap/ccswitch
-```
-
-### npm / npx
-
-```bash
-# Install globally
-npm install -g @fairy-pitta/cc-account-switcher
-
-# Or run without installing
-npx @fairy-pitta/cc-account-switcher --help
-```
-
-### Make
+### Fast path
 
 ```bash
 git clone https://github.com/fairy-pitta/cc-account-switcher.git
 cd cc-account-switcher
 sudo make install
+
+sudo install -d /usr/local/bin/hooks /usr/local/bin/statusline
+sudo install -m 755 hooks/ccs-rate-hook.sh /usr/local/bin/hooks/ccs-rate-hook.sh
+sudo install -m 755 statusline/ccs-statusline.sh /usr/local/bin/statusline/ccs-statusline.sh
 ```
 
-### Manual
+### Requirements
 
-Download `ccswitch.sh` from the [latest release](https://github.com/fairy-pitta/cc-account-switcher/releases) and place it in your `$PATH` as `ccs`.
+- Bash 3.2+
+- `jq`
+- `curl`
+- Claude Code already installed
+- Claude Code already logged into at least one account
 
-## Quick Start
+### Root shells
 
-![quickstart](assets/quickstart.gif)
+By default `ccs` blocks `root`.
 
-1. Log into Claude Code with your first account
-2. `ccs add` — save current credentials
-3. Log out, log into your second account
-4. `ccs add` — save the second set of credentials
-5. `ccs sw` — rotate between accounts
-6. Restart Claude Code after each switch
-
-> **What gets switched:** Only authentication credentials. Your themes, settings, preferences, and chat history remain unchanged.
-
-## Usage
-
-### Account Management
+If your server runs Claude Code as `root`, use either:
 
 ```bash
-ccs add                          # Add current account
-ccs ls                           # List all managed accounts
-ccs rm 2                         # Remove account by number
-ccs rm user@example.com          # Remove account by email
+ccs --allow-root ls
+```
+
+or:
+
+```bash
+export CCSWITCH_ALLOW_ROOT=1
+export CCS_PATH=/usr/local/bin/ccs
+```
+
+## Source of Truth Files
+
+Important on Linux servers:
+
+- Active Claude auth/account:
+  - `~/.claude.json`
+- Claude Code hook and statusline config:
+  - `~/.claude/settings.json`
+- ccs state:
+  - `~/.claude-switch-backup/sequence.json`
+- Active usage cache:
+  - `/tmp/claude-usage-cache.json`
+
+## Initial Setup
+
+### 1. Add accounts
+
+```bash
+ccs add
+```
+
+Repeat after logging into each account you want to manage.
+
+### 2. Set account types
+
+Example:
+
+```bash
+tmp=$(mktemp)
+jq '.accounts["1"].accountType = "team"' ~/.claude-switch-backup/sequence.json > "$tmp" && mv "$tmp" ~/.claude-switch-backup/sequence.json
+```
+
+Common values in this fork:
+
+- `team`
+- `max20`
+
+### 3. Enable auto-switch hook
+
+```bash
+ccs rate-setup --threshold 95
+ccs statusline-setup
+```
+
+This writes:
+
+- `hooks.PreToolUse` to `~/.claude/settings.json`
+- `statusLine.command` to `~/.claude/settings.json`
+
+### 4. Verify
+
+```bash
+ccs ls
+ccs status
+ccs rate-check --refresh
+CCS_PATH=/usr/local/bin/ccs /usr/local/bin/statusline/ccs-statusline.sh
+```
+
+Expected signs:
+
+- active account is shown correctly
+- account type is shown
+- statusline prints one line such as:
+  - `ccs user@example.com · use 19% · 5h 6% · 7d 19%`
+
+## Auto-switch Modes
+
+### Directory mode
+
+Map folders to accounts:
+
+```bash
+ccs dir ~/work 1
+ccs auto
+```
+
+### Rate-limit mode
+
+Switch when usage exceeds threshold:
+
+```bash
+ccs rate-check
+ccs rate-check --auto-switch
+```
+
+The hook version runs automatically from Claude Code `PreToolUse`.
+
+## Team Ladder Rotation
+
+This fork supports staged team-first rotation.
+
+Behavior:
+
+1. `team` group is always preferred before `max20`
+2. team ladder stages are:
+   - `20`
+   - `40`
+   - `60`
+   - `80`
+   - `95`
+3. the next stage only becomes active after all team accounts have reached the current stage
+4. `max20` accounts are used only when team accounts have no lower-stage candidate left
+
+Example with two team accounts:
+
+- team A at `25%`
+- team B at `10%`
+
+Current target stage is still `20`, so team B is preferred first.
+
+## Active-first Usage Refresh
+
+Important host behavior:
+
+- usage for the currently active account is reliable
+- usage reads from backup credentials of non-active accounts may fail or return `429`
+
+Because of that, this fork now prefers:
+
+- real-time usage for the active account
+- historical snapshots for previously active accounts
+
+Commands:
+
+```bash
+ccs warm-check
+ccs warm-loop
+```
+
+Current meaning:
+
+- `warm-check` refreshes the active account usage, updates snapshot, and sends a one-shot warm ping only when needed
+- `warm-loop` runs `warm-check` every 60 seconds
+
+This is a lightweight scheduler. It does **not** ping Claude every minute. It only checks state every minute.
+
+## Commands
+
+### Account management
+
+```bash
+ccs add
+ccs ls
+ccs rm 2
+ccs rm user@example.com
+ccs profile 1 work
+ccs to work
 ```
 
 ### Switching
 
 ```bash
-ccs sw                           # Rotate to next account
-ccs to 2                         # Switch to account #2
-ccs to user@example.com          # Switch by email
-ccs to work                      # Switch by profile name
-ccs -n sw                        # Dry-run: preview what would happen
-ccs sw -r                        # Switch and restart Claude Code
-ccs sw --no-restart              # Switch without restart prompt
+ccs sw
+ccs to 2
+ccs to user@example.com
+ccs sw --no-restart
 ```
 
-### Profiles
+### Auto-switch and warming
 
 ```bash
-ccs profile 1 work               # Name account 1 "work"
-ccs profile 2 personal           # Name account 2 "personal"
-ccs to work                      # Then switch by profile name
+ccs rate-check
+ccs rate-check --auto-switch
+ccs rate-setup --threshold 95
+ccs statusline-setup
+ccs warm-check
+ccs warm-loop
 ```
-
-### Directory-based Auto-switching
-
-```bash
-ccs dir ~/work 1                 # Map ~/work to account 1
-ccs dir ~/personal 2             # Map ~/personal to account 2
-ccs auto                         # Switch based on current directory
-```
-
-### Rate Limit Auto-switch
-
-Automatically switch to the next account when your 5-hour usage exceeds a threshold. Uses Claude Code's [PreToolUse hook](https://docs.anthropic.com/en/docs/claude-code/hooks) system — no polling, no background processes.
-
-```bash
-# Set up (one-time) — installs a PreToolUse hook into Claude Code
-ccs rate-setup                   # Enable with default 80% threshold
-ccs rate-setup --threshold 70    # Custom threshold
-
-# Manual check
-ccs rate-check                   # Check current usage vs threshold
-ccs rate-check --auto-switch     # Check and switch if exceeded
-ccs rate-check --max-age 30      # Treat the cache as stale after 30s
-
-# Disable
-ccs rate-setup --disable         # Remove hook and disable
-```
-
-**How it works:**
-
-1. The usage cache lives at `/tmp/claude-usage-cache.json` with a `cached_at` timestamp.
-2. Before each tool call the PreToolUse hook checks the cache. If it's fresh (younger than the TTL) and under threshold, it returns immediately (~20ms, no API call).
-3. If the cache is missing, stale, or for a different account, the hook refreshes it from the [Anthropic OAuth Usage API](https://api.anthropic.com/api/oauth/usage) on demand — so it works in headless `claude -p` runs with no statusline.
-4. If usage exceeds the threshold, it switches to the next account and tells Claude Code to deny the tool call with a "please restart" message.
-5. Switches take an exclusive lock, so concurrent agents (e.g. an orchestrator's heartbeats) can't race or thrash accounts.
-6. All errors fail open — a broken hook never blocks your work.
-
-**Cache TTL:** the cache is considered fresh for `DEFAULT_CACHE_TTL` (60s) by default. Override per-install with `.rateLimit.cacheTtl` in `~/.claude-switch-backup/sequence.json`, or per-invocation with `--max-age SECONDS`. A short TTL means fresher data at the cost of more API calls; a longer TTL means fewer calls.
-
-**Optional statusline:** for interactive sessions you can install a statusline that shows the active account and 5-hour usage while keeping the cache warm:
-
-```bash
-ccs statusline-setup             # Install (writes .statusLine into settings.local.json)
-ccs statusline-setup --disable   # Remove it (leaves any other statusline untouched)
-```
-
-It renders e.g. `ccs you@example.com · 5h 42%` and appends `(!)` once you cross the threshold. The cache refresh runs in the background, so it never blocks the prompt. The statusline is **not required** — headless runs refresh the cache on demand (above).
-
-> **Note (multi-account at the same time):** `ccswitch` rewrites a single machine-global credential store, so all Claude Code processes on the machine share one account at a time. Auto-switch is built for the *sequential* case — "when this account is exhausted, rotate to the next." Running different accounts in parallel requires per-process isolation via Claude Code's `CLAUDE_CONFIG_DIR`.
 
 ### Diagnostics
 
 ```bash
-ccs check                        # Verify backup integrity (JSON, permissions, keychain)
-ccs status                       # Current account, token expiry, last switch
-ccs stats                        # Per-account usage statistics
+ccs check
+ccs status
+ccs stats
 ```
 
-### Other
+## Known Limits
+
+- Auto-switch hook can rewrite auth automatically, but runtime hot-reload behavior depends on Claude Code build and host behavior
+- Non-active account usage fetch may be unreliable on some hosts
+- `0%` does not always mean reset time is known
+- `resetAt` is authoritative when present; internal timers should not replace it
+
+## Troubleshooting and Operations
+
+- Troubleshooting:
+  - [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)
+- Operations and recovery:
+  - [docs/OPERATIONS.md](docs/OPERATIONS.md)
+
+## Development
+
+Run focused tests:
 
 ```bash
-ccs version                      # Show version
-ccs help                         # Show help
+bats test/test_rate_check.bats
 ```
 
-### Running as root
-
-By default the script refuses to run as `root`, because credentials and backups are
-stored per-user (under `$HOME` and, on macOS, the user's Keychain). Running as root
-targets a different home/Keychain and can leave root-owned files behind that break
-your normal user.
-
-If you understand the risks (e.g. sandbox or container testing), opt out with the
-`--allow-root` flag or the `CCSWITCH_ALLOW_ROOT=1` environment variable:
+Run all tests:
 
 ```bash
-ccs --allow-root ls              # Flag (can go before or after the command)
-CCSWITCH_ALLOW_ROOT=1 ccs ls     # Environment variable
+bats test/*.bats
 ```
-
-Containers are detected automatically and allowed without the flag.
-
-### Shell Integration
-
-Add to your shell profile to enable completions and the `ccs` alias:
-
-**Bash** (`~/.bashrc`):
-
-```bash
-source "$(command -v ccs)" --shell-init bash 2>/dev/null
-```
-
-**Zsh** (`~/.zshrc`):
-
-```bash
-source "$(command -v ccs)" --shell-init zsh 2>/dev/null
-```
-
-**Fish** (`~/.config/fish/config.fish`):
-
-```fish
-source "$(command -v ccs)" --shell-init fish 2>/dev/null
-```
-
-## Requirements
-
-- Bash 3.2+
-- `jq` (JSON processor)
-
-### Installing Dependencies
-
-**macOS:**
-
-```bash
-brew install jq
-```
-
-**Ubuntu/Debian:**
-
-```bash
-sudo apt install jq
-```
-
-## How It Works
-
-The switcher stores account authentication data separately:
-
-- **macOS**: Credentials in Keychain, OAuth info in `~/.claude-switch-backup/`
-- **Linux/WSL**: Both credentials and OAuth info in `~/.claude-switch-backup/` with restricted permissions
-
-When switching accounts, it:
-
-1. Backs up the current account's authentication data
-2. Restores the target account's authentication data
-3. Updates Claude Code's authentication files
-4. Automatically rolls back if any step fails
-
-## Troubleshooting
-
-Run `ccs check` first — it verifies JSON validity, file permissions, and keychain entries.
-
-### Common Issues
-
-| Problem | Solution |
-|---------|----------|
-| Switch fails | Run `ccs check` to diagnose. Ensure Claude Code is closed. |
-| Can't add account | Ensure you're logged into Claude Code. Verify `jq` is installed. |
-| Claude Code doesn't recognize new account | Restart Claude Code after switching, or use `ccs sw -r`. |
-| Not sure which account is active | Run `ccs ls` — the active account is marked. |
-
-## Cleanup / Uninstall
-
-1. Note your current active account: `ccs ls`
-2. Remove the backup directory: `rm -rf ~/.claude-switch-backup`
-3. Uninstall:
-   - **make**: `sudo make uninstall`
-   - **npm**: `npm uninstall -g @fairy-pitta/cc-account-switcher`
-   - **manual**: `rm /usr/local/bin/ccs`
-
-Your current Claude Code login will remain active.
-
-## Contributing
-
-Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
-
-## Security
-
-- macOS credentials stored in system Keychain
-- All backup files use `600` permissions (owner-only read/write)
-- Integrity checks via `ccs check`
-
-## Acknowledgments
-
-This project is a fork of [ming86/cc-account-switcher](https://github.com/ming86/cc-account-switcher). Thanks to the original author for building the foundation of multi-account switching for Claude Code.
-
-## License
-
-MIT License — see [LICENSE](LICENSE) file for details.
