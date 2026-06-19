@@ -437,6 +437,48 @@ LIMIT 1;
 " 2>/dev/null | head -n1
 }
 
+coord_remote_lease_count() {
+    local email="$1"
+    if coord_http_ready; then
+        local encoded
+        encoded=$(printf '%s' "$email" | jq -sRr @uri)
+        coord_http_request GET "/v1/leases/owner?email=${encoded}&serverId=$(printf '%s' "$(coord_server_id)" | jq -sRr @uri)" 2>/dev/null \
+            | jq -r '.holderCount // 0' 2>/dev/null
+        return 0
+    fi
+
+    local owner
+    owner=$(coord_remote_lease_owner "$email" 2>/dev/null || true)
+    if [[ -n "$owner" ]]; then
+        echo "1"
+    else
+        echo "0"
+    fi
+}
+
+coord_release_account_state() {
+    local email="$1"
+    [[ -n "$email" ]] || return 0
+    local server_id
+    server_id=$(coord_server_id)
+
+    if coord_http_ready; then
+        local payload
+        payload=$(jq -n --arg email "$email" --arg serverId "$server_id" '{email: $email, serverId: $serverId}')
+        coord_http_request POST "/v1/leases/release" "$payload" >/dev/null 2>&1 || true
+        return 0
+    fi
+
+    if coord_mysql_ready; then
+        coord_ensure_schema >/dev/null 2>&1 || return 0
+        coord_mysql_exec "
+DELETE FROM account_leases
+WHERE email = '$(sql_escape "$email")'
+  AND server_id = '$(sql_escape "$server_id")';
+" >/dev/null 2>&1 || true
+    fi
+}
+
 # Setup backup directories
 setup_directories() {
     mkdir -p "$BACKUP_DIR"/{configs,credentials}
@@ -866,83 +908,74 @@ account_group_type() {
     jq -r --arg num "$account_num" '.accounts[$num].accountType // "other"' "$SEQUENCE_FILE" 2>/dev/null || echo "other"
 }
 
-emit_group_ladder_candidates() {
-    local group="$1"
-    local active_account="$2"
-    local entries=()
-    local ord=0
-    local num type usage target="" email lease_owner
+account_usage_known() {
+    local account_num="$1"
+    local observed
+    observed=$(jq -r --arg num "$account_num" '.accounts[$num].lastKnownUsage.observedAt // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
+    [[ -n "$observed" && "$observed" != "null" ]]
+}
 
+account_type_priority() {
+    local account_num="$1"
+    local type priority
+    type=$(account_group_type "$account_num")
+    priority=$(jq -r --arg type "$type" '.accountTypePolicy[$type].priority // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
+    if [[ -n "$priority" && "$priority" != "null" ]]; then
+        echo "$priority"
+        return
+    fi
+    case "$type" in
+        team) echo "100" ;;
+        max20) echo "50" ;;
+        *) echo "10" ;;
+    esac
+}
+
+collect_switch_candidates() {
+    local active_account="$1"
+    local ord=0 num usage known priority email remote_count
     while IFS= read -r num; do
         [[ -n "$num" ]] || continue
         if [[ "$num" == "$active_account" ]]; then
             ord=$((ord + 1))
             continue
         fi
-        type=$(account_group_type "$num")
-        if [[ "$type" == "$group" ]]; then
-            email=$(jq -r --arg num "$num" '.accounts[$num].email // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
-            lease_owner=""
-            if [[ -n "$email" ]]; then
-                lease_owner=$(coord_remote_lease_owner "$email" 2>/dev/null || true)
-            fi
-            if [[ -n "$lease_owner" ]]; then
-                ord=$((ord + 1))
-                continue
-            fi
-            usage=$(account_snapshot_usage "$num")
-            entries+=("${usage}|${ord}|${num}")
+        email=$(jq -r --arg num "$num" '.accounts[$num].email // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
+        usage=$(account_snapshot_usage "$num")
+        if account_usage_known "$num"; then
+            known=1
+        else
+            known=0
         fi
+        priority=$(account_type_priority "$num")
+        remote_count=0
+        if [[ -n "$email" ]]; then
+            remote_count=$(coord_remote_lease_count "$email" 2>/dev/null || echo 0)
+        fi
+        printf '%s|%s|%s|%s|%s\n' "$num" "$usage" "$known" "$priority" "$remote_count"
         ord=$((ord + 1))
     done < <(jq -r '.sequence[]' "$SEQUENCE_FILE" 2>/dev/null)
-
-    [[ ${#entries[@]} -gt 0 ]] || return 0
-
-    local stage entry entry_usage
-    for stage in 20 40 60 80 95; do
-        for entry in "${entries[@]}"; do
-            entry_usage="${entry%%|*}"
-            if (( entry_usage < stage )); then
-                target="$stage"
-                break 2
-            fi
-        done
-    done
-
-    [[ -n "$target" ]] || return 0
-
-    printf '%s\n' "${entries[@]}" \
-        | awk -F'|' -v target="$target" '$1 < target { print }' \
-        | sort -t'|' -k1,1n -k2,2n \
-        | cut -d'|' -f3
 }
 
 auto_switch_candidates() {
     local active_account="$1"
+    local candidates
+    candidates=$(collect_switch_candidates "$active_account")
+    [[ -n "$candidates" ]] || return 0
 
-    emit_group_ladder_candidates "team" "$active_account"
-    local rc=$?
-    if [[ $rc -eq 0 ]]; then
-        local team_out
-        team_out=$(emit_group_ladder_candidates "team" "$active_account")
-        if [[ -n "$team_out" ]]; then
-            printf '%s\n' "$team_out"
-            return 0
-        fi
-    fi
+    local exclusive
+    exclusive=$(printf '%s\n' "$candidates" | awk -F'|' '$5 == 0')
 
-    local max20_out
-    max20_out=$(emit_group_ladder_candidates "max20" "$active_account")
-    if [[ -n "$max20_out" ]]; then
-        printf '%s\n' "$max20_out"
+    if [[ -n "$exclusive" ]]; then
+        printf '%s\n' "$exclusive" \
+            | sort -t'|' -k4,4nr -k3,3nr -k2,2n -k1,1n \
+            | cut -d'|' -f1
         return 0
     fi
 
-    local other_out
-    other_out=$(emit_group_ladder_candidates "other" "$active_account")
-    if [[ -n "$other_out" ]]; then
-        printf '%s\n' "$other_out"
-    fi
+    printf '%s\n' "$candidates" \
+        | sort -t'|' -k4,4nr -k3,3nr -k2,2n -k5,5n -k1,1n \
+        | cut -d'|' -f1
 }
 
 # Claude Code process detection (Node.js app)
@@ -2417,6 +2450,8 @@ perform_switch() {
     # Invalidate any stale usage cache from the previous account immediately.
     # The next hook/statusline pass must fetch fresh usage for the new account.
     rm -f "$cache_file" 2>/dev/null || true
+
+    coord_release_account_state "$current_email"
 
     # Best effort: once the target account is active, refresh its usage snapshot
     # immediately. On this host non-active backup credentials are unreliable, but

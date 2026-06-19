@@ -150,28 +150,27 @@ ccs rate-check --auto-switch
 
 The hook version runs automatically from Claude Code `PreToolUse`.
 
-## Team Ladder Rotation
+## Adaptive Multi-server Selection
 
-This fork supports staged team-first rotation.
+This fork now uses adaptive lease-aware selection.
 
 Behavior:
 
-1. `team` group is always preferred before `max20`
-2. team ladder stages are:
-   - `20`
-   - `40`
-   - `60`
-   - `80`
-   - `95`
-3. the next stage only becomes active after all team accounts have reached the current stage
-4. `max20` accounts are used only when team accounts have no lower-stage candidate left
+1. accounts are ranked by:
+   - local policy priority
+   - whether usage is known
+   - effective usage ascending
+2. effective usage means:
+   - active limit first
+   - else `max(5h, 7d)`
+3. if a non-active snapshot has `resetAt5h` in the past, stale 5h usage is treated as `0`
+4. normal mode prefers accounts that are **not** leased by other servers
+5. if no exclusive candidate is left, fallback mode allows a shared candidate so both servers do not dead-end
 
-Example with two team accounts:
+This means:
 
-- team A at `25%`
-- team B at `10%`
-
-Current target stage is still `20`, so team B is preferred first.
+- early in the pool, servers spread out
+- late in the pool, servers may temporarily converge on the last usable account
 
 ## Active-first Usage Refresh
 
@@ -237,11 +236,22 @@ That one command will:
 - enable the statusline
 - keep the local threshold at `95`
 
+Useful helper commands on the coordinator server:
+
+```bash
+ccs coord-token
+ccs coord-client-command
+```
+
+- `coord-token` prints only the shared API token
+- `coord-client-command` prints a full copy-paste command for another server
+
 ### Verify on another server
 
 ```bash
 ccs status
 ccs rate-check --refresh
+ccs coord-sync
 ```
 
 Healthy signs:
@@ -281,6 +291,8 @@ ccs rate-setup --threshold 95
 ccs statusline-setup
 ccs warm-check
 ccs warm-loop
+ccs coord-token
+ccs coord-client-command
 ccs coord-client-setup --api-url https://ccs.dev.gass.web.id --api-token 'YOUR_SHARED_TOKEN' --server-id "$(hostname)" --threshold 95
 ```
 

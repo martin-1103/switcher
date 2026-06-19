@@ -20,7 +20,11 @@ fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
 
 function loadState() {
   try {
-    return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+    const state = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+    if (!state.leases || typeof state.leases !== 'object') {
+      state.leases = {};
+    }
+    return state;
   } catch {
     return { leases: {} };
   }
@@ -34,7 +38,24 @@ function saveState(state) {
 
 function cleanupExpired(state, now = Date.now()) {
   for (const [email, lease] of Object.entries(state.leases || {})) {
-    if (!lease || Number(lease.leaseExpiresAt || 0) <= now) {
+    if (!lease) {
+      delete state.leases[email];
+      continue;
+    }
+
+    if (lease.holders && typeof lease.holders === 'object') {
+      for (const [serverId, holder] of Object.entries(lease.holders)) {
+        if (!holder || Number(holder.leaseExpiresAt || 0) <= now) {
+          delete lease.holders[serverId];
+        }
+      }
+      if (Object.keys(lease.holders).length === 0) {
+        delete state.leases[email];
+      }
+      continue;
+    }
+
+    if (Number(lease.leaseExpiresAt || 0) <= now) {
       delete state.leases[email];
     }
   }
@@ -93,6 +114,49 @@ function normalizeLease(input) {
   };
 }
 
+function upgradeLeaseRecord(email, lease) {
+  if (!lease) return null;
+  if (lease.holders && typeof lease.holders === 'object') {
+    return lease;
+  }
+  const serverId = String(lease.serverId || '').trim();
+  if (!serverId) return null;
+  return {
+    email,
+    accountType: lease.accountType || null,
+    holders: {
+      [serverId]: {
+        ...lease,
+        email,
+        serverId,
+      },
+    },
+  };
+}
+
+function flattenLease(email, lease) {
+  const record = upgradeLeaseRecord(email, lease);
+  if (!record) return null;
+  const holders = Object.values(record.holders || {}).sort((a, b) => Number(b.updatedAt || 0) - Number(a.updatedAt || 0));
+  const latest = holders[0] || {};
+  return {
+    email,
+    accountType: latest.accountType || record.accountType || null,
+    holderCount: holders.length,
+    leaseExpiresAt: Math.max(...holders.map(h => Number(h.leaseExpiresAt || 0)), 0),
+    updatedAt: Math.max(...holders.map(h => Number(h.updatedAt || 0)), 0),
+    latestSnapshot: {
+      activeLimit: Number(latest.activeLimit || 0),
+      fiveHour: Number(latest.fiveHour || 0),
+      sevenDay: Number(latest.sevenDay || 0),
+      resetAt5h: latest.resetAt5h || null,
+      resetAt7d: latest.resetAt7d || null,
+      observedAt: Number(latest.observedAt || 0),
+    },
+    holders,
+  };
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
@@ -109,19 +173,27 @@ const server = http.createServer(async (req, res) => {
     cleanupExpired(state);
 
     if (req.method === 'GET' && url.pathname === '/v1/leases') {
+      const leases = Object.entries(state.leases)
+        .map(([email, lease]) => flattenLease(email, lease))
+        .filter(Boolean);
       saveState(state);
-      return send(res, 200, { leases: Object.values(state.leases) });
+      return send(res, 200, { leases });
     }
 
     if (req.method === 'GET' && url.pathname === '/v1/leases/owner') {
       const email = String(url.searchParams.get('email') || '').trim();
       const serverId = String(url.searchParams.get('serverId') || '').trim();
-      const lease = state.leases[email];
+      const lease = flattenLease(email, state.leases[email]);
       saveState(state);
-      if (!lease || (serverId && lease.serverId === serverId)) {
-        return send(res, 200, { owner: null });
+      if (!lease) {
+        return send(res, 200, { owner: null, owners: [], holderCount: 0 });
       }
-      return send(res, 200, { owner: lease });
+      const owners = lease.holders.filter(holder => !serverId || holder.serverId !== serverId);
+      return send(res, 200, {
+        owner: owners[0] || null,
+        owners,
+        holderCount: owners.length,
+      });
     }
 
     if (req.method === 'POST' && url.pathname === '/v1/leases/claim') {
@@ -129,18 +201,34 @@ const server = http.createServer(async (req, res) => {
       if (!body.email || !body.serverId) {
         return send(res, 400, { error: 'email and serverId required' });
       }
-      state.leases[body.email] = body;
+      const existing = upgradeLeaseRecord(body.email, state.leases[body.email]) || {
+        email: body.email,
+        accountType: body.accountType || null,
+        holders: {},
+      };
+      existing.accountType = body.accountType || existing.accountType || null;
+      existing.holders[body.serverId] = body;
+      state.leases[body.email] = existing;
       saveState(state);
-      return send(res, 200, { ok: true, lease: body });
+      return send(res, 200, { ok: true, lease: flattenLease(body.email, state.leases[body.email]) });
     }
 
     if (req.method === 'POST' && url.pathname === '/v1/leases/release') {
       const body = await readJson(req);
       const email = String(body.email || '').trim();
       const serverId = String(body.serverId || '').trim();
-      const lease = state.leases[email];
-      if (lease && (!serverId || lease.serverId === serverId)) {
-        delete state.leases[email];
+      const lease = upgradeLeaseRecord(email, state.leases[email]);
+      if (lease) {
+        if (serverId) {
+          delete lease.holders[serverId];
+        } else {
+          lease.holders = {};
+        }
+        if (Object.keys(lease.holders).length === 0) {
+          delete state.leases[email];
+        } else {
+          state.leases[email] = lease;
+        }
       }
       saveState(state);
       return send(res, 200, { ok: true });

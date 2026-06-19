@@ -459,12 +459,15 @@ MOCK_EOF
 #!/bin/bash
 args="$*"
 if [[ "$args" == *"/v1/leases/owner?email=team1%40example.com&serverId=srv-a"* ]]; then
-  echo '{"owner":{"serverId":"srv-b"}}'
+  echo '{"owner":{"serverId":"srv-b"},"owners":[{"serverId":"srv-b"}],"holderCount":1}'
   echo "200"
 elif [[ "$args" == *"/v1/leases/owner?email=team2%40example.com&serverId=srv-a"* ]]; then
-  echo '{"owner":null}'
+  echo '{"owner":null,"owners":[],"holderCount":0}'
   echo "200"
 elif [[ "$args" == *"/v1/leases/claim"* ]]; then
+  echo '{"ok":true}'
+  echo "200"
+elif [[ "$args" == *"/v1/leases/release"* ]]; then
   echo '{"ok":true}'
   echo "200"
 elif [[ ! -f "$HOME/.curl_calls" ]]; then
@@ -529,6 +532,76 @@ else
   echo '{"five_hour":{"utilization":95,"limit":100,"used":95}}'
 fi
 echo "200"
+MOCK_EOF
+    chmod +x "$MOCK_BIN/curl"
+
+    run run_ccswitch rate-check --auto-switch --threshold 80
+    [ "$status" -eq 1 ]
+    active=$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")
+    [ "$active" -eq 2 ]
+}
+
+@test "test_rate_check_allows_shared_fallback_when_no_exclusive_candidate_left" {
+    setup_fake_account "team-active@example.com" "uuid-active"
+    add_account_to_sequence "1" "team-active@example.com" "uuid-active" "true"
+    add_account_to_sequence "2" "shared-a@example.com" "uuid-a" "false"
+    add_account_to_sequence "3" "shared-b@example.com" "uuid-b" "false"
+    create_fake_credentials "team-active@example.com"
+
+    local updated
+    updated=$(jq '
+        .accounts["1"].accountType = "team" |
+        .accounts["2"].accountType = "team" |
+        .accounts["3"].accountType = "team" |
+        .accounts["2"].lastKnownUsage = {
+            fiveHour: 5,
+            sevenDay: 10,
+            activeLimit: 5,
+            observedAt: 123
+        } |
+        .accounts["3"].lastKnownUsage = {
+            fiveHour: 20,
+            sevenDay: 20,
+            activeLimit: 20,
+            observedAt: 123
+        } |
+        .coordination = {
+            mode: "http",
+            serverId: "srv-a",
+            leaseTtlSeconds: 180,
+            http: {
+                url: "http://127.0.0.1:19090",
+                token: "token-123"
+            }
+        }
+    ' "$SEQUENCE_FILE")
+    echo "$updated" > "$SEQUENCE_FILE"
+
+    create_fake_usage_cache 90 "team-active@example.com"
+
+    cat > "$MOCK_BIN/curl" << 'MOCK_EOF'
+#!/bin/bash
+args="$*"
+if [[ "$args" == *"/v1/leases/owner?email=shared-a%40example.com&serverId=srv-a"* ]]; then
+  echo '{"owner":{"serverId":"srv-b"},"owners":[{"serverId":"srv-b"}],"holderCount":1}'
+  echo "200"
+elif [[ "$args" == *"/v1/leases/owner?email=shared-b%40example.com&serverId=srv-a"* ]]; then
+  echo '{"owner":{"serverId":"srv-c"},"owners":[{"serverId":"srv-c"}],"holderCount":1}'
+  echo "200"
+elif [[ "$args" == *"/v1/leases/claim"* ]]; then
+  echo '{"ok":true}'
+  echo "200"
+elif [[ "$args" == *"/v1/leases/release"* ]]; then
+  echo '{"ok":true}'
+  echo "200"
+elif [[ ! -f "$HOME/.curl_calls" ]]; then
+  echo 1 > "$HOME/.curl_calls"
+  echo '{"five_hour":{"utilization":10,"limit":100,"used":10}}'
+  echo "200"
+else
+  echo '{"five_hour":{"utilization":95,"limit":100,"used":95}}'
+  echo "200"
+fi
 MOCK_EOF
     chmod +x "$MOCK_BIN/curl"
 

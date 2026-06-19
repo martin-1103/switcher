@@ -59,6 +59,13 @@ ccs status
 ccs coord-sync
 ```
 
+Useful helper commands on the coordinator server:
+
+```bash
+ccs coord-token
+ccs coord-client-command
+```
+
 Notes:
 
 - `warm-check` only trusts the active account
@@ -73,18 +80,18 @@ ccs to user@example.com
 ccs sw
 ```
 
-## Ladder policy in this fork
+## Adaptive lease policy in this fork
 
-- priority:
-  - `team`
-  - then `max20`
-- stages:
-  - `20`
-  - `40`
-  - `60`
-  - `80`
-  - `95`
-- next stage opens only after all team accounts reach current stage
+- selection uses:
+  - policy priority
+  - known usage first
+  - effective usage lowest first
+- effective usage:
+  - active limit first
+  - else `max(5h, 7d)`
+- if `resetAt5h` already passed on a non-active snapshot, stale 5h usage is treated as `0`
+- normal mode prefers accounts not leased by other servers
+- scarce fallback allows shared use only when no exclusive candidate is left
 
 ## Rollback
 
