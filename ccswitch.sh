@@ -978,6 +978,28 @@ auto_switch_candidates() {
         | cut -d'|' -f1
 }
 
+should_reclaim_to_preferred_account() {
+    local active_account="$1"
+    [[ -f "$SEQUENCE_FILE" ]] || return 1
+
+    local best_account
+    best_account=$(auto_switch_candidates "$active_account" | head -n1)
+    [[ -n "$best_account" ]] || return 1
+
+    local active_priority best_priority active_usage best_usage
+    active_priority=$(account_type_priority "$active_account")
+    best_priority=$(account_type_priority "$best_account")
+    active_usage=$(account_snapshot_usage "$active_account")
+    best_usage=$(account_snapshot_usage "$best_account")
+
+    if (( best_priority > active_priority )) && (( best_usage < active_usage )); then
+        echo "$best_account"
+        return 0
+    fi
+
+    return 1
+}
+
 # Claude Code process detection (Node.js app)
 is_claude_running() {
     ps -eo pid,comm,args | awk '$2 == "claude" || $3 == "claude" {exit 0} END {exit 1}'
@@ -2686,8 +2708,34 @@ cmd_rate_check() {
     usage_summary=$(format_usage_windows "$cache_file")
     usage_source=$(effective_usage_source "$cache_file")
 
+    local starting_account reclaim_target=""
+    starting_account=$(jq -r '.activeAccountNumber // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
+    if [[ -n "$starting_account" && "$starting_account" != "null" ]]; then
+        reclaim_target=$(should_reclaim_to_preferred_account "$starting_account" 2>/dev/null || true)
+    fi
+
     # Below threshold — all good
     if [[ "$usage_int" -lt "$threshold" ]]; then
+        if [[ "$auto_switch" == true && -n "$reclaim_target" ]]; then
+            local reclaim_email
+            reclaim_email=$(jq -r --arg num "$reclaim_target" '.accounts[$num].email // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
+            if ! (CCS_SILENT=1 CCS_SKIP_POST_SWITCH_USAGE_FETCH=1 perform_switch "$reclaim_target"); then
+                if [[ "$hook_mode" == true ]]; then
+                    exit 0
+                fi
+                echo "Error: Failed to reclaim preferred account Account-$reclaim_target ($reclaim_email)" >&2
+                exit 2
+            fi
+            rm -f "$cache_file"
+            fetch_usage_data >/dev/null 2>&1 || true
+            if [[ "$hook_mode" == true ]]; then
+                _rate_hook_deny "Switched back to preferred account Account-$reclaim_target ($reclaim_email). Please restart Claude Code."
+                exit 0
+            fi
+            echo "Switched back to preferred account Account-$reclaim_target ($reclaim_email)"
+            handle_restart_after_switch
+            exit 1
+        fi
         if [[ "$hook_mode" != true ]]; then
             echo "Usage: ${usage_summary} (threshold: ${threshold}% on ${usage_source}) — OK"
         fi
@@ -2723,7 +2771,6 @@ cmd_rate_check() {
         # Try switching to next accounts, prioritizing team accounts before max20.
         local attempts=0
         local max_attempts=$((total_accounts - 1))
-        local starting_account
         starting_account=$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")
 
         while IFS= read -r next_account; do

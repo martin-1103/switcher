@@ -611,6 +611,58 @@ MOCK_EOF
     [ "$active" -eq 2 ]
 }
 
+@test "test_rate_check_reclaims_preferred_team_when_active_fallback_is_lower_priority" {
+    setup_fake_account "fallback@example.com" "uuid-fallback"
+    add_account_to_sequence "1" "team-fresh@example.com" "uuid-team" "false"
+    add_account_to_sequence "2" "fallback@example.com" "uuid-fallback" "true"
+    create_fake_credentials "fallback@example.com"
+
+    local updated
+    updated=$(jq '
+        .accounts["1"].accountType = "team" |
+        .accounts["1"].lastKnownUsage = {
+            fiveHour: 95,
+            sevenDay: 20,
+            activeLimit: 95,
+            resetAt5h: "2026-06-19T00:00:00Z",
+            observedAt: 123
+        } |
+        .accounts["2"].accountType = "max20" |
+        .accounts["2"].lastKnownUsage = {
+            fiveHour: 10,
+            sevenDay: 70,
+            activeLimit: 70,
+            observedAt: 123
+        }
+    ' "$SEQUENCE_FILE")
+    echo "$updated" > "$SEQUENCE_FILE"
+
+    create_fake_usage_cache 10 "fallback@example.com" 70 70
+
+    cat > "$MOCK_BIN/curl" << 'MOCK_EOF'
+#!/bin/bash
+if [[ ! -f "$HOME/.curl_calls" ]]; then
+  echo 0 > "$HOME/.curl_calls"
+fi
+calls=$(cat "$HOME/.curl_calls")
+calls=$((calls + 1))
+echo "$calls" > "$HOME/.curl_calls"
+if [[ "$calls" -eq 1 ]]; then
+  echo '{"five_hour":{"utilization":0,"limit":100,"used":0}}'
+else
+  echo '{"five_hour":{"utilization":5,"limit":100,"used":5}}'
+fi
+echo "200"
+MOCK_EOF
+    chmod +x "$MOCK_BIN/curl"
+
+    run run_ccswitch rate-check --auto-switch --threshold 95
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"Switched back to preferred account"* ]]
+    active=$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")
+    [ "$active" -eq 1 ]
+}
+
 @test "test_rate_check_auto_switch_all_limited_restores_original_account" {
     setup_fake_account "user1@example.com" "uuid-1"
     add_account_to_sequence "1" "user1@example.com" "uuid-1" "true"
