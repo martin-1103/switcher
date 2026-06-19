@@ -312,6 +312,58 @@ MOCK_EOF
     [ "$active" -eq 3 ]
 }
 
+@test "test_rate_check_auto_switch_holds_group_stage_until_all_team_reach_it" {
+    setup_fake_account "max@example.com" "uuid-max"
+    add_account_to_sequence "1" "max@example.com" "uuid-max" "true"
+    add_account_to_sequence "2" "team-over20@example.com" "uuid-team-over20" "false"
+    add_account_to_sequence "3" "team-under20@example.com" "uuid-team-under20" "false"
+    create_fake_credentials "max@example.com"
+
+    local updated
+    updated=$(jq '
+        .accounts["1"].accountType = "max20" |
+        .accounts["2"].accountType = "team" |
+        .accounts["3"].accountType = "team" |
+        .accounts["2"].lastKnownUsage = {
+            fiveHour: 25,
+            sevenDay: 0,
+            activeLimit: 25,
+            observedAt: 123
+        } |
+        .accounts["3"].lastKnownUsage = {
+            fiveHour: 10,
+            sevenDay: 0,
+            activeLimit: 10,
+            observedAt: 123
+        }
+    ' "$SEQUENCE_FILE")
+    echo "$updated" > "$SEQUENCE_FILE"
+
+    create_fake_usage_cache 90 "max@example.com"
+
+    cat > "$MOCK_BIN/curl" << 'MOCK_EOF'
+#!/bin/bash
+if [[ ! -f "$HOME/.curl_calls" ]]; then
+  echo 0 > "$HOME/.curl_calls"
+fi
+calls=$(cat "$HOME/.curl_calls")
+calls=$((calls + 1))
+echo "$calls" > "$HOME/.curl_calls"
+if [[ "$calls" -eq 1 ]]; then
+  echo '{"five_hour":{"utilization":10,"limit":100,"used":10}}'
+else
+  echo '{"five_hour":{"utilization":95,"limit":100,"used":95}}'
+fi
+echo "200"
+MOCK_EOF
+    chmod +x "$MOCK_BIN/curl"
+
+    run run_ccswitch rate-check --auto-switch --threshold 80
+    [ "$status" -eq 1 ]
+    active=$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")
+    [ "$active" -eq 3 ]
+}
+
 @test "test_rate_check_auto_switch_all_limited_restores_original_account" {
     setup_fake_account "user1@example.com" "uuid-1"
     add_account_to_sequence "1" "user1@example.com" "uuid-1" "true"
@@ -457,4 +509,27 @@ MOCK_EOF
     [ "$status" -eq 0 ]
     # Should output deny JSON since there's only one account
     echo "$output" | jq . >/dev/null 2>&1
+}
+
+@test "test_warm_check_only_refreshes_active_account" {
+    setup_fake_account "user1@example.com" "uuid-1"
+    add_account_to_sequence "1" "user1@example.com" "uuid-1" "true"
+    add_account_to_sequence "2" "user2@example.com" "uuid-2" "false"
+    create_fake_credentials "user1@example.com"
+
+    cat > "$MOCK_BIN/curl" << 'MOCK_EOF'
+#!/bin/bash
+echo '{"five_hour":{"utilization":12,"resets_at":"2026-06-19T04:20:00+00:00"},"seven_day":{"utilization":5,"resets_at":"2026-06-23T16:00:00+00:00"},"limits":[{"kind":"session","percent":12,"is_active":true}]}'
+echo "200"
+MOCK_EOF
+    chmod +x "$MOCK_BIN/curl"
+
+    run run_ccswitch warm-check
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"No account needed warm ping."* ]]
+
+    usage1=$(jq -r '.accounts["1"].lastKnownUsage.fiveHour' "$SEQUENCE_FILE")
+    usage2=$(jq -r '.accounts["2"].lastKnownUsage // empty' "$SEQUENCE_FILE")
+    [ "$usage1" = "12" ]
+    [ -z "$usage2" ]
 }

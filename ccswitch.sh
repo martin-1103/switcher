@@ -528,44 +528,41 @@ cmd_warm_check() {
 
     local now_epoch
     now_epoch=$(date +%s)
-    local did_ping=0
+    local active_num active_email creds cache_file reset_at reset_epoch last_pinged access_token usage_line
+    active_num=$(jq -r '.activeAccountNumber // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
+    [[ -n "$active_num" && "$active_num" != "null" ]] || { echo "No active account."; return 0; }
+    active_email=$(jq -r --arg num "$active_num" '.accounts[$num].email // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
+    [[ -n "$active_email" ]] || { echo "No active account email."; return 0; }
 
-    while IFS='|' read -r num email; do
-        [[ -n "$num" ]] || continue
-        local creds cache_file reset_at reset_epoch last_pinged access_token usage_line
-        if [[ "$(jq -r --arg num "$num" '.activeAccountNumber == ($num|tonumber)' "$SEQUENCE_FILE" 2>/dev/null)" == "true" ]]; then
-            creds=$(read_credentials)
-        else
-            creds=$(read_account_credentials "$num" "$email")
-        fi
-        [[ -n "$creds" ]] || continue
+    creds=$(read_credentials)
+    [[ -n "$creds" ]] || { echo "No active credentials."; return 0; }
 
-        cache_file=$(mktemp "/tmp/ccs-warm-${num}-XXXXXX.json")
-        if ! fetch_usage_for_account "$num" "$email" "$creds" "$cache_file"; then
-            rm -f "$cache_file"
-            continue
-        fi
-
-        reset_at=$(jq -r '.five_hour.resets_at // empty' "$cache_file" 2>/dev/null || true)
-        usage_line=$(format_usage_windows "$cache_file" 2>/dev/null | tr -d '\n')
+    cache_file=$(mktemp "/tmp/ccs-warm-${active_num}-XXXXXX.json")
+    if ! fetch_usage_for_account "$active_num" "$active_email" "$creds" "$cache_file"; then
         rm -f "$cache_file"
-        [[ -n "$reset_at" ]] || continue
+        echo "Active account usage refresh failed."
+        return 0
+    fi
 
-        reset_epoch=$(iso_to_epoch "$reset_at")
-        [[ "$reset_epoch" -gt 0 ]] || continue
-        last_pinged=$(jq -r --arg num "$num" '.accounts[$num].lastPingedResetAt // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
+    reset_at=$(jq -r '.five_hour.resets_at // empty' "$cache_file" 2>/dev/null || true)
+    usage_line=$(format_usage_windows "$cache_file" 2>/dev/null | tr -d '\n')
+    rm -f "$cache_file"
+    [[ -n "$reset_at" ]] || { echo "No account needed warm ping."; return 0; }
 
-        if [[ "$now_epoch" -ge $((reset_epoch - lead_seconds)) && "$last_pinged" != "$reset_at" ]]; then
-            access_token=$(credential_access_token "$creds")
-            if [[ -n "$access_token" ]] && send_warm_ping "$access_token"; then
-                mark_account_pinged "$num" "$reset_at" >/dev/null 2>&1 || true
-                echo "Pinged Account-$num ($email) after resetAt=$reset_at [$usage_line]"
-                did_ping=1
-            fi
+    reset_epoch=$(iso_to_epoch "$reset_at")
+    [[ "$reset_epoch" -gt 0 ]] || { echo "No account needed warm ping."; return 0; }
+    last_pinged=$(jq -r --arg num "$active_num" '.accounts[$num].lastPingedResetAt // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
+
+    if [[ "$now_epoch" -ge $((reset_epoch - lead_seconds)) && "$last_pinged" != "$reset_at" ]]; then
+        access_token=$(credential_access_token "$creds")
+        if [[ -n "$access_token" ]] && send_warm_ping "$access_token"; then
+            mark_account_pinged "$active_num" "$reset_at" >/dev/null 2>&1 || true
+            echo "Pinged Account-$active_num ($active_email) after resetAt=$reset_at [$usage_line]"
+            return 0
         fi
-    done < <(jq -r '.accounts | to_entries[] | "\(.key)|\(.value.email)"' "$SEQUENCE_FILE" 2>/dev/null)
+    fi
 
-    [[ "$did_ping" -eq 1 ]] || echo "No account needed warm ping."
+    echo "No account needed warm ping."
 }
 
 cmd_warm_loop() {
@@ -589,35 +586,93 @@ cmd_warm_loop() {
     done
 }
 
+account_snapshot_usage() {
+    local account_num="$1"
+    jq -r --arg num "$account_num" '
+        if ((.accounts[$num].lastKnownUsage.activeLimit // 0) > 0) then
+            (.accounts[$num].lastKnownUsage.activeLimit // 0)
+        else
+            [
+                (.accounts[$num].lastKnownUsage.fiveHour // 0),
+                (.accounts[$num].lastKnownUsage.sevenDay // 0)
+            ] | max
+        end
+    ' "$SEQUENCE_FILE" 2>/dev/null || echo "0"
+}
+
+account_group_type() {
+    local account_num="$1"
+    jq -r --arg num "$account_num" '.accounts[$num].accountType // "other"' "$SEQUENCE_FILE" 2>/dev/null || echo "other"
+}
+
+emit_group_ladder_candidates() {
+    local group="$1"
+    local active_account="$2"
+    local entries=()
+    local ord=0
+    local num type usage target=""
+
+    while IFS= read -r num; do
+        [[ -n "$num" ]] || continue
+        if [[ "$num" == "$active_account" ]]; then
+            ord=$((ord + 1))
+            continue
+        fi
+        type=$(account_group_type "$num")
+        if [[ "$type" == "$group" ]]; then
+            usage=$(account_snapshot_usage "$num")
+            entries+=("${usage}|${ord}|${num}")
+        fi
+        ord=$((ord + 1))
+    done < <(jq -r '.sequence[]' "$SEQUENCE_FILE" 2>/dev/null)
+
+    [[ ${#entries[@]} -gt 0 ]] || return 0
+
+    local stage entry entry_usage
+    for stage in 20 40 60 80 95; do
+        for entry in "${entries[@]}"; do
+            entry_usage="${entry%%|*}"
+            if (( entry_usage < stage )); then
+                target="$stage"
+                break 2
+            fi
+        done
+    done
+
+    [[ -n "$target" ]] || return 0
+
+    printf '%s\n' "${entries[@]}" \
+        | awk -F'|' -v target="$target" '$1 < target { print }' \
+        | sort -t'|' -k1,1n -k2,2n \
+        | cut -d'|' -f3
+}
+
 auto_switch_candidates() {
     local active_account="$1"
-    jq -r --arg active "$active_account" '
-        .sequence as $seq |
-        [
-            range(0; ($seq | length)) as $i |
-            ($seq[$i] | tostring) as $num |
-            select($num != $active) |
-            {
-                num: $num,
-                ord: $i,
-                prio: (
-                    if (.accounts[$num].accountType // "") == "team" then 0
-                    elif (.accounts[$num].accountType // "") == "max20" then 1
-                    else 2
-                    end
-                ),
-                usage_prio: (
-                    if (
-                        ((.accounts[$num].lastKnownUsage.fiveHour // 0) > 0) or
-                        ((.accounts[$num].lastKnownUsage.sevenDay // 0) > 0) or
-                        ((.accounts[$num].lastKnownUsage.activeLimit // 0) > 0)
-                    ) then 1 else 0 end
-                )
-            }
-        ] |
-        sort_by(.prio, .usage_prio, .ord) |
-        .[].num
-    ' "$SEQUENCE_FILE" 2>/dev/null
+
+    emit_group_ladder_candidates "team" "$active_account"
+    local rc=$?
+    if [[ $rc -eq 0 ]]; then
+        local team_out
+        team_out=$(emit_group_ladder_candidates "team" "$active_account")
+        if [[ -n "$team_out" ]]; then
+            printf '%s\n' "$team_out"
+            return 0
+        fi
+    fi
+
+    local max20_out
+    max20_out=$(emit_group_ladder_candidates "max20" "$active_account")
+    if [[ -n "$max20_out" ]]; then
+        printf '%s\n' "$max20_out"
+        return 0
+    fi
+
+    local other_out
+    other_out=$(emit_group_ladder_candidates "other" "$active_account")
+    if [[ -n "$other_out" ]]; then
+        printf '%s\n' "$other_out"
+    fi
 }
 
 # Claude Code process detection (Node.js app)
@@ -1812,6 +1867,16 @@ perform_switch() {
     # The next hook/statusline pass must fetch fresh usage for the new account.
     rm -f "$cache_file" 2>/dev/null || true
 
+    # Best effort: once the target account is active, refresh its usage snapshot
+    # immediately. On this host non-active backup credentials are unreliable, but
+    # active-account usage reads are reliable enough to seed ladder decisions.
+    if [[ "${CCS_SKIP_POST_SWITCH_USAGE_FETCH:-0}" != "1" ]]; then
+        local live_cache
+        live_cache=$(mktemp "/tmp/ccs-switch-${target_account}-XXXXXX.json")
+        fetch_usage_for_account "$target_account" "$target_email" "$target_creds" "$live_cache" >/dev/null 2>&1 || true
+        rm -f "$live_cache" 2>/dev/null || true
+    fi
+
     # Switch is committed; release the lock before any interactive display/restart
     # so we never hold it while waiting on the user.
     release_switch_lock
@@ -2079,7 +2144,7 @@ cmd_rate_check() {
             next_email=$(jq -r --arg num "$next_account" '.accounts[$num].email' "$SEQUENCE_FILE")
 
             # Perform switch in subshell to catch exit 1 from perform_switch
-            if ! (CCS_SILENT=1 perform_switch "$next_account"); then
+            if ! (CCS_SILENT=1 CCS_SKIP_POST_SWITCH_USAGE_FETCH=1 perform_switch "$next_account"); then
                 # Switch failed — fail open in hook mode
                 if [[ "$hook_mode" == true ]]; then
                     exit 0
@@ -2126,7 +2191,7 @@ cmd_rate_check() {
         local current_active
         current_active=$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")
         if [[ "$current_active" != "$starting_account" ]]; then
-            CCS_SILENT=1 perform_switch "$starting_account" >/dev/null 2>&1 || true
+            CCS_SILENT=1 CCS_SKIP_POST_SWITCH_USAGE_FETCH=1 perform_switch "$starting_account" >/dev/null 2>&1 || true
         fi
 
         # All accounts are limited
