@@ -255,6 +255,21 @@ EOF
 create_fake_usage_cache() {
     local utilization="${1:-50}"
     local email="${2:-user1@example.com}"
+    local seven_day="${3:-}"
+    local limit_percent="${4:-}"
+    local limits_json="[]"
+    if [[ -n "$limit_percent" ]]; then
+        limits_json=$(cat <<EOF
+[
+  {
+    "name": "active-limit",
+    "percent": $limit_percent,
+    "is_active": true
+  }
+]
+EOF
+)
+    fi
     cat > /tmp/claude-usage-cache.json <<EOF
 {
   "five_hour": {
@@ -262,6 +277,12 @@ create_fake_usage_cache() {
     "limit": 100,
     "used": $utilization
   },
+  "seven_day": {
+    "utilization": ${seven_day:-0},
+    "limit": 100,
+    "used": ${seven_day:-0}
+  },
+  "limits": $limits_json,
   "active_account": "$email",
   "cached_at": $(date +%s)
 }

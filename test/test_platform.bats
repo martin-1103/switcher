@@ -69,6 +69,23 @@ teardown() {
     [ "$output" = "$HOME/.claude/.claude.json" ]
 }
 
+@test "test_get_claude_config_path_prefers_newer_fallback_when_both_valid" {
+    create_fake_claude_config "primary@example.com"
+    sleep 1
+    cat > "$HOME/.claude.json" <<EOF
+{
+  "oauthAccount": {
+    "emailAddress": "fallback@example.com",
+    "accountUuid": "uuid-fallback"
+  }
+}
+EOF
+
+    run get_claude_config_path
+    [ "$status" -eq 0 ]
+    [ "$output" = "$HOME/.claude.json" ]
+}
+
 @test "test_get_claude_config_path_without_primary_returns_fallback" {
     run get_claude_config_path
     [ "$status" -eq 0 ]

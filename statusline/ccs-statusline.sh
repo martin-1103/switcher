@@ -38,6 +38,18 @@ if [[ -f "$CACHE_FILE" ]]; then
     acct=$(jq -r '.active_account // "?"' "$CACHE_FILE" 2>/dev/null || echo "?")
     util=$(jq -r '.five_hour.utilization // 0' "$CACHE_FILE" 2>/dev/null || echo "0")
     util_int=$(printf "%.0f" "$util" 2>/dev/null || echo "0")
+    weekly=$(jq -r '.seven_day.utilization // empty' "$CACHE_FILE" 2>/dev/null || true)
+    weekly_int=""
+    [[ -n "$weekly" ]] && weekly_int=$(printf "%.0f" "$weekly" 2>/dev/null || echo "")
+    limit=$(jq -r '[(.limits // [])[] | select((.is_active // false) == true) | .percent? | select(type == "number")] | max // empty' "$CACHE_FILE" 2>/dev/null || true)
+    limit_int=""
+    [[ -n "$limit" ]] && limit_int=$(printf "%.0f" "$limit" 2>/dev/null || echo "")
+    eval_int="$util_int"
+    if [[ -n "$limit_int" ]]; then
+        eval_int="$limit_int"
+    elif [[ -n "$weekly_int" && "$weekly_int" -gt "$eval_int" ]]; then
+        eval_int="$weekly_int"
+    fi
 
     # Threshold marker: append "(!)" when at/over the configured threshold.
     threshold=80
@@ -46,9 +58,15 @@ if [[ -f "$CACHE_FILE" ]]; then
         [[ -n "$cfg" ]] && threshold="$cfg"
     fi
     marker=""
-    [[ "$util_int" -ge "$threshold" ]] && marker=" (!)"
+    [[ "$eval_int" -ge "$threshold" ]] && marker=" (!)"
 
-    printf 'ccs %s · 5h %s%%%s\n' "$acct" "$util_int" "$marker"
+    if [[ -n "$limit_int" ]]; then
+        printf 'ccs %s · use %s%% · 5h %s%% · 7d %s%%%s\n' "$acct" "$eval_int" "$util_int" "${weekly_int:-0}" "$marker"
+    elif [[ -n "$weekly_int" ]]; then
+        printf 'ccs %s · use %s%% · 5h %s%% · 7d %s%%%s\n' "$acct" "$eval_int" "$util_int" "$weekly_int" "$marker"
+    else
+        printf 'ccs %s · use %s%%%s\n' "$acct" "$eval_int" "$marker"
+    fi
 else
     printf 'ccs (no usage data yet)\n'
 fi

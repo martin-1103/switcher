@@ -88,17 +88,33 @@ detect_platform() {
 get_claude_config_path() {
     local primary_config="$HOME/.claude/.claude.json"
     local fallback_config="$HOME/.claude.json"
+    local primary_valid=false
+    local fallback_valid=false
 
-    # Check primary location first
-    if [[ -f "$primary_config" ]]; then
-        # Verify it has valid oauthAccount structure
-        if jq -e '.oauthAccount' "$primary_config" >/dev/null 2>&1; then
-            echo "$primary_config"
-            return
-        fi
+    if [[ -f "$primary_config" ]] && jq -e '.oauthAccount' "$primary_config" >/dev/null 2>&1; then
+        primary_valid=true
+    fi
+    if [[ -f "$fallback_config" ]] && jq -e '.oauthAccount' "$fallback_config" >/dev/null 2>&1; then
+        fallback_valid=true
     fi
 
-    # Fallback to standard location
+    if [[ "$primary_valid" == true && "$fallback_valid" == true ]]; then
+        local primary_mtime fallback_mtime
+        primary_mtime=$(stat -c '%Y' "$primary_config" 2>/dev/null || stat -f '%m' "$primary_config" 2>/dev/null || echo 0)
+        fallback_mtime=$(stat -c '%Y' "$fallback_config" 2>/dev/null || stat -f '%m' "$fallback_config" 2>/dev/null || echo 0)
+        if [[ "$fallback_mtime" -gt "$primary_mtime" ]]; then
+            echo "$fallback_config"
+        else
+            echo "$primary_config"
+        fi
+        return
+    fi
+
+    if [[ "$primary_valid" == true ]]; then
+        echo "$primary_config"
+        return
+    fi
+
     echo "$fallback_config"
 }
 
@@ -238,6 +254,372 @@ cache_freshness() {
     echo "fresh"
 }
 
+usage_window_percent() {
+    local cache_file="$1"
+    local key="$2"
+    jq -r --arg key "$key" '.[$key].utilization // empty' "$cache_file" 2>/dev/null
+}
+
+highest_limit_percent() {
+    local cache_file="$1"
+    jq -r '
+        [
+            (.limits // [])[] |
+            select((.is_active // false) == true) |
+            .percent? |
+            select(type == "number" and . > 0)
+        ] | max // empty
+    ' "$cache_file" 2>/dev/null
+}
+
+effective_limit_source() {
+    local cache_file="$1"
+    jq -r '
+        [
+            (.limits // [])[] |
+            select((.is_active // false) == true) |
+            select((.percent? | type) == "number") |
+            {
+                percent: .percent,
+                label: "limit"
+            }
+        ] |
+        sort_by(.percent) |
+        last |
+        if . then "\(.percent)|\(.label)" else empty end
+    ' "$cache_file" 2>/dev/null
+}
+
+effective_usage_percent() {
+    local cache_file="$1"
+    local active_limit active_percent five_hour seven_day
+    active_limit=$(effective_limit_source "$cache_file")
+    if [[ -n "$active_limit" ]]; then
+        printf '%s\n' "${active_limit%%|*}"
+        return
+    fi
+
+    five_hour=$(usage_window_percent "$cache_file" "five_hour")
+    seven_day=$(usage_window_percent "$cache_file" "seven_day")
+
+    jq -nr \
+        --arg five "${five_hour:-0}" \
+        --arg seven "${seven_day:-0}" '
+        [
+            ($five | tonumber? // 0),
+            ($seven | tonumber? // 0)
+        ] | max
+    ' 2>/dev/null
+}
+
+effective_usage_source() {
+    local cache_file="$1"
+    local active_limit
+    active_limit=$(effective_limit_source "$cache_file")
+    if [[ -n "$active_limit" ]]; then
+        printf '%s\n' "${active_limit#*|}"
+    else
+        local seven_day seven_day_int
+        seven_day=$(usage_window_percent "$cache_file" "seven_day")
+        seven_day_int=$(printf "%.0f" "${seven_day:-0}" 2>/dev/null || echo "0")
+        if [[ "$seven_day_int" -gt 0 ]]; then
+            printf 'seven_day\n'
+        else
+            printf 'five_hour\n'
+        fi
+    fi
+}
+
+usage_window_reset() {
+    local cache_file="$1"
+    local key="$2"
+    jq -r --arg key "$key" '.[$key].resets_at // empty' "$cache_file" 2>/dev/null
+}
+
+format_usage_windows() {
+    local cache_file="$1"
+    local five_hour seven_day highest_limit five_hour_int seven_day_int highest_limit_int
+    five_hour=$(usage_window_percent "$cache_file" "five_hour")
+    seven_day=$(usage_window_percent "$cache_file" "seven_day")
+    highest_limit=$(highest_limit_percent "$cache_file")
+
+    [[ -n "$five_hour" ]] && five_hour_int=$(printf "%.0f" "$five_hour" 2>/dev/null || echo "")
+    [[ -n "$seven_day" ]] && seven_day_int=$(printf "%.0f" "$seven_day" 2>/dev/null || echo "")
+    [[ -n "$highest_limit" ]] && highest_limit_int=$(printf "%.0f" "$highest_limit" 2>/dev/null || echo "")
+
+    local parts=()
+    [[ -n "${five_hour_int:-}" ]] && parts+=("5h ${five_hour_int}%")
+    [[ -n "${seven_day_int:-}" ]] && parts+=("7d ${seven_day_int}%")
+    [[ -n "${highest_limit_int:-}" ]] && parts+=("limit ${highest_limit_int}%")
+
+    if [[ ${#parts[@]} -eq 0 ]]; then
+        echo "no usage data"
+    else
+        printf '%s' "${parts[0]}"
+        local i
+        for ((i = 1; i < ${#parts[@]}; i++)); do
+            printf ' | %s' "${parts[i]}"
+        done
+        printf '\n'
+    fi
+}
+
+update_account_usage_snapshot() {
+    local email="$1"
+    local cache_file="$2"
+    [[ -f "$SEQUENCE_FILE" && -f "$cache_file" ]] || return 0
+
+    local account_num
+    account_num=$(jq -r --arg email "$email" '.accounts | to_entries[] | select(.value.email == $email) | .key' "$SEQUENCE_FILE" 2>/dev/null || true)
+    [[ -n "$account_num" ]] || return 0
+
+    local updated
+    updated=$(jq \
+        --arg num "$account_num" \
+        --slurpfile cache "$cache_file" \
+        '
+        .accounts[$num].lastKnownUsage = {
+            fiveHour: ($cache[0].five_hour.utilization // 0),
+            sevenDay: ($cache[0].seven_day.utilization // 0),
+            activeLimit: (
+                [($cache[0].limits // [])[] | select((.is_active // false) == true) | .percent? | select(type == "number")] | max // 0
+            ),
+            resetAt5h: ($cache[0].five_hour.resets_at // null),
+            resetAt7d: ($cache[0].seven_day.resets_at // null),
+            observedAt: ($cache[0].cached_at // 0)
+        }
+        ' "$SEQUENCE_FILE" 2>/dev/null) || return 0
+
+    [[ -n "$updated" ]] || return 0
+    write_json "$SEQUENCE_FILE" "$updated" >/dev/null 2>&1 || true
+}
+
+iso_to_epoch() {
+    local iso="$1"
+    [[ -n "$iso" && "$iso" != "null" ]] || { echo 0; return; }
+    date -d "$iso" +%s 2>/dev/null || date -j -f "%Y-%m-%dT%H:%M:%S%z" "$iso" +%s 2>/dev/null || echo 0
+}
+
+write_account_credentials_if_active() {
+    local email="$1"
+    local creds="$2"
+    local current_email
+    current_email=$(get_current_account)
+    if [[ "$email" == "$current_email" ]]; then
+        write_credentials "$creds" >/dev/null 2>&1 || true
+    fi
+}
+
+fetch_usage_for_account() {
+    local account_num="$1"
+    local email="$2"
+    local creds="$3"
+    local cache_file="$4"
+    local persist_backup="${5:-true}"
+
+    [[ -n "$creds" ]] || return 1
+
+    local access_token
+    access_token=$(credential_access_token "$creds")
+    [[ -n "$access_token" ]] || return 1
+
+    local response http_code body
+    response=$(curl -sS -w "\n%{http_code}" \
+        -H "Authorization: Bearer $access_token" \
+        -H "anthropic-beta: oauth-2025-04-20" \
+        "https://api.anthropic.com/api/oauth/usage" 2>/dev/null) || return 1
+
+    http_code=$(echo "$response" | tail -n1)
+    body=$(echo "$response" | sed '$d')
+
+    if [[ "$http_code" == "401" ]]; then
+        local refresh_token client_id refresh_response refresh_code refresh_body new_access new_refresh updated_creds
+        refresh_token=$(credential_refresh_token "$creds")
+        client_id="9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+        [[ -n "$refresh_token" ]] || return 1
+
+        refresh_response=$(curl -sS -w "\n%{http_code}" \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d "{\"grant_type\":\"refresh_token\",\"refresh_token\":\"$refresh_token\",\"client_id\":\"$client_id\"}" \
+            "https://console.anthropic.com/v1/oauth/token" 2>/dev/null) || return 1
+        refresh_code=$(echo "$refresh_response" | tail -n1)
+        refresh_body=$(echo "$refresh_response" | sed '$d')
+        [[ "$refresh_code" == "200" ]] || return 1
+
+        new_access=$(echo "$refresh_body" | jq -r '.access_token // empty' 2>/dev/null)
+        new_refresh=$(echo "$refresh_body" | jq -r '.refresh_token // empty' 2>/dev/null)
+        [[ -n "$new_access" ]] || return 1
+
+        updated_creds=$(update_credential_tokens "$creds" "$new_access" "${new_refresh:-$refresh_token}")
+        if [[ "$persist_backup" == "true" ]]; then
+            write_account_credentials "$account_num" "$email" "$updated_creds" >/dev/null 2>&1 || true
+        fi
+        write_account_credentials_if_active "$email" "$updated_creds"
+
+        response=$(curl -sS -w "\n%{http_code}" \
+            -H "Authorization: Bearer $new_access" \
+            -H "anthropic-beta: oauth-2025-04-20" \
+            "https://api.anthropic.com/api/oauth/usage" 2>/dev/null) || return 1
+        http_code=$(echo "$response" | tail -n1)
+        body=$(echo "$response" | sed '$d')
+    fi
+
+    [[ "$http_code" == "200" ]] || return 1
+    echo "$body" | jq . >/dev/null 2>&1 || return 1
+
+    local cache_content
+    cache_content=$(echo "$body" | jq \
+        --arg email "$email" \
+        --arg ts "$(date +%s)" \
+        '. + {active_account: $email, cached_at: ($ts | tonumber)}' 2>/dev/null) || return 1
+
+    printf '%s' "$cache_content" > "$cache_file"
+    update_account_usage_snapshot "$email" "$cache_file"
+    return 0
+}
+
+send_warm_ping() {
+    local access_token="$1"
+    local model="${CCS_PING_MODEL:-claude-3-5-haiku-latest}"
+    local response_code
+    response_code=$(curl -sS -o /dev/null -w "%{http_code}" \
+        -X POST \
+        -H "Authorization: Bearer $access_token" \
+        -H "anthropic-beta: oauth-2025-04-20" \
+        -H "content-type: application/json" \
+        "https://api.anthropic.com/v1/messages?beta=true" \
+        -d "{\"model\":\"${model}\",\"max_tokens\":1,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}" 2>/dev/null) || return 1
+    [[ "$response_code" =~ ^2 ]] || return 1
+}
+
+mark_account_pinged() {
+    local account_num="$1"
+    local reset_at="$2"
+    local now
+    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    local updated
+    updated=$(jq \
+        --arg num "$account_num" \
+        --arg reset "$reset_at" \
+        --arg now "$now" \
+        '
+        .accounts[$num].lastPingedResetAt = $reset |
+        .accounts[$num].lastPingAt = $now
+        ' "$SEQUENCE_FILE" 2>/dev/null) || return 1
+    write_json "$SEQUENCE_FILE" "$updated"
+}
+
+cmd_warm_check() {
+    local lead_seconds=5
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --lead-seconds)
+                lead_seconds="$2"
+                shift 2
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    [[ -f "$SEQUENCE_FILE" ]] || { echo "Error: No accounts configured"; exit 1; }
+
+    local now_epoch
+    now_epoch=$(date +%s)
+    local did_ping=0
+
+    while IFS='|' read -r num email; do
+        [[ -n "$num" ]] || continue
+        local creds cache_file reset_at reset_epoch last_pinged access_token usage_line
+        if [[ "$(jq -r --arg num "$num" '.activeAccountNumber == ($num|tonumber)' "$SEQUENCE_FILE" 2>/dev/null)" == "true" ]]; then
+            creds=$(read_credentials)
+        else
+            creds=$(read_account_credentials "$num" "$email")
+        fi
+        [[ -n "$creds" ]] || continue
+
+        cache_file=$(mktemp "/tmp/ccs-warm-${num}-XXXXXX.json")
+        if ! fetch_usage_for_account "$num" "$email" "$creds" "$cache_file"; then
+            rm -f "$cache_file"
+            continue
+        fi
+
+        reset_at=$(jq -r '.five_hour.resets_at // empty' "$cache_file" 2>/dev/null || true)
+        usage_line=$(format_usage_windows "$cache_file" 2>/dev/null | tr -d '\n')
+        rm -f "$cache_file"
+        [[ -n "$reset_at" ]] || continue
+
+        reset_epoch=$(iso_to_epoch "$reset_at")
+        [[ "$reset_epoch" -gt 0 ]] || continue
+        last_pinged=$(jq -r --arg num "$num" '.accounts[$num].lastPingedResetAt // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
+
+        if [[ "$now_epoch" -ge $((reset_epoch - lead_seconds)) && "$last_pinged" != "$reset_at" ]]; then
+            access_token=$(credential_access_token "$creds")
+            if [[ -n "$access_token" ]] && send_warm_ping "$access_token"; then
+                mark_account_pinged "$num" "$reset_at" >/dev/null 2>&1 || true
+                echo "Pinged Account-$num ($email) after resetAt=$reset_at [$usage_line]"
+                did_ping=1
+            fi
+        fi
+    done < <(jq -r '.accounts | to_entries[] | "\(.key)|\(.value.email)"' "$SEQUENCE_FILE" 2>/dev/null)
+
+    [[ "$did_ping" -eq 1 ]] || echo "No account needed warm ping."
+}
+
+cmd_warm_loop() {
+    local interval=60
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --interval)
+                interval="$2"
+                shift 2
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    echo "Starting warm loop (interval=${interval}s). Ctrl-C to stop."
+    while true; do
+        cmd_warm_check
+        sleep "$interval"
+    done
+}
+
+auto_switch_candidates() {
+    local active_account="$1"
+    jq -r --arg active "$active_account" '
+        .sequence as $seq |
+        [
+            range(0; ($seq | length)) as $i |
+            ($seq[$i] | tostring) as $num |
+            select($num != $active) |
+            {
+                num: $num,
+                ord: $i,
+                prio: (
+                    if (.accounts[$num].accountType // "") == "team" then 0
+                    elif (.accounts[$num].accountType // "") == "max20" then 1
+                    else 2
+                    end
+                ),
+                usage_prio: (
+                    if (
+                        ((.accounts[$num].lastKnownUsage.fiveHour // 0) > 0) or
+                        ((.accounts[$num].lastKnownUsage.sevenDay // 0) > 0) or
+                        ((.accounts[$num].lastKnownUsage.activeLimit // 0) > 0)
+                    ) then 1 else 0 end
+                )
+            }
+        ] |
+        sort_by(.prio, .usage_prio, .ord) |
+        .[].num
+    ' "$SEQUENCE_FILE" 2>/dev/null
+}
+
 # Claude Code process detection (Node.js app)
 is_claude_running() {
     ps -eo pid,comm,args | awk '$2 == "claude" || $3 == "claude" {exit 0} END {exit 1}'
@@ -293,6 +675,48 @@ read_credentials() {
             fi
             ;;
     esac
+}
+
+# Extract access token from credentials in either legacy flat format or the
+# current Claude Code nested format.
+credential_access_token() {
+    local creds="$1"
+    echo "$creds" | jq -r '
+        .access_token //
+        .token //
+        .claudeAiOauth.accessToken //
+        empty
+    ' 2>/dev/null
+}
+
+# Extract refresh token from credentials in either legacy flat format or the
+# current Claude Code nested format.
+credential_refresh_token() {
+    local creds="$1"
+    echo "$creds" | jq -r '
+        .refresh_token //
+        .claudeAiOauth.refreshToken //
+        empty
+    ' 2>/dev/null
+}
+
+# Update tokens while preserving the credential JSON shape Claude Code expects.
+update_credential_tokens() {
+    local creds="$1"
+    local access_token="$2"
+    local refresh_token="$3"
+
+    echo "$creds" | jq \
+        --arg at "$access_token" \
+        --arg rt "$refresh_token" '
+        if has("claudeAiOauth") then
+            .claudeAiOauth.accessToken = $at |
+            .claudeAiOauth.refreshToken = $rt
+        else
+            .access_token = $at |
+            .refresh_token = $rt
+        end
+    ' 2>/dev/null
 }
 
 # Write credentials based on platform
@@ -537,7 +961,11 @@ cmd_check() {
             fi
             # Check file permissions
             local perms
-            perms=$(stat -f "%Lp" "$config_file" 2>/dev/null || stat -c "%a" "$config_file" 2>/dev/null)
+            if [[ "$platform" == "macos" ]]; then
+                perms=$(stat -f "%Lp" "$config_file" 2>/dev/null)
+            else
+                perms=$(stat -c "%a" "$config_file" 2>/dev/null)
+            fi
             if [[ "$perms" == "600" ]]; then
                 echo "  [OK] Config file permissions: $perms"
             else
@@ -578,7 +1006,11 @@ cmd_check() {
                         issues=$((issues + 1))
                     fi
                     local cperms
-                    cperms=$(stat -f "%Lp" "$cred_file" 2>/dev/null || stat -c "%a" "$cred_file" 2>/dev/null)
+                    if [[ "$platform" == "macos" ]]; then
+                        cperms=$(stat -f "%Lp" "$cred_file" 2>/dev/null)
+                    else
+                        cperms=$(stat -c "%a" "$cred_file" 2>/dev/null)
+                    fi
                     if [[ "$cperms" == "600" ]]; then
                         echo "  [OK] Credentials file permissions: $cperms"
                     else
@@ -596,7 +1028,11 @@ cmd_check() {
     # Check backup directory permissions
     echo ""
     local dir_perms
-    dir_perms=$(stat -f "%Lp" "$BACKUP_DIR" 2>/dev/null || stat -c "%a" "$BACKUP_DIR" 2>/dev/null)
+    if [[ "$platform" == "macos" ]]; then
+        dir_perms=$(stat -f "%Lp" "$BACKUP_DIR" 2>/dev/null)
+    else
+        dir_perms=$(stat -c "%a" "$BACKUP_DIR" 2>/dev/null)
+    fi
     if [[ "$dir_perms" == "700" ]]; then
         echo "[OK] Backup directory permissions: $dir_perms"
     else
@@ -625,10 +1061,12 @@ cmd_status() {
 
     local active_num=""
     local profile_name=""
+    local account_type=""
     if [[ "$current_email" != "none" ]]; then
         active_num=$(jq -r --arg email "$current_email" '.accounts | to_entries[] | select(.value.email == $email) | .key' "$SEQUENCE_FILE" 2>/dev/null)
         if [[ -n "$active_num" ]]; then
             profile_name=$(jq -r --arg num "$active_num" '.accounts[$num].profile // empty' "$SEQUENCE_FILE" 2>/dev/null)
+            account_type=$(jq -r --arg num "$active_num" '.accounts[$num].accountType // empty' "$SEQUENCE_FILE" 2>/dev/null)
         fi
     fi
 
@@ -641,6 +1079,9 @@ cmd_status() {
     fi
     if [[ -n "$profile_name" ]]; then
         echo "Profile name:    $profile_name"
+    fi
+    if [[ -n "$account_type" ]]; then
+        echo "Account type:    $account_type"
     fi
 
     # Last switch timestamp
@@ -657,7 +1098,7 @@ cmd_status() {
     if [[ -n "$creds" ]]; then
         # Try to extract access_token or the token field
         local token
-        token=$(echo "$creds" | jq -r '.access_token // .token // empty' 2>/dev/null)
+        token=$(credential_access_token "$creds")
         if [[ -n "$token" ]]; then
             local payload
             payload=$(decode_jwt_payload "$token")
@@ -689,6 +1130,21 @@ cmd_status() {
     else
         echo "Token status:    No credentials found"
     fi
+
+    local cache_file="/tmp/claude-usage-cache.json"
+    if [[ -f "$cache_file" ]]; then
+        local usage_summary five_reset seven_reset
+        usage_summary=$(format_usage_windows "$cache_file")
+        five_reset=$(usage_window_reset "$cache_file" "five_hour")
+        seven_reset=$(usage_window_reset "$cache_file" "seven_day")
+
+        echo ""
+        echo "Usage windows:   $usage_summary"
+        [[ -n "$five_reset" ]] && echo "5h resets at:    $five_reset"
+        [[ -n "$seven_reset" ]] && echo "7d resets at:    $seven_reset"
+    fi
+
+    return 0
 }
 
 # Usage statistics
@@ -1089,10 +1545,11 @@ cmd_list() {
         .sequence[] as $num |
         .accounts["\($num)"] |
         (if .profile then " [\(.profile)]" else "" end) as $prof |
+        (if .accountType then " {\(.accountType)}" else "" end) as $type |
         if "\($num)" == $active then
-            "  \($num): \(.email)\($prof) (active)"
+            "  \($num): \(.email)\($prof)\($type) (active)"
         else
-            "  \($num): \(.email)\($prof)"
+            "  \($num): \(.email)\($prof)\($type)"
         end
     ' "$SEQUENCE_FILE"
 }
@@ -1184,6 +1641,7 @@ cmd_switch_to() {
 # Perform the actual account switch
 perform_switch() {
     local target_account="$1"
+    local cache_file="/tmp/claude-usage-cache.json"
 
     # Get current and target account info
     local current_account target_email current_email
@@ -1350,6 +1808,10 @@ perform_switch() {
         exit 1
     fi
 
+    # Invalidate any stale usage cache from the previous account immediately.
+    # The next hook/statusline pass must fetch fresh usage for the new account.
+    rm -f "$cache_file" 2>/dev/null || true
+
     # Switch is committed; release the lock before any interactive display/restart
     # so we never hold it while waiting on the user.
     release_switch_lock
@@ -1380,7 +1842,7 @@ fetch_usage_data() {
         return 1
     fi
 
-    access_token=$(echo "$creds" | jq -r '.access_token // empty' 2>/dev/null)
+    access_token=$(credential_access_token "$creds")
     if [[ -z "$access_token" ]]; then
         return 1
     fi
@@ -1399,7 +1861,7 @@ fetch_usage_data() {
     # Handle token refresh on 401
     if [[ "$http_code" == "401" ]]; then
         local refresh_token client_id
-        refresh_token=$(echo "$creds" | jq -r '.refresh_token // empty' 2>/dev/null)
+        refresh_token=$(credential_refresh_token "$creds")
         client_id="9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 
         if [[ -z "$refresh_token" ]]; then
@@ -1430,10 +1892,7 @@ fetch_usage_data() {
             return 1
         fi
 
-        updated_creds=$(echo "$creds" | jq \
-            --arg at "$new_access" \
-            --arg rt "${new_refresh:-$refresh_token}" \
-            '.access_token = $at | .refresh_token = $rt' 2>/dev/null)
+        updated_creds=$(update_credential_tokens "$creds" "$new_access" "${new_refresh:-$refresh_token}")
         write_credentials "$updated_creds"
 
         # Retry the usage API with new token
@@ -1463,6 +1922,7 @@ fetch_usage_data() {
         '. + {active_account: $email, cached_at: ($ts | tonumber)}' 2>/dev/null) || return 1
 
     echo "$cache_content" > "$cache_file"
+    update_account_usage_snapshot "$current_email" "$cache_file"
     return 0
 }
 
@@ -1567,21 +2027,23 @@ cmd_rate_check() {
     fi
 
     # Read utilization
-    local usage usage_int
-    usage=$(jq -r '.five_hour.utilization // 0' "$cache_file" 2>/dev/null || echo "0")
+    local usage usage_int usage_summary usage_source
+    usage=$(effective_usage_percent "$cache_file")
     usage_int=$(printf "%.0f" "$usage" 2>/dev/null || echo "0")
+    usage_summary=$(format_usage_windows "$cache_file")
+    usage_source=$(effective_usage_source "$cache_file")
 
     # Below threshold — all good
     if [[ "$usage_int" -lt "$threshold" ]]; then
         if [[ "$hook_mode" != true ]]; then
-            echo "Usage: ${usage_int}% (threshold: ${threshold}%) — OK"
+            echo "Usage: ${usage_summary} (threshold: ${threshold}% on ${usage_source}) — OK"
         fi
         exit 0
     fi
 
     # Above threshold
     if [[ "$hook_mode" != true ]]; then
-        echo "Usage: ${usage_int}% exceeds threshold ${threshold}%"
+        echo "Usage: ${usage_summary} exceeds threshold ${threshold}% on ${usage_source}"
     fi
 
     if [[ "$auto_switch" == true ]]; then
@@ -1605,18 +2067,15 @@ cmd_rate_check() {
             exit 3
         fi
 
-        # Try switching to next accounts (up to N-1 attempts)
+        # Try switching to next accounts, prioritizing team accounts before max20.
         local attempts=0
         local max_attempts=$((total_accounts - 1))
+        local starting_account
+        starting_account=$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")
 
-        while [[ $attempts -lt $max_attempts ]]; do
-            local active_account next_account next_email
-            active_account=$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")
-            next_account=$(jq -r --argjson active "$active_account" '
-                .sequence as $seq |
-                ($seq | index($active) // 0) as $idx |
-                $seq[($idx + 1) % ($seq | length)]
-            ' "$SEQUENCE_FILE")
+        while IFS= read -r next_account; do
+            [[ -z "$next_account" ]] && continue
+            local next_email
             next_email=$(jq -r --arg num "$next_account" '.accounts[$num].email' "$SEQUENCE_FILE")
 
             # Perform switch in subshell to catch exit 1 from perform_switch
@@ -1633,7 +2092,7 @@ cmd_rate_check() {
             rm -f "$cache_file"
             if fetch_usage_data; then
                 local new_usage new_usage_int
-                new_usage=$(jq -r '.five_hour.utilization // 0' "$cache_file" 2>/dev/null || echo "0")
+                new_usage=$(effective_usage_percent "$cache_file")
                 new_usage_int=$(printf "%.0f" "$new_usage" 2>/dev/null || echo "0")
 
                 if [[ "$new_usage_int" -lt "$threshold" ]]; then
@@ -1642,7 +2101,9 @@ cmd_rate_check() {
                         _rate_hook_deny "Rate limit exceeded. Switched to Account-$next_account ($next_email). Please restart Claude Code."
                         exit 0
                     fi
-                    echo "Switched to Account-$next_account ($next_email) — usage: ${new_usage_int}%"
+                    local new_usage_summary
+                    new_usage_summary=$(format_usage_windows "$cache_file")
+                    echo "Switched to Account-$next_account ($next_email) — usage: ${new_usage_summary}"
                     handle_restart_after_switch
                     exit 1
                 fi
@@ -1658,7 +2119,15 @@ cmd_rate_check() {
             fi
 
             attempts=$((attempts + 1))
-        done
+            [[ $attempts -ge $max_attempts ]] && break
+        done < <(auto_switch_candidates "$starting_account")
+
+        # Restore the original account before reporting "all limited".
+        local current_active
+        current_active=$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")
+        if [[ "$current_active" != "$starting_account" ]]; then
+            CCS_SILENT=1 perform_switch "$starting_account" >/dev/null 2>&1 || true
+        fi
 
         # All accounts are limited
         if [[ "$hook_mode" == true ]]; then
@@ -1913,6 +2382,8 @@ show_usage() {
     echo "  rate-setup --disable             Remove hook and disable auto-switch"
     echo "  statusline-setup                 Install statusline (shows usage, keeps cache warm)"
     echo "  statusline-setup --disable       Remove the ccs statusline"
+    echo "  warm-check                       Refresh all accounts, ping just-reset 5h windows once"
+    echo "  warm-loop                        Run warm-check every 60s"
     echo ""
     echo "Diagnostics:"
     echo "  check                            Verify backup integrity (JSON, permissions, keychain)"
@@ -2027,6 +2498,14 @@ main() {
         statusline-setup)
             shift
             cmd_statusline_setup "$@"
+            ;;
+        warm-check)
+            shift
+            cmd_warm_check "$@"
+            ;;
+        warm-loop)
+            shift
+            cmd_warm_loop "$@"
             ;;
         check|--check)
             cmd_check

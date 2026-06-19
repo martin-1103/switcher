@@ -36,12 +36,25 @@ run_statusline() {
 @test "statusline prints account and usage from a fresh cache" {
     setup_fake_account "user1@example.com" "uuid-1"
     add_account_to_sequence "1" "user1@example.com" "uuid-1" "true"
-    create_fake_usage_cache 42 "user1@example.com"
+    create_fake_usage_cache 42 "user1@example.com" 13 42
 
     run run_statusline
     [ "$status" -eq 0 ]
     [[ "$output" == *"user1@example.com"* ]]
-    [[ "$output" == *"42%"* ]]
+    [[ "$output" == *"use 42%"* ]]
+    [[ "$output" == *"5h 42%"* ]]
+    [[ "$output" == *"7d 13%"* ]]
+}
+
+@test "statusline uses active limit when it exceeds 5h" {
+    setup_fake_account "user1@example.com" "uuid-1"
+    add_account_to_sequence "1" "user1@example.com" "uuid-1" "true"
+    create_fake_usage_cache 0 "user1@example.com" 13 95
+
+    run run_statusline
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"use 95%"* ]]
+    [[ "$output" == *"(!)"* ]]
 }
 
 @test "statusline reports when no usage data is cached" {

@@ -5,10 +5,12 @@ load test_helper
 setup() {
     setup_test_env
     CACHE_FILE="/tmp/claude-usage-cache-test-$$.json"
+    rm -f /tmp/claude-usage-cache.json
 }
 
 teardown() {
     rm -f "$CACHE_FILE"
+    rm -f /tmp/claude-usage-cache.json
     teardown_test_env
 }
 
@@ -50,6 +52,50 @@ EOF
     run run_ccswitch rate-check --threshold 80
     [ "$status" -eq 1 ]
     [[ "$output" == *"exceeds"* ]]
+}
+
+@test "test_rate_check_reports_5h_and_7d_usage" {
+    setup_fake_account "user1@example.com" "uuid-1"
+    add_account_to_sequence "1" "user1@example.com" "uuid-1" "true"
+
+    create_fake_usage_cache 90 "user1@example.com" 13
+
+    run run_ccswitch rate-check --threshold 80
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"5h 90% | 7d 13%"* ]]
+}
+
+@test "test_rate_check_uses_highest_active_limit_when_above_5h" {
+    setup_fake_account "user1@example.com" "uuid-1"
+    add_account_to_sequence "1" "user1@example.com" "uuid-1" "true"
+
+    create_fake_usage_cache 0 "user1@example.com" 13 95
+
+    run run_ccswitch rate-check --threshold 80
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"limit 95%"* ]]
+    [[ "$output" == *"exceeds threshold 80% on limit"* ]]
+}
+
+@test "test_rate_check_falls_back_to_seven_day_when_no_active_limit" {
+    setup_fake_account "user1@example.com" "uuid-1"
+    add_account_to_sequence "1" "user1@example.com" "uuid-1" "true"
+
+    cat > /tmp/claude-usage-cache.json <<EOF
+{
+  "five_hour": { "utilization": 0 },
+  "seven_day": { "utilization": 91 },
+  "limits": [
+    { "kind": "weekly_all", "percent": 91, "is_active": false }
+  ],
+  "active_account": "user1@example.com",
+  "cached_at": $(date +%s)
+}
+EOF
+
+    run run_ccswitch rate-check --threshold 80
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"exceeds threshold 80% on seven_day"* ]]
 }
 
 @test "test_rate_check_no_cache_returns_2" {
@@ -172,6 +218,120 @@ MOCK_EOF
 
     run run_ccswitch rate-check --auto-switch --threshold 80
     [ "$status" -eq 3 ]
+}
+
+@test "test_rate_check_auto_switch_prioritizes_team_before_max20" {
+    setup_fake_account "max@example.com" "uuid-max"
+    add_account_to_sequence "1" "max@example.com" "uuid-max" "true"
+    add_account_to_sequence "2" "team1@example.com" "uuid-team1" "false"
+    add_account_to_sequence "3" "team2@example.com" "uuid-team2" "false"
+    create_fake_credentials "max@example.com"
+
+    local updated
+    updated=$(jq '
+        .accounts["1"].accountType = "max20" |
+        .accounts["2"].accountType = "team" |
+        .accounts["3"].accountType = "team"
+    ' "$SEQUENCE_FILE")
+    echo "$updated" > "$SEQUENCE_FILE"
+
+    create_fake_usage_cache 90 "max@example.com"
+
+    cat > "$MOCK_BIN/curl" << 'MOCK_EOF'
+#!/bin/bash
+if [[ ! -f "$HOME/.curl_calls" ]]; then
+  echo 0 > "$HOME/.curl_calls"
+fi
+calls=$(cat "$HOME/.curl_calls")
+calls=$((calls + 1))
+echo "$calls" > "$HOME/.curl_calls"
+if [[ "$calls" -eq 1 ]]; then
+  echo '{"five_hour":{"utilization":10,"limit":100,"used":10}}'
+else
+  echo '{"five_hour":{"utilization":95,"limit":100,"used":95}}'
+fi
+echo "200"
+MOCK_EOF
+    chmod +x "$MOCK_BIN/curl"
+
+    run run_ccswitch rate-check --auto-switch --threshold 80
+    [ "$status" -eq 1 ]
+    active=$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")
+    [ "$active" -eq 2 ]
+}
+
+@test "test_rate_check_auto_switch_prioritizes_known_zero_usage_team_first" {
+    setup_fake_account "max@example.com" "uuid-max"
+    add_account_to_sequence "1" "max@example.com" "uuid-max" "true"
+    add_account_to_sequence "2" "team-used@example.com" "uuid-team-used" "false"
+    add_account_to_sequence "3" "team-fresh@example.com" "uuid-team-fresh" "false"
+    create_fake_credentials "max@example.com"
+
+    local updated
+    updated=$(jq '
+        .accounts["1"].accountType = "max20" |
+        .accounts["2"].accountType = "team" |
+        .accounts["3"].accountType = "team" |
+        .accounts["2"].lastKnownUsage = {
+            fiveHour: 10,
+            sevenDay: 0,
+            activeLimit: 10,
+            observedAt: 123
+        } |
+        .accounts["3"].lastKnownUsage = {
+            fiveHour: 0,
+            sevenDay: 0,
+            activeLimit: 0,
+            observedAt: 123
+        }
+    ' "$SEQUENCE_FILE")
+    echo "$updated" > "$SEQUENCE_FILE"
+
+    create_fake_usage_cache 90 "max@example.com"
+
+    cat > "$MOCK_BIN/curl" << 'MOCK_EOF'
+#!/bin/bash
+if [[ ! -f "$HOME/.curl_calls" ]]; then
+  echo 0 > "$HOME/.curl_calls"
+fi
+calls=$(cat "$HOME/.curl_calls")
+calls=$((calls + 1))
+echo "$calls" > "$HOME/.curl_calls"
+if [[ "$calls" -eq 1 ]]; then
+  echo '{"five_hour":{"utilization":0,"limit":100,"used":0}}'
+else
+  echo '{"five_hour":{"utilization":95,"limit":100,"used":95}}'
+fi
+echo "200"
+MOCK_EOF
+    chmod +x "$MOCK_BIN/curl"
+
+    run run_ccswitch rate-check --auto-switch --threshold 80
+    [ "$status" -eq 1 ]
+    active=$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")
+    [ "$active" -eq 3 ]
+}
+
+@test "test_rate_check_auto_switch_all_limited_restores_original_account" {
+    setup_fake_account "user1@example.com" "uuid-1"
+    add_account_to_sequence "1" "user1@example.com" "uuid-1" "true"
+    add_account_to_sequence "2" "user2@example.com" "uuid-2" "false"
+    add_account_to_sequence "3" "user3@example.com" "uuid-3" "false"
+    create_fake_credentials "user1@example.com"
+
+    create_fake_usage_cache 90 "user1@example.com"
+
+    cat > "$MOCK_BIN/curl" << 'MOCK_EOF'
+#!/bin/bash
+echo '{"five_hour":{"utilization":95,"limit":100,"used":95}}'
+echo "200"
+MOCK_EOF
+    chmod +x "$MOCK_BIN/curl"
+
+    run run_ccswitch rate-check --auto-switch --threshold 80
+    [ "$status" -eq 3 ]
+    active=$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")
+    [ "$active" -eq 1 ]
 }
 
 @test "test_rate_check_stale_cache_account_mismatch_refetches" {

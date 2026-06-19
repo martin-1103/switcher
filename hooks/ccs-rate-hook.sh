@@ -19,6 +19,13 @@ CACHE_FILE="/tmp/claude-usage-cache.json"
 THRESHOLD=80
 CACHE_TTL=60
 
+# Resolve ccs early so both the fast path and delegate path use the same binary.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CCS="${CCS_PATH:-}"
+[[ -z "$CCS" || ! -x "$CCS" ]] && CCS="${SCRIPT_DIR}/../ccswitch.sh"
+[[ -x "$CCS" ]] || CCS=$(command -v ccs 2>/dev/null || echo "")
+[[ -z "$CCS" || ! -x "$CCS" ]] && CCS="/usr/local/bin/ccs"
+
 # Fail open: if anything goes wrong, allow the tool call
 trap 'exit 0' ERR
 
@@ -42,22 +49,28 @@ if [[ -f "$CACHE_FILE" ]]; then
     [[ "$cached_at" =~ ^[0-9]+$ ]] || cached_at=0
     now=$(date +%s)
     age=$(( now - cached_at ))
-    usage=$(jq -r '.five_hour.utilization // 0' "$CACHE_FILE" 2>/dev/null || echo "0")
+    current_email=$("$CCS" status 2>/dev/null | sed -n 's/^Current account: //p' | head -n1)
+    cached_email=$(jq -r '.active_account // empty' "$CACHE_FILE" 2>/dev/null || true)
+    usage=$(jq -r '
+        (
+            [(.limits // [])[] | select((.is_active // false) == true) | .percent? | select(type == "number")] | max
+        ) // (
+            [(.five_hour.utilization // 0), (.seven_day.utilization // 0)] | max
+        )
+    ' "$CACHE_FILE" 2>/dev/null || echo "0")
     usage_int=$(printf "%.0f" "$usage" 2>/dev/null || echo "0")
-    if [[ "$cached_at" -gt 0 && "$age" -lt "$CACHE_TTL" && "$usage_int" -lt "$THRESHOLD" ]]; then
+    cache_matches=true
+    if [[ -n "$current_email" && -n "$cached_email" && "$current_email" != "$cached_email" ]]; then
+        cache_matches=false
+    fi
+    if [[ "$cached_at" -gt 0 && "$age" -lt "$CACHE_TTL" && "$cache_matches" == true && "$usage_int" -lt "$THRESHOLD" ]]; then
         fast_ok=true
     fi
 fi
 [[ "$fast_ok" == true ]] && exit 0
 
 # Delegate to ccs rate-check (refreshes the cache if missing/stale, then switches
-# if over threshold). Resolve ccs: 1) CCS_PATH env (set by rate-setup),
-# 2) sibling of this script's dir, 3) PATH, 4) common locations.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CCS="${CCS_PATH:-}"
-[[ -z "$CCS" || ! -x "$CCS" ]] && CCS="${SCRIPT_DIR}/../ccswitch.sh"
-[[ -x "$CCS" ]] || CCS=$(command -v ccs 2>/dev/null || echo "")
-[[ -z "$CCS" || ! -x "$CCS" ]] && CCS="/usr/local/bin/ccs"
+# if over threshold).
 [[ -x "$CCS" ]] || { echo "ccs not found" >&2; exit 0; }
 
 # Run in subshell, capture output. On any failure → fail open.
