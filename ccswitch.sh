@@ -1415,6 +1415,19 @@ cmd_auto_switch() {
 
 # Add account
 cmd_add_account() {
+    local account_type=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --type)
+                account_type="$2"
+                shift 2
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
     setup_directories
     init_sequence_file
 
@@ -1433,6 +1446,15 @@ cmd_add_account() {
 
     local account_num
     account_num=$(get_next_account_number)
+
+    if [[ -z "$account_type" && -t 0 ]]; then
+        echo -n "Account type [team/max20, empty=skip]: "
+        read -r account_type
+    fi
+    if [[ -n "$account_type" && "$account_type" != "team" && "$account_type" != "max20" ]]; then
+        echo "Error: Invalid account type '$account_type'. Use 'team' or 'max20'."
+        exit 1
+    fi
 
     # Backup current credentials and config
     local current_creds current_config
@@ -1454,12 +1476,13 @@ cmd_add_account() {
 
     # Update sequence.json
     local updated_sequence
-    updated_sequence=$(jq --arg num "$account_num" --arg email "$current_email" --arg uuid "$account_uuid" --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+    updated_sequence=$(jq --arg num "$account_num" --arg email "$current_email" --arg uuid "$account_uuid" --arg type "$account_type" --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
         .accounts[$num] = {
             email: $email,
             uuid: $uuid,
             added: $now
         } |
+        (if ($type | length) > 0 then .accounts[$num].accountType = $type else . end) |
         .sequence += [$num | tonumber] |
         .activeAccountNumber = ($num | tonumber) |
         .lastUpdated = $now
@@ -2426,7 +2449,7 @@ show_usage() {
     echo "Usage: ccs [OPTIONS] <command> [args]"
     echo ""
     echo "Account Management:"
-    echo "  add                              Add current account to managed accounts"
+    echo "  add [--type team|max20]          Add current account to managed accounts"
     echo "  rm <num|email>                   Remove account by number or email"
     echo "  ls                               List all managed accounts"
     echo ""
@@ -2525,7 +2548,8 @@ main() {
 
     case "${1:-}" in
         add|--add-account)
-            cmd_add_account
+            shift
+            cmd_add_account "$@"
             ;;
         rm|--remove-account)
             shift

@@ -94,3 +94,22 @@ teardown() {
     active=$(jq '.activeAccountNumber' "$SEQUENCE_FILE")
     [ "$active" -eq 2 ]
 }
+
+@test "test_add_account_with_type_flag_stores_account_type" {
+    setup_fake_account "user1@example.com" "uuid-1"
+
+    run run_ccswitch add --type team
+    [ "$status" -eq 0 ]
+
+    local account_type
+    account_type=$(jq -r '.accounts["1"].accountType // empty' "$SEQUENCE_FILE")
+    [ "$account_type" = "team" ]
+}
+
+@test "test_add_account_with_invalid_type_fails" {
+    setup_fake_account "user1@example.com" "uuid-1"
+
+    run run_ccswitch add --type wrong
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"Invalid account type"* ]]
+}
