@@ -74,7 +74,7 @@ fi
 [[ -x "$CCS" ]] || { echo "ccs not found" >&2; exit 0; }
 
 # Run in subshell, capture output. On any failure → fail open.
-result=$("$CCS" rate-check --auto-switch --hook-mode --threshold "$THRESHOLD" --max-age "$CACHE_TTL" 2>/dev/null) || true
+result=$(CCS_SUPPRESS_HOOK_MESSAGE=1 "$CCS" rate-check --auto-switch --hook-mode --threshold "$THRESHOLD" --max-age "$CACHE_TTL" 2>/dev/null) || true
 
 if [[ -n "$result" ]]; then
     echo "$result"

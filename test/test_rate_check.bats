@@ -163,6 +163,17 @@ MOCK_EOF
     [ "$decision" = "deny" ]
 }
 
+@test "test_rate_check_hook_mode_can_suppress_deny_output" {
+    setup_fake_account "user1@example.com" "uuid-1"
+    add_account_to_sequence "1" "user1@example.com" "uuid-1" "true"
+
+    create_fake_usage_cache 90 "user1@example.com"
+
+    run env HOME="$TEST_HOME" PATH="$MOCK_BIN:$ORIGINAL_PATH" CCS_SUPPRESS_HOOK_MESSAGE=1 /bin/bash "$CCSWITCH_SCRIPT" rate-check --hook-mode --threshold 80
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+}
+
 @test "test_rate_check_hook_mode_silent_on_allow" {
     setup_fake_account "user1@example.com" "uuid-1"
     add_account_to_sequence "1" "user1@example.com" "uuid-1" "true"
@@ -606,6 +617,76 @@ MOCK_EOF
     chmod +x "$MOCK_BIN/curl"
 
     run run_ccswitch rate-check --auto-switch --threshold 80
+    [ "$status" -eq 1 ]
+    active=$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")
+    [ "$active" -eq 2 ]
+}
+
+@test "test_rate_check_allows_shared_fallback_when_exclusive_candidates_are_unhealthy" {
+    setup_fake_account "team-active@example.com" "uuid-active"
+    add_account_to_sequence "1" "team-active@example.com" "uuid-active" "true"
+    add_account_to_sequence "2" "shared-good@example.com" "uuid-a" "false"
+    add_account_to_sequence "3" "exclusive-bad@example.com" "uuid-b" "false"
+    create_fake_credentials "team-active@example.com"
+
+    local updated
+    updated=$(jq '
+        .accounts["1"].accountType = "team" |
+        .accounts["2"].accountType = "max20" |
+        .accounts["3"].accountType = "team" |
+        .accounts["2"].lastKnownUsage = {
+            fiveHour: 1,
+            sevenDay: 5,
+            activeLimit: 1,
+            observedAt: 123
+        } |
+        .accounts["3"].lastKnownUsage = {
+            fiveHour: 96,
+            sevenDay: 20,
+            activeLimit: 96,
+            observedAt: 123
+        } |
+        .coordination = {
+            mode: "http",
+            serverId: "srv-a",
+            leaseTtlSeconds: 180,
+            http: {
+                url: "http://127.0.0.1:19090",
+                token: "token-123"
+            }
+        }
+    ' "$SEQUENCE_FILE")
+    echo "$updated" > "$SEQUENCE_FILE"
+
+    create_fake_usage_cache 100 "team-active@example.com"
+
+    cat > "$MOCK_BIN/curl" << 'MOCK_EOF'
+#!/bin/bash
+args="$*"
+if [[ "$args" == *"/v1/leases/owner?email=shared-good%40example.com&serverId=srv-a"* ]]; then
+  echo '{"owner":{"serverId":"srv-b"},"owners":[{"serverId":"srv-b"}],"holderCount":1}'
+  echo "200"
+elif [[ "$args" == *"/v1/leases/owner?email=exclusive-bad%40example.com&serverId=srv-a"* ]]; then
+  echo '{"owner":null,"owners":[],"holderCount":0}'
+  echo "200"
+elif [[ "$args" == *"/v1/leases/claim"* ]]; then
+  echo '{"ok":true}'
+  echo "200"
+elif [[ "$args" == *"/v1/leases/release"* ]]; then
+  echo '{"ok":true}'
+  echo "200"
+elif [[ ! -f "$HOME/.curl_calls" ]]; then
+  echo 1 > "$HOME/.curl_calls"
+  echo '{"five_hour":{"utilization":5,"limit":100,"used":5}}'
+  echo "200"
+else
+  echo '{"five_hour":{"utilization":100,"limit":100,"used":100}}'
+  echo "200"
+fi
+MOCK_EOF
+    chmod +x "$MOCK_BIN/curl"
+
+    run run_ccswitch rate-check --auto-switch --threshold 95
     [ "$status" -eq 1 ]
     active=$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")
     [ "$active" -eq 2 ]

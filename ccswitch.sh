@@ -959,6 +959,7 @@ collect_switch_candidates() {
 
 auto_switch_candidates() {
     local active_account="$1"
+    local healthy_threshold="${2:-95}"
     local candidates
     candidates=$(collect_switch_candidates "$active_account")
     [[ -n "$candidates" ]] || return 0
@@ -966,15 +967,20 @@ auto_switch_candidates() {
     local exclusive
     exclusive=$(printf '%s\n' "$candidates" | awk -F'|' '$5 == 0')
 
+    local exclusive_healthy=""
     if [[ -n "$exclusive" ]]; then
-        printf '%s\n' "$exclusive" \
+        exclusive_healthy=$(printf '%s\n' "$exclusive" | awk -F'|' -v t="$healthy_threshold" '$2 < t')
+    fi
+
+    if [[ -n "$exclusive_healthy" ]]; then
+        printf '%s\n' "$exclusive_healthy" \
             | sort -t'|' -k4,4nr -k3,3nr -k2,2n -k1,1n \
             | cut -d'|' -f1
         return 0
     fi
 
     printf '%s\n' "$candidates" \
-        | sort -t'|' -k4,4nr -k3,3nr -k2,2n -k5,5n -k1,1n \
+        | sort -t'|' -k3,3nr -k2,2n -k4,4nr -k5,5n -k1,1n \
         | cut -d'|' -f1
 }
 
@@ -983,7 +989,7 @@ should_reclaim_to_preferred_account() {
     [[ -f "$SEQUENCE_FILE" ]] || return 1
 
     local best_account
-    best_account=$(auto_switch_candidates "$active_account" | head -n1)
+    best_account=$(auto_switch_candidates "$active_account" "${2:-95}" | head -n1)
     [[ -n "$best_account" ]] || return 1
 
     local active_priority best_priority active_usage best_usage
@@ -2711,7 +2717,7 @@ cmd_rate_check() {
     local starting_account reclaim_target=""
     starting_account=$(jq -r '.activeAccountNumber // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
     if [[ -n "$starting_account" && "$starting_account" != "null" ]]; then
-        reclaim_target=$(should_reclaim_to_preferred_account "$starting_account" 2>/dev/null || true)
+        reclaim_target=$(should_reclaim_to_preferred_account "$starting_account" "$threshold" 2>/dev/null || true)
     fi
 
     # Below threshold — all good
@@ -2820,7 +2826,7 @@ cmd_rate_check() {
 
             attempts=$((attempts + 1))
             [[ $attempts -ge $max_attempts ]] && break
-        done < <(auto_switch_candidates "$starting_account")
+        done < <(auto_switch_candidates "$starting_account" "$threshold")
 
         # Restore the original account before reporting "all limited".
         local current_active
@@ -2849,6 +2855,9 @@ cmd_rate_check() {
 # Output hook-protocol JSON to deny a tool call
 _rate_hook_deny() {
     local reason="$1"
+    if [[ "${CCS_SUPPRESS_HOOK_MESSAGE:-0}" == "1" ]]; then
+        return 0
+    fi
     cat <<EOF
 {"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"$reason"}}
 EOF
