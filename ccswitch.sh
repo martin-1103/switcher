@@ -2257,7 +2257,7 @@ cmd_switch() {
         $seq[($idx + 1) % ($seq | length)]
     ' "$SEQUENCE_FILE")
 
-    perform_switch "$next_account"
+    CCS_SWITCH_REASON=manual perform_switch "$next_account"
 }
 
 # Switch to specific account
@@ -2302,12 +2302,13 @@ cmd_switch_to() {
     fi
 
     # wait_for_claude_close
-    perform_switch "$target_account"
+    CCS_SWITCH_REASON=manual perform_switch "$target_account"
 }
 
 # Perform the actual account switch
 perform_switch() {
     local target_account="$1"
+    local switch_reason="${CCS_SWITCH_REASON:-}"
     local cache_file="/tmp/claude-usage-cache.json"
 
     # Get current and target account info
@@ -2458,6 +2459,7 @@ perform_switch() {
         --arg num "$target_account" \
         --arg cur "$current_account" \
         --arg now "$now" \
+        --arg reason "$switch_reason" \
         --argjson elapsed "$elapsed_seconds" '
         # Update time on old account
         .accounts[$cur].totalSeconds = ((.accounts[$cur].totalSeconds // 0) + $elapsed) |
@@ -2467,7 +2469,9 @@ perform_switch() {
         .accounts[$num].lastUsed = $now |
         # Update active account
         .activeAccountNumber = ($num | tonumber) |
-        .lastUpdated = $now
+        .lastUpdated = $now |
+        (if $reason == "auto" then .lastAutoSwitchAt = $now else . end) |
+        (if $reason == "manual" then .lastManualSwitchAt = $now else . end)
     ' "$SEQUENCE_FILE")
 
     if ! write_json "$SEQUENCE_FILE" "$updated_sequence"; then
@@ -2725,7 +2729,7 @@ cmd_rate_check() {
         if [[ "$auto_switch" == true && -n "$reclaim_target" ]]; then
             local reclaim_email
             reclaim_email=$(jq -r --arg num "$reclaim_target" '.accounts[$num].email // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
-            if ! (CCS_SILENT=1 CCS_SKIP_POST_SWITCH_USAGE_FETCH=1 perform_switch "$reclaim_target"); then
+            if ! (CCS_SWITCH_REASON=auto CCS_SILENT=1 CCS_SKIP_POST_SWITCH_USAGE_FETCH=1 perform_switch "$reclaim_target"); then
                 if [[ "$hook_mode" == true ]]; then
                     exit 0
                 fi
@@ -2785,7 +2789,7 @@ cmd_rate_check() {
             next_email=$(jq -r --arg num "$next_account" '.accounts[$num].email' "$SEQUENCE_FILE")
 
             # Perform switch in subshell to catch exit 1 from perform_switch
-            if ! (CCS_SILENT=1 CCS_SKIP_POST_SWITCH_USAGE_FETCH=1 perform_switch "$next_account"); then
+            if ! (CCS_SWITCH_REASON=auto CCS_SILENT=1 CCS_SKIP_POST_SWITCH_USAGE_FETCH=1 perform_switch "$next_account"); then
                 # Switch failed — fail open in hook mode
                 if [[ "$hook_mode" == true ]]; then
                     exit 0

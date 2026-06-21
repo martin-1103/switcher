@@ -16,6 +16,7 @@ set -uo pipefail  # No -e: we handle errors manually
 INPUT=$(cat)
 
 CACHE_FILE="/tmp/claude-usage-cache.json"
+HOOK_LOCK_DIR="/tmp/ccs-rate-hook.lock"
 THRESHOLD=80
 CACHE_TTL=60
 
@@ -72,6 +73,13 @@ fi
 # Delegate to ccs rate-check (refreshes the cache if missing/stale, then switches
 # if over threshold).
 [[ -x "$CCS" ]] || { echo "ccs not found" >&2; exit 0; }
+
+# Guard against concurrent PreToolUse invocations racing each other.
+# Only one hook instance should drive rate-check/switch at a time.
+if ! mkdir "$HOOK_LOCK_DIR" 2>/dev/null; then
+    exit 0
+fi
+trap 'rmdir "$HOOK_LOCK_DIR" 2>/dev/null || true; exit 0' EXIT ERR
 
 # Run in subshell, capture output. On any failure → fail open.
 result=$(CCS_SUPPRESS_HOOK_MESSAGE=1 "$CCS" rate-check --auto-switch --hook-mode --threshold "$THRESHOLD" --max-age "$CACHE_TTL" 2>/dev/null) || true
