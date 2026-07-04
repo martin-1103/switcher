@@ -1166,17 +1166,55 @@ account_snapshot_usage() {
         [[ "$reset_7d_epoch" -gt 0 && "$reset_7d_epoch" -le "$now_epoch" ]] && seven_expired=1
     fi
 
+    # Only the 5-hour window drives switch priority/ranking. sevenDay is still
+    # a hard block when it hits 100% (window truly exhausted, account unusable
+    # regardless of 5h), it just doesn't otherwise weigh into the score —
+    # activeLimit can be driven by the 7-day window (API picks whichever
+    # window is currently binding), which would leak sevenDay into ranking
+    # even though the auto-switch priority is 5h-only.
     jq -r --arg num "$account_num" --argjson fiveExpired "$five_expired" --argjson sevenExpired "$seven_expired" '
         (.accounts[$num].lastKnownUsage // {}) as $u |
         (if $fiveExpired == 1 then 0 else ($u.fiveHour // 0) end) as $five |
         (if $sevenExpired == 1 then 0 else ($u.sevenDay // 0) end) as $seven |
-        (if (($u.activeLimit // 0) > 0 and $fiveExpired == 0 and $sevenExpired == 0) then ($u.activeLimit // 0) else $five end) as $primary |
-        if ($primary >= 100 or $seven >= 100) then
-            100000 + ([$primary, $seven] | max)
-        else
-            $primary * 1000 + $seven
-        end
+        if ($five >= 100 or $seven >= 100) then 100000 + ([$five, $seven] | max) else $five * 1000 end
     ' "$SEQUENCE_FILE" 2>/dev/null || echo "0"
+}
+
+candidate_over_threshold() {
+    local account_num="$1"
+    local threshold="$2"
+    local now_epoch reset_5h reset_7d five_expired=0 seven_expired=0
+    now_epoch=$(date +%s)
+
+    reset_5h=$(jq -r --arg num "$account_num" '.accounts[$num].lastKnownUsage.resetAt5h // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
+    if [[ -n "$reset_5h" ]]; then
+        local r5_epoch
+        r5_epoch=$(iso_to_epoch "$reset_5h")
+        [[ "$r5_epoch" -gt 0 && "$r5_epoch" -le "$now_epoch" ]] && five_expired=1
+    fi
+    reset_7d=$(jq -r --arg num "$account_num" '.accounts[$num].lastKnownUsage.resetAt7d // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
+    if [[ -n "$reset_7d" ]]; then
+        local r7_epoch
+        r7_epoch=$(iso_to_epoch "$reset_7d")
+        [[ "$r7_epoch" -gt 0 && "$r7_epoch" -le "$now_epoch" ]] && seven_expired=1
+    fi
+
+    # Candidate's own binding limit (activeLimit — whichever window the API
+    # says is currently constraining it — falling back to fiveHour, with
+    # sevenDay as a hard block). This is a real "is this account itself still
+    # rate-limited" check, not the 5h-only ranking score: switching to a
+    # candidate that's still over threshold just moves the loop, it doesn't
+    # break it.
+    local usage_int
+    usage_int=$(jq -r --arg num "$account_num" --argjson fiveExpired "$five_expired" --argjson sevenExpired "$seven_expired" '
+        (.accounts[$num].lastKnownUsage // {}) as $u |
+        (if $fiveExpired == 1 then 0 else ($u.fiveHour // 0) end) as $five |
+        (if $sevenExpired == 1 then 0 else ($u.sevenDay // 0) end) as $seven |
+        (if (($u.activeLimit // 0) > 0 and $fiveExpired == 0 and $sevenExpired == 0) then ($u.activeLimit // 0) else $five end) as $primary |
+        [$primary, $seven] | max
+    ' "$SEQUENCE_FILE" 2>/dev/null || echo "0")
+    usage_int=$(printf "%.0f" "${usage_int:-0}" 2>/dev/null || echo "0")
+    [[ "$usage_int" -ge "$threshold" ]]
 }
 
 account_group_type() {
@@ -3292,6 +3330,19 @@ cmd_rate_check() {
             local next_email
             next_email=$(jq -r --arg num "$next_account" '.accounts[$num].email' "$SEQUENCE_FILE")
 
+            # Skip a candidate that is itself still over threshold (its own
+            # activeLimit/sevenDay, from the cached snapshot — no extra API
+            # call). Without this, auto_switch_candidates' 5h-only ranking can
+            # still pick an account that's over threshold via sevenDay/
+            # activeLimit; switching to it just moves the "over threshold"
+            # loop to the next account instead of ending it.
+            if candidate_over_threshold "$next_account" "$threshold"; then
+                log_switch_event "candidate Account-$next_account ($next_email) skipped: still over threshold (${threshold}%) per cached snapshot"
+                attempts=$((attempts + 1))
+                [[ $attempts -ge $max_attempts ]] && break
+                continue
+            fi
+
             # Claim the account atomically BEFORE switching. On a 409 conflict
             # (return 2) another server grabbed it first — skip to the next
             # candidate instead of colliding. On coordinator-unavailable
@@ -3319,14 +3370,12 @@ cmd_rate_check() {
                 exit 2
             fi
 
-            # Trust auto_switch_candidates' selection (already based on the
-            # cached/coordinator snapshot) instead of re-fetching from the API
-            # to verify — an extra fetch right after switching just doubles
-            # API calls and, on a 429, used to fall through to "assume OK" and
-            # get stuck, which caused an infinite reclaim/switch loop across
-            # accounts that were all actually still over threshold.
+            # No post-switch verify fetch: the candidate was already checked
+            # against the cached snapshot above (candidate_over_threshold),
+            # and re-fetching from the API here just doubles API calls and,
+            # on a 429, used to fall through to "assume OK" and get stuck.
             rm -f "$cache_file"
-            log_switch_event "switch OK: Account-$starting_account -> Account-$next_account ($next_email) (unverified, trusting candidate snapshot)"
+            log_switch_event "switch OK: Account-$starting_account -> Account-$next_account ($next_email)"
             if [[ "$hook_mode" == true ]]; then
                 _rate_hook_deny "Rate limit exceeded. Switched to Account-$next_account ($next_email). Please restart Claude Code."
                 exit 0
