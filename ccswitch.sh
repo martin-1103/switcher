@@ -787,12 +787,12 @@ format_usage_snapshot() {
             usage_json=$(jq -cn --arg five "${remote_5h:-0}" --arg seven "${remote_7d:-0}" --arg limit "${remote_limit:-0}" \
                 --arg r5 "$remote_reset_5h" --arg r7 "$remote_reset_7d" --arg obs "$remote_observed" '
                 {
-                    fiveHour: ($five|tonumber?//0),
-                    sevenDay: ($seven|tonumber?//0),
-                    activeLimit: ($limit|tonumber?//0),
+                    fiveHour: ($five|tonumber? // 0),
+                    sevenDay: ($seven|tonumber? // 0),
+                    activeLimit: ($limit|tonumber? // 0),
                     resetAt5h: (if $r5 == "" then null else $r5 end),
                     resetAt7d: (if $r7 == "" then null else $r7 end),
-                    observedAt: ($obs|tonumber?//0)
+                    observedAt: ($obs|tonumber? // 0)
                 }')
             remote_note=" [remote]"
         fi
@@ -1261,8 +1261,8 @@ collect_switch_candidates() {
                     remote_usage="$remote_limit"
                 else
                     remote_usage=$(jq -nr --arg five "${remote_5h:-0}" --arg seven "${remote_7d:-0}" '
-                        ($five|tonumber?//0) as $five |
-                        ($seven|tonumber?//0) as $seven |
+                        ($five|tonumber? // 0) as $five |
+                        ($seven|tonumber? // 0) as $seven |
                         if ($five >= 100 or $seven >= 100) then 100000 + ([$five, $seven] | max)
                         else $five * 1000 + $seven
                         end
