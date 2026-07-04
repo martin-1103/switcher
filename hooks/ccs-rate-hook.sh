@@ -25,7 +25,6 @@ fi
 INPUT=$(cat)
 
 CACHE_FILE="/tmp/claude-usage-cache.json"
-HOOK_LOCK_DIR="/tmp/ccs-rate-hook.lock"
 HOOK_LOG_FILE="/tmp/ccs-rate-hook.log"
 THRESHOLD=80
 CACHE_TTL=60
@@ -119,20 +118,25 @@ if [[ "${usage_int:-0}" -lt "$THRESHOLD" ]]; then
     exit 0
 fi
 
-# Guard against concurrent PreToolUse invocations racing each other.
-# Only one hook instance should switch at a time.
-if ! mkdir "$HOOK_LOCK_DIR" 2>/dev/null; then
-    hook_log "skip hook-lock-busy"
-    exit 0
-fi
-trap 'rmdir "$HOOK_LOCK_DIR" 2>/dev/null || true; exit 0' EXIT ERR
+# Delegate the actual decision to rate-check --auto-switch, the single source
+# of truth for switching. It holds the cross-process switch lock (serializes
+# every session/hook/statusline on the host), skips candidates that are
+# themselves over threshold, and emits the proper PreToolUse deny JSON when all
+# accounts are limited. The old path called `ccs sw` — a blind round-robin that
+# ignored threshold and bypassed all of that, so with every account limited the
+# active account hopped one step per tool call, forever. rate-check owns its own
+# lock, so no separate hook lock is needed here. The cache is already fresh and
+# over-threshold at this point (checked above), so hook-mode reads it without a
+# new API fetch.
+hook_log "delegate rate-check account=${current_email:-unknown} usage=${usage_int:-0} threshold=$THRESHOLD"
+result=$(CCS_SWITCH_REASON=auto CCS_SILENT=1 "$CCS" rate-check --auto-switch --hook-mode 2>>"$HOOK_LOG_FILE") || true
 
-hook_log "switch-start account=${current_email:-unknown} usage=${usage_int:-0} threshold=$THRESHOLD"
-result=$(CCS_SWITCH_REASON=auto CCS_SILENT=1 CCS_SKIP_POST_SWITCH_USAGE_FETCH=1 CCS_HEADLESS_SMOKE=1 "$CCS" sw 2>&1) || true
-
+# rate-check emits the PreToolUse hook JSON (deny/allow) on stdout — pass it
+# through to Claude Code verbatim so the deny actually blocks the tool call.
 if [[ -n "$result" ]]; then
-    hook_log "switch-result $(printf '%s' "$result" | tr '\n' ' ' | cut -c1-180)"
+    printf '%s\n' "$result"
+    hook_log "delegate-result $(printf '%s' "$result" | tr '\n' ' ' | cut -c1-180)"
 else
-    hook_log "switch-empty"
+    hook_log "delegate-empty"
 fi
 exit 0
