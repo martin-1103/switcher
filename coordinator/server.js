@@ -24,9 +24,12 @@ function loadState() {
     if (!state.leases || typeof state.leases !== 'object') {
       state.leases = {};
     }
+    if (!state.usageSnapshots || typeof state.usageSnapshots !== 'object') {
+      state.usageSnapshots = {};
+    }
     return state;
   } catch {
-    return { leases: {} };
+    return { leases: {}, usageSnapshots: {} };
   }
 }
 
@@ -134,24 +137,28 @@ function upgradeLeaseRecord(email, lease) {
   };
 }
 
-function flattenLease(email, lease) {
+function flattenLease(email, lease, usageSnapshot) {
   const record = upgradeLeaseRecord(email, lease);
-  if (!record) return null;
-  const holders = Object.values(record.holders || {}).sort((a, b) => Number(b.updatedAt || 0) - Number(a.updatedAt || 0));
-  const latest = holders[0] || {};
+  const holders = record ? Object.values(record.holders || {}).sort((a, b) => Number(b.updatedAt || 0) - Number(a.updatedAt || 0)) : [];
+  const latest = holders[0];
+  // Prefer a live holder's snapshot (freshest, tied to an active lease); fall
+  // back to the persisted last-known snapshot when no server currently holds
+  // the lease — usage data must survive lease expiry, it isn't exclusivity state.
+  const source = latest || usageSnapshot;
+  if (!source) return null;
   return {
     email,
-    accountType: latest.accountType || record.accountType || null,
+    accountType: (latest && latest.accountType) || (record && record.accountType) || (usageSnapshot && usageSnapshot.accountType) || null,
     holderCount: holders.length,
-    leaseExpiresAt: Math.max(...holders.map(h => Number(h.leaseExpiresAt || 0)), 0),
-    updatedAt: Math.max(...holders.map(h => Number(h.updatedAt || 0)), 0),
+    leaseExpiresAt: holders.length ? Math.max(...holders.map(h => Number(h.leaseExpiresAt || 0)), 0) : 0,
+    updatedAt: Number(source.updatedAt || 0),
     latestSnapshot: {
-      activeLimit: Number(latest.activeLimit || 0),
-      fiveHour: Number(latest.fiveHour || 0),
-      sevenDay: Number(latest.sevenDay || 0),
-      resetAt5h: latest.resetAt5h || null,
-      resetAt7d: latest.resetAt7d || null,
-      observedAt: Number(latest.observedAt || 0),
+      activeLimit: Number(source.activeLimit || 0),
+      fiveHour: Number(source.fiveHour || 0),
+      sevenDay: Number(source.sevenDay || 0),
+      resetAt5h: source.resetAt5h || null,
+      resetAt7d: source.resetAt7d || null,
+      observedAt: Number(source.observedAt || 0),
     },
     holders,
   };
@@ -174,8 +181,9 @@ const server = http.createServer(async (req, res) => {
     cleanupExpired(state, now);
 
     if (req.method === 'GET' && url.pathname === '/v1/leases') {
-      const leases = Object.entries(state.leases)
-        .map(([email, lease]) => flattenLease(email, lease))
+      const emails = new Set([...Object.keys(state.leases), ...Object.keys(state.usageSnapshots)]);
+      const leases = Array.from(emails)
+        .map(email => flattenLease(email, state.leases[email], state.usageSnapshots[email]))
         .filter(Boolean);
       saveState(state);
       return send(res, 200, { leases });
@@ -184,14 +192,20 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/v1/leases/owner') {
       const email = String(url.searchParams.get('email') || '').trim();
       const serverId = String(url.searchParams.get('serverId') || '').trim();
-      const lease = flattenLease(email, state.leases[email]);
+      const lease = flattenLease(email, state.leases[email], state.usageSnapshots[email]);
       saveState(state);
       if (!lease) {
         return send(res, 200, { owner: null, owners: [], holderCount: 0 });
       }
       const owners = lease.holders.filter(holder => !serverId || holder.serverId !== serverId);
+      // No live holder (lease expired) but a persisted usage snapshot exists:
+      // surface it as a synthetic, non-exclusive "owner" so callers still see
+      // the last-known usage instead of it vanishing with the lease.
+      const fallbackOwner = owners.length === 0 && lease.holderCount === 0
+        ? { ...lease.latestSnapshot, email, observedAt: lease.latestSnapshot.observedAt }
+        : null;
       return send(res, 200, {
-        owner: owners[0] || null,
+        owner: owners[0] || fallbackOwner,
         owners,
         holderCount: owners.length,
       });
@@ -232,8 +246,11 @@ const server = http.createServer(async (req, res) => {
       existing.accountType = body.accountType || existing.accountType || null;
       existing.holders[body.serverId] = body;
       fresh.leases[body.email] = existing;
+      // Persist the usage snapshot outside the lease, keyed only by email, so
+      // it survives lease expiry (cleanupExpired only touches state.leases).
+      fresh.usageSnapshots[body.email] = { ...body };
       saveState(fresh);
-      return send(res, 200, { ok: true, lease: flattenLease(body.email, fresh.leases[body.email]) });
+      return send(res, 200, { ok: true, lease: flattenLease(body.email, fresh.leases[body.email], fresh.usageSnapshots[body.email]) });
     }
 
     if (req.method === 'POST' && url.pathname === '/v1/leases/release') {
