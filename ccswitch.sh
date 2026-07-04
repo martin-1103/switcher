@@ -2770,6 +2770,13 @@ perform_switch() {
         exit 1
     fi
 
+    if ! credential_is_usable "$target_creds"; then
+        log_credential_event "refused to switch to Account-$target_account ($target_email): backup credentials are empty/expired (caller=perform_switch)"
+        echo "Error: Account-$target_account ($target_email) has empty/expired backup credentials. Re-login to that account first (ccs to $target_account after logging in), then retry." >&2
+        rollback
+        exit 1
+    fi
+
     # Step 3: Activate target account
     if ! write_credentials "$target_creds"; then
         rollback
@@ -3219,6 +3226,14 @@ cmd_rate_check() {
 
         if (( next_5h > accept_max )); then
             log_switch_event "candidate Account-$next_account ($next_email) skipped: 5h ${next_5h}% > accept ${accept_max}% (forced=${forced})"
+            continue
+        fi
+
+        local next_creds
+        next_creds=$(read_account_credentials "$next_account" "$next_email")
+        if ! credential_is_usable "$next_creds"; then
+            log_switch_event "candidate Account-$next_account ($next_email) skipped: backup credentials empty/expired"
+            log_credential_event "candidate Account-$next_account ($next_email) skipped by auto-switch: backup credentials empty/expired (caller=cmd_rate_check)"
             continue
         fi
 
