@@ -3169,7 +3169,7 @@ cmd_rate_setup() {
     setup_directories
     init_sequence_file
 
-    local settings_file="$HOME/.claude/settings.local.json"
+    local settings_file="$HOME/.claude/settings.json"
 
     # Determine hook script path
     local hook_script
@@ -3181,7 +3181,7 @@ cmd_rate_setup() {
         updated=$(jq '.rateLimit = {enabled: false}' "$SEQUENCE_FILE" 2>/dev/null)
         write_json "$SEQUENCE_FILE" "$updated"
 
-        # Remove hook from settings.local.json if present (match by hook script
+        # Remove hook from settings.json if present (match by hook script
         # path). Handles both the legacy flat shape and the nested-hooks shape,
         # and drops matcher entries whose nested hooks array becomes empty.
         if [[ -f "$settings_file" ]]; then
@@ -3225,7 +3225,7 @@ cmd_rate_setup() {
         return 1
     fi
 
-    # Install hook into settings.local.json
+    # Install hook into settings.json
     mkdir -p "$(dirname "$settings_file")"
     if [[ ! -f "$settings_file" ]]; then
         echo '{}' > "$settings_file"
@@ -3290,7 +3290,7 @@ cmd_statusline_setup() {
         esac
     done
 
-    local settings_file="$HOME/.claude/settings.local.json"
+    local settings_file="$HOME/.claude/settings.json"
     local statusline_script
     statusline_script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/statusline/ccs-statusline.sh"
 
