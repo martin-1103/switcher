@@ -535,12 +535,14 @@ coord_remote_lease_count() {
     fi
 }
 
-# Single coordinator read returning "holderCount|usage|observedAt|resetAt5h" for
-# an email. Usage/observedAt come from the freshest OTHER holder (owner list
-# already excludes our serverId, ordered most-recent). This lets switch
-# selection use fleet-wide usage instead of only this server's local snapshot.
-# Non-HTTP (mysql) mode has no usage in the owner query, so it returns just the
-# count with empty usage fields and the caller keeps its local snapshot.
+# Single coordinator read returning
+# "holderCount|activeLimit|fiveHour|sevenDay|observedAt|resetAt5h|resetAt7d" for
+# an email. Fields come from the freshest OTHER holder (owner list already
+# excludes our serverId, ordered most-recent). Raw per-window values (not a
+# pre-maxed "usage") let the caller apply its own reset-expiry zeroing per
+# window, same as account_snapshot_usage does for local snapshots. Non-HTTP
+# (mysql) mode has no usage in the owner query, so it returns just the count
+# with empty usage fields and the caller keeps its local snapshot.
 coord_remote_owner_state() {
     local email="$1"
     if coord_http_ready; then
@@ -550,16 +552,14 @@ coord_remote_owner_state() {
             | jq -r '
                 (.holderCount // 0) as $c |
                 (.owner // null) as $o |
-                if $o == null then "\($c)|||"
+                if $o == null then "\($c)||||||"
                 else
-                    (if (($o.activeLimit // 0) > 0) then ($o.activeLimit)
-                     else ([($o.fiveHour // 0), ($o.sevenDay // 0)] | max) end) as $u |
-                    "\($c)|\($u)|\($o.observedAt // 0)|\($o.resetAt5h // "")"
+                    "\($c)|\($o.activeLimit // 0)|\($o.fiveHour // 0)|\($o.sevenDay // 0)|\($o.observedAt // 0)|\($o.resetAt5h // "")|\($o.resetAt7d // "")"
                 end
             ' 2>/dev/null
         return 0
     fi
-    printf '%s|||\n' "$(coord_remote_lease_count "$email" 2>/dev/null || echo 0)"
+    printf '%s||||||\n' "$(coord_remote_lease_count "$email" 2>/dev/null || echo 0)"
 }
 
 coord_release_account_state() {
@@ -762,13 +762,30 @@ format_usage_windows() {
 
 format_usage_snapshot() {
     local account_num="$1"
-    local line observed_at age
-    line=$(jq -r --arg num "$account_num" '
+    local line observed_at age now_epoch reset_5h reset_7d five_expired=0 seven_expired=0
+    now_epoch=$(date +%s)
+    reset_5h=$(jq -r --arg num "$account_num" '.accounts[$num].lastKnownUsage.resetAt5h // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
+    if [[ -n "$reset_5h" ]]; then
+        local r5_epoch
+        r5_epoch=$(iso_to_epoch "$reset_5h")
+        [[ "$r5_epoch" -gt 0 && "$r5_epoch" -le "$now_epoch" ]] && five_expired=1
+    fi
+    reset_7d=$(jq -r --arg num "$account_num" '.accounts[$num].lastKnownUsage.resetAt7d // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
+    if [[ -n "$reset_7d" ]]; then
+        local r7_epoch
+        r7_epoch=$(iso_to_epoch "$reset_7d")
+        [[ "$r7_epoch" -gt 0 && "$r7_epoch" -le "$now_epoch" ]] && seven_expired=1
+    fi
+
+    line=$(jq -r --arg num "$account_num" --argjson fiveExpired "$five_expired" --argjson sevenExpired "$seven_expired" '
         (.accounts[$num].lastKnownUsage // {}) as $u |
+        (if $fiveExpired == 1 then 0 else $u.fiveHour end) as $five |
+        (if $sevenExpired == 1 then 0 else $u.sevenDay end) as $seven |
+        (if ($fiveExpired == 1 or $sevenExpired == 1) then null else $u.activeLimit end) as $limit |
         [
-            (if ($u.fiveHour? != null) then "5h \($u.fiveHour | round)%" else empty end),
-            (if ($u.sevenDay? != null) then "7d \($u.sevenDay | round)%" else empty end),
-            (if ($u.activeLimit? != null) then "limit \($u.activeLimit | round)%" else empty end)
+            (if ($five != null) then "5h \($five | round)%" else empty end),
+            (if ($seven != null) then "7d \($seven | round)%" else empty end),
+            (if ($limit != null) then "limit \($limit | round)%" else empty end)
         ] | map(select(length > 0)) | join(" | ")
     ' "$SEQUENCE_FILE" 2>/dev/null)
     [[ -z "$line" ]] && return
@@ -1092,26 +1109,31 @@ cmd_warm_loop() {
 
 account_snapshot_usage() {
     local account_num="$1"
-    local reset_at reset_epoch now_epoch
-    reset_at=$(jq -r --arg num "$account_num" '.accounts[$num].lastKnownUsage.resetAt5h // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
-    if [[ -n "$reset_at" ]]; then
-        reset_epoch=$(iso_to_epoch "$reset_at")
-        now_epoch=$(date +%s)
-        if [[ "$reset_epoch" -gt 0 && "$reset_epoch" -le "$now_epoch" ]]; then
-            echo "0"
-            return
-        fi
+    local now_epoch reset_5h reset_7d five_expired=0 seven_expired=0
+    now_epoch=$(date +%s)
+
+    reset_5h=$(jq -r --arg num "$account_num" '.accounts[$num].lastKnownUsage.resetAt5h // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
+    if [[ -n "$reset_5h" ]]; then
+        local reset_5h_epoch
+        reset_5h_epoch=$(iso_to_epoch "$reset_5h")
+        [[ "$reset_5h_epoch" -gt 0 && "$reset_5h_epoch" -le "$now_epoch" ]] && five_expired=1
     fi
 
-    jq -r --arg num "$account_num" '
+    reset_7d=$(jq -r --arg num "$account_num" '.accounts[$num].lastKnownUsage.resetAt7d // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
+    if [[ -n "$reset_7d" ]]; then
+        local reset_7d_epoch
+        reset_7d_epoch=$(iso_to_epoch "$reset_7d")
+        [[ "$reset_7d_epoch" -gt 0 && "$reset_7d_epoch" -le "$now_epoch" ]] && seven_expired=1
+    fi
+
+    jq -r --arg num "$account_num" --argjson fiveExpired "$five_expired" --argjson sevenExpired "$seven_expired" '
         (.accounts[$num].lastKnownUsage // {}) as $u |
-        if (($u.activeLimit // 0) > 0) then
+        (if $fiveExpired == 1 then 0 else ($u.fiveHour // 0) end) as $five |
+        (if $sevenExpired == 1 then 0 else ($u.sevenDay // 0) end) as $seven |
+        if (($u.activeLimit // 0) > 0 and $fiveExpired == 0 and $sevenExpired == 0) then
             ($u.activeLimit // 0)
         else
-            [
-                ($u.fiveHour // 0),
-                ($u.sevenDay // 0)
-            ] | max
+            [$five, $seven] | max
         end
     ' "$SEQUENCE_FILE" 2>/dev/null || echo "0"
 }
@@ -1167,25 +1189,42 @@ collect_switch_candidates() {
             # usage. Prefer remote usage only when it was observed more recently
             # than our local snapshot, so a stale local number can't override a
             # fresh fleet-wide one (and vice versa).
-            local remote_state remote_usage remote_observed remote_reset local_observed
-            remote_state=$(coord_remote_owner_state "$email" 2>/dev/null || echo "0|||")
+            local remote_state remote_limit remote_5h remote_7d remote_observed remote_reset_5h remote_reset_7d local_observed
+            remote_state=$(coord_remote_owner_state "$email" 2>/dev/null || echo "0||||||")
             remote_count=$(printf '%s' "$remote_state" | cut -d'|' -f1)
             [[ "$remote_count" =~ ^[0-9]+$ ]] || remote_count=0
-            remote_usage=$(printf '%s' "$remote_state" | cut -d'|' -f2)
-            remote_observed=$(printf '%s' "$remote_state" | cut -d'|' -f3)
-            remote_reset=$(printf '%s' "$remote_state" | cut -d'|' -f4)
+            remote_limit=$(printf '%s' "$remote_state" | cut -d'|' -f2)
+            remote_5h=$(printf '%s' "$remote_state" | cut -d'|' -f3)
+            remote_7d=$(printf '%s' "$remote_state" | cut -d'|' -f4)
+            remote_observed=$(printf '%s' "$remote_state" | cut -d'|' -f5)
+            remote_reset_5h=$(printf '%s' "$remote_state" | cut -d'|' -f6)
+            remote_reset_7d=$(printf '%s' "$remote_state" | cut -d'|' -f7)
             local_observed=$(jq -r --arg num "$num" '.accounts[$num].lastKnownUsage.observedAt // 0' "$SEQUENCE_FILE" 2>/dev/null || echo 0)
             [[ "$local_observed" =~ ^[0-9]+$ ]] || local_observed=0
             [[ "$remote_observed" =~ ^[0-9]+$ ]] || remote_observed=0
-            if [[ -n "$remote_usage" && "$remote_observed" -gt "$local_observed" ]]; then
+            if [[ -n "$remote_5h$remote_7d$remote_limit" && "$remote_observed" -gt "$local_observed" ]]; then
                 # Apply the same reset-expiry rule account_snapshot_usage uses:
-                # a passed 5h reset means the window is clear, usage is 0.
-                if [[ -n "$remote_reset" ]]; then
-                    local rr_epoch
-                    rr_epoch=$(iso_to_epoch "$remote_reset")
-                    if [[ "$rr_epoch" -gt 0 && "$rr_epoch" -le "$(date +%s)" ]]; then
-                        remote_usage=0
-                    fi
+                # a passed reset means that window is clear, usage is 0 — checked
+                # per-window (5h and 7d independently) rather than zeroing both.
+                local now_epoch five_expired=0 seven_expired=0
+                now_epoch=$(date +%s)
+                if [[ -n "$remote_reset_5h" ]]; then
+                    local r5_epoch
+                    r5_epoch=$(iso_to_epoch "$remote_reset_5h")
+                    [[ "$r5_epoch" -gt 0 && "$r5_epoch" -le "$now_epoch" ]] && five_expired=1
+                fi
+                if [[ -n "$remote_reset_7d" ]]; then
+                    local r7_epoch
+                    r7_epoch=$(iso_to_epoch "$remote_reset_7d")
+                    [[ "$r7_epoch" -gt 0 && "$r7_epoch" -le "$now_epoch" ]] && seven_expired=1
+                fi
+                [[ "$five_expired" -eq 1 ]] && remote_5h=0
+                [[ "$seven_expired" -eq 1 ]] && remote_7d=0
+                local remote_usage
+                if [[ -n "$remote_limit" && "$remote_limit" != "0" && "$five_expired" -eq 0 && "$seven_expired" -eq 0 ]]; then
+                    remote_usage="$remote_limit"
+                else
+                    remote_usage=$(jq -nr --arg five "${remote_5h:-0}" --arg seven "${remote_7d:-0}" '[($five|tonumber?//0), ($seven|tonumber?//0)] | max')
                 fi
                 usage="$remote_usage"
                 known=1
