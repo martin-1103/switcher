@@ -32,7 +32,18 @@ CCS="${CCS_PATH:-}"
 # would never reclaim an account whose window has reset. The statusline is
 # invoked periodically by Claude Code's own render loop regardless of tool
 # activity, so piggyback the reclaim check here instead of adding a timer.
-if [[ -x "$CCS" ]]; then
+#
+# Claude Code re-renders the statusline every few seconds with no coupling to
+# how long our background call takes. Without a throttle, a slow API call
+# (e.g. curl hanging on a 429) means each render spawns another rate-check
+# before the last one even finished, piling up processes that all just skip
+# on the switch-lock anyway. Only spawn once per RATE_CHECK_MIN_INTERVAL.
+RATE_CHECK_MIN_INTERVAL=10
+RATE_CHECK_STAMP="/tmp/claude-ratecheck-last-spawn"
+last_spawn=$(stat -c %Y "$RATE_CHECK_STAMP" 2>/dev/null || echo 0)
+now_ts=$(date +%s 2>/dev/null || echo 0)
+if [[ -x "$CCS" && $(( now_ts - last_spawn )) -ge "$RATE_CHECK_MIN_INTERVAL" ]]; then
+    touch "$RATE_CHECK_STAMP" 2>/dev/null || true
     ( CCS_SILENT=1 "$CCS" rate-check --auto-switch >/dev/null 2>&1 & ) 2>/dev/null || true
 fi
 
