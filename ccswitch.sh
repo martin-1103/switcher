@@ -762,14 +762,22 @@ format_usage_windows() {
 
 format_usage_snapshot() {
     local account_num="$1"
-    jq -r --arg num "$account_num" '
+    local line observed_at age
+    line=$(jq -r --arg num "$account_num" '
         (.accounts[$num].lastKnownUsage // {}) as $u |
         [
             (if ($u.fiveHour? != null) then "5h \($u.fiveHour | round)%" else empty end),
             (if ($u.sevenDay? != null) then "7d \($u.sevenDay | round)%" else empty end),
             (if ($u.activeLimit? != null) then "limit \($u.activeLimit | round)%" else empty end)
         ] | map(select(length > 0)) | join(" | ")
-    ' "$SEQUENCE_FILE" 2>/dev/null
+    ' "$SEQUENCE_FILE" 2>/dev/null)
+    [[ -z "$line" ]] && return
+    observed_at=$(jq -r --arg num "$account_num" '.accounts[$num].lastKnownUsage.observedAt // empty' "$SEQUENCE_FILE" 2>/dev/null)
+    if [[ "$observed_at" =~ ^[0-9]+$ ]]; then
+        age=$(( $(date +%s) - observed_at ))
+        line="${line} (updated $(format_relative_age "$age") lalu)"
+    fi
+    printf '%s' "$line"
 }
 
 format_usage_resets_snapshot() {
@@ -857,6 +865,29 @@ format_relative_duration() {
         echo "${mins}m lagi"
     else
         echo "<1m lagi"
+    fi
+}
+
+format_relative_age() {
+    local seconds="$1"
+    if [[ -z "$seconds" || "$seconds" -lt 0 ]]; then
+        echo "0m"
+        return
+    fi
+
+    local days hours mins
+    days=$((seconds / 86400))
+    hours=$(((seconds % 86400) / 3600))
+    mins=$(((seconds % 3600) / 60))
+
+    if [[ "$days" -gt 0 ]]; then
+        echo "${days}d ${hours}h"
+    elif [[ "$hours" -gt 0 ]]; then
+        echo "${hours}j ${mins}m"
+    elif [[ "$mins" -gt 0 ]]; then
+        echo "${mins}m"
+    else
+        echo "<1m"
     fi
 }
 
