@@ -439,6 +439,48 @@ REPLACE INTO account_leases (
 " >/dev/null 2>&1 || true
 }
 
+# Try to atomically claim an account before switching to it, so two servers can
+# never converge on the same account (closes the TOCTOU race between reading
+# lease state and switching). Talks to the coordinator directly instead of
+# coord_http_request because that helper collapses every non-2xx into return 1,
+# and here we must tell a 409 conflict apart from a network failure.
+# Exit codes: 0 = claimed (safe to switch), 2 = conflict (another server holds
+# it), 1 = coordinator unavailable / non-HTTP mode (caller decides fallback).
+coord_try_claim_exclusive() {
+    local account_num="$1"
+    local email="$2"
+    coord_http_ready || return 1
+
+    local url token payload response http_code
+    url="$(coord_config_value '.coordination.http.url')/v1/leases/claim"
+    token=$(coord_config_value '.coordination.http.token')
+    local connect_timeout="${CCS_CURL_CONNECT_TIMEOUT:-$DEFAULT_CURL_CONNECT_TIMEOUT}"
+    local max_time="${CCS_CURL_MAX_TIME:-$DEFAULT_CURL_MAX_TIME}"
+
+    payload=$(jq -n \
+        --arg email "$email" \
+        --arg serverId "$(coord_server_id)" \
+        --argjson accountNumber "${account_num:-0}" \
+        --argjson leaseTtlSeconds "$(coord_lease_ttl)" \
+        '{email: $email, serverId: $serverId, accountNumber: $accountNumber, leaseTtlSeconds: $leaseTtlSeconds, exclusive: true}')
+
+    response=$(curl -sS -w "\n%{http_code}" \
+        --connect-timeout "$connect_timeout" \
+        --max-time "$max_time" \
+        -X POST \
+        -H "Authorization: Bearer $token" \
+        -H "Content-Type: application/json" \
+        --data "$payload" \
+        "$url" 2>/dev/null) || return 1
+
+    http_code=$(printf '%s' "$response" | tail -n1)
+    case "$http_code" in
+        2*) return 0 ;;
+        409) return 2 ;;
+        *) return 1 ;;
+    esac
+}
+
 coord_publish_active_state() {
     coord_enabled || return 0
     [[ -f "$SEQUENCE_FILE" ]] || return 0
@@ -3064,6 +3106,20 @@ cmd_rate_check() {
             [[ -z "$next_account" ]] && continue
             local next_email
             next_email=$(jq -r --arg num "$next_account" '.accounts[$num].email' "$SEQUENCE_FILE")
+
+            # Claim the account atomically BEFORE switching. On a 409 conflict
+            # (return 2) another server grabbed it first — skip to the next
+            # candidate instead of colliding. On coordinator-unavailable
+            # (return 1) fail open and switch anyway, so a down coordinator
+            # degrades to the old autonomous behaviour rather than blocking.
+            if [[ -n "$next_email" && "$next_email" != "null" ]]; then
+                coord_try_claim_exclusive "$next_account" "$next_email"
+                if [[ $? -eq 2 ]]; then
+                    attempts=$((attempts + 1))
+                    [[ $attempts -ge $max_attempts ]] && break
+                    continue
+                fi
+            fi
 
             # Perform switch in subshell to catch exit 1 from perform_switch
             if ! (CCS_SWITCH_REASON=auto CCS_SILENT=1 CCS_SKIP_POST_SWITCH_USAGE_FETCH=1 perform_switch "$next_account"); then

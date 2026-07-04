@@ -169,8 +169,9 @@ const server = http.createServer(async (req, res) => {
       return unauthorized(res);
     }
 
+    const now = Date.now();
     const state = loadState();
-    cleanupExpired(state);
+    cleanupExpired(state, now);
 
     if (req.method === 'GET' && url.pathname === '/v1/leases') {
       const leases = Object.entries(state.leases)
@@ -197,20 +198,42 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'POST' && url.pathname === '/v1/leases/claim') {
-      const body = normalizeLease(await readJson(req));
+      const raw = await readJson(req);
+      const exclusive = raw.exclusive === true;
+      const body = normalizeLease(raw);
       if (!body.email || !body.serverId) {
         return send(res, 400, { error: 'email and serverId required' });
       }
-      const existing = upgradeLeaseRecord(body.email, state.leases[body.email]) || {
+      // Reload fresh AFTER the await, then check+mutate+save synchronously with
+      // no further await. Node is single-threaded, so this whole sequence runs
+      // atomically — it closes the load→await→save race where two overlapping
+      // claims could each save over the other and drop a holder.
+      const fresh = loadState();
+      cleanupExpired(fresh, now);
+      const existing = upgradeLeaseRecord(body.email, fresh.leases[body.email]) || {
         email: body.email,
         accountType: body.accountType || null,
         holders: {},
       };
+      // Exclusive claim: refuse if ANOTHER server already holds a live lease on
+      // this account. This lets a client claim-before-switch and only switch on
+      // 200, so two servers can never converge on the same account.
+      if (exclusive) {
+        const conflict = Object.values(existing.holders || {}).some(
+          h => h && h.serverId !== body.serverId && Number(h.leaseExpiresAt || 0) > now,
+        );
+        if (conflict) {
+          return send(res, 409, {
+            error: 'conflict',
+            lease: flattenLease(body.email, fresh.leases[body.email]),
+          });
+        }
+      }
       existing.accountType = body.accountType || existing.accountType || null;
       existing.holders[body.serverId] = body;
-      state.leases[body.email] = existing;
-      saveState(state);
-      return send(res, 200, { ok: true, lease: flattenLease(body.email, state.leases[body.email]) });
+      fresh.leases[body.email] = existing;
+      saveState(fresh);
+      return send(res, 200, { ok: true, lease: flattenLease(body.email, fresh.leases[body.email]) });
     }
 
     if (req.method === 'POST' && url.pathname === '/v1/leases/release') {
