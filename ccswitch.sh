@@ -221,9 +221,29 @@ coord_server_id() {
     configured=$(coord_config_value '.coordination.serverId' 2>/dev/null || true)
     if [[ -n "$configured" ]]; then
         printf '%s\n' "$configured"
-    else
-        hostname 2>/dev/null || echo "unknown-server"
+        return 0
     fi
+
+    # No serverId configured: derive a stable, collision-resistant one.
+    # Prefer public IP (unique per host even when hostnames collide), fall
+    # back to hostname. Cache the result into config so this resolves once.
+    local resolved
+    local connect_timeout="${CCS_CURL_CONNECT_TIMEOUT:-$DEFAULT_CURL_CONNECT_TIMEOUT}"
+    resolved=$(curl -sS --connect-timeout "$connect_timeout" --max-time "$connect_timeout" \
+        "https://api.ipify.org" 2>/dev/null || true)
+    if [[ ! "$resolved" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+        resolved=$(hostname 2>/dev/null || echo "unknown-server")
+    fi
+
+    # Persist so subsequent publishes skip the network call. Best effort:
+    # if the config isn't writable yet, still return the resolved value.
+    if [[ -f "$SEQUENCE_FILE" ]]; then
+        local updated
+        updated=$(jq --arg sid "$resolved" '.coordination.serverId = $sid' "$SEQUENCE_FILE" 2>/dev/null || true)
+        [[ -n "$updated" ]] && write_json "$SEQUENCE_FILE" "$updated" >/dev/null 2>&1 || true
+    fi
+
+    printf '%s\n' "$resolved"
 }
 
 coord_lease_ttl() {
