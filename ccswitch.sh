@@ -1426,6 +1426,16 @@ credential_refresh_token() {
     ' 2>/dev/null
 }
 
+# Append a timestamped line to a persistent credential-event log, so a
+# corrupted/emptied credential file can be traced after the fact (bash
+# subshells and background hook calls otherwise drop stderr warnings).
+log_credential_event() {
+    local msg="$1"
+    local log_file="${BACKUP_DIR}/credential-events.log"
+    mkdir -p "$BACKUP_DIR" 2>/dev/null || true
+    printf '%s pid=%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" "$msg" >> "$log_file" 2>/dev/null || true
+}
+
 credential_is_usable() {
     local creds="$1"
     local access refresh expires now
@@ -1503,6 +1513,10 @@ write_credentials() {
     local platform
     platform=$(detect_platform)
 
+    if ! credential_is_usable "$credentials"; then
+        log_credential_event "write_credentials writing EMPTY/EXPIRED credentials to live session"
+    fi
+
     case "$platform" in
         macos)
             security add-generic-password -U -s "Claude Code-credentials" -a "$USER" -w "$credentials" 2>/dev/null
@@ -1548,9 +1562,11 @@ write_account_credentials() {
         local existing
         existing=$(read_account_credentials "$account_num" "$email")
         if credential_is_usable "$existing"; then
+            log_credential_event "refused to overwrite valid backup for Account-$account_num ($email) with empty/expired credentials (caller=${FUNCNAME[1]:-unknown})"
             echo "Warning: refusing to overwrite valid backup for Account-$account_num ($email) with empty/expired credentials" >&2
             return 0
         fi
+        log_credential_event "writing EMPTY/EXPIRED credentials for Account-$account_num ($email) — existing backup was already unusable (caller=${FUNCNAME[1]:-unknown})"
     fi
 
     platform=$(detect_platform)
