@@ -1327,6 +1327,22 @@ should_reclaim_to_preferred_account() {
         return 0
     fi
 
+    # Same-priority accounts don't reclaim on any usage edge (that would
+    # thrash between two team accounts a few percent apart). But when the
+    # active account's 5h usage is at least double the candidate's, the gap
+    # is big enough that riding it out to the 95% hard-switch threshold
+    # wastes a mostly-empty sibling account for no reason — pull the primary
+    # (5h, or activeLimit) window back out of the composite score to compare.
+    if (( best_priority == active_priority )); then
+        local active_five best_five
+        active_five=$(( active_usage >= 100000 ? 100 : active_usage / 1000 ))
+        best_five=$(( best_usage >= 100000 ? 100 : best_usage / 1000 ))
+        if (( active_five > 0 && best_five * 2 < active_five )); then
+            echo "$best_account"
+            return 0
+        fi
+    fi
+
     return 1
 }
 
