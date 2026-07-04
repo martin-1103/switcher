@@ -790,13 +790,13 @@ format_usage_resets_snapshot() {
     if [[ -n "$reset_5h" ]]; then
         reset_epoch=$(iso_to_epoch "$reset_5h")
         delta=$((reset_epoch - now_epoch))
-        parts+=("5h $(format_relative_duration "$delta")")
+        parts+=("5h-reset: $(format_relative_duration "$delta")")
     fi
 
     if [[ -n "$reset_7d" ]]; then
         reset_epoch=$(iso_to_epoch "$reset_7d")
         delta=$((reset_epoch - now_epoch))
-        parts+=("7d $(format_relative_duration "$delta")")
+        parts+=("7d-reset: $(format_relative_duration "$delta")")
     fi
 
     if [[ ${#parts[@]} -gt 0 ]]; then
