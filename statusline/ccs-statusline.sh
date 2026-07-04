@@ -15,6 +15,7 @@ set -uo pipefail
 # shellcheck disable=SC2034
 INPUT=$(cat 2>/dev/null || true)
 
+HOME="${HOME:-/root}"
 CACHE_FILE="/tmp/claude-usage-cache.json"
 SEQ="$HOME/.claude-switch-backup/sequence.json"
 
@@ -26,11 +27,13 @@ CCS="${CCS_PATH:-}"
 [[ -x "$CCS" ]] || CCS=$(command -v ccs 2>/dev/null || echo "")
 [[ -z "$CCS" || ! -x "$CCS" ]] && CCS="/usr/local/bin/ccs"
 
-# Kick a TTL-aware refresh in the background (no --auto-switch: refreshing the
-# cache is the statusline's job; switching is the hook's). Detached so the render
-# never waits on the API call.
+# Kick a TTL-aware refresh + reclaim check in the background. The hook only
+# fires on a tool call, so an idle session (Claude Code open, no tool calls)
+# would never reclaim an account whose window has reset. The statusline is
+# invoked periodically by Claude Code's own render loop regardless of tool
+# activity, so piggyback the reclaim check here instead of adding a timer.
 if [[ -x "$CCS" ]]; then
-    ( "$CCS" rate-check >/dev/null 2>&1 & ) 2>/dev/null || true
+    ( CCS_SILENT=1 "$CCS" rate-check --auto-switch >/dev/null 2>&1 & ) 2>/dev/null || true
 fi
 
 # Print from whatever is currently cached.
