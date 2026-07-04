@@ -881,9 +881,9 @@ format_relative_age() {
     mins=$(((seconds % 3600) / 60))
 
     if [[ "$days" -gt 0 ]]; then
-        echo "${days}d ${hours}h"
+        echo "${days}d"
     elif [[ "$hours" -gt 0 ]]; then
-        echo "${hours}j ${mins}m"
+        echo "${hours}j"
     elif [[ "$mins" -gt 0 ]]; then
         echo "${mins}m"
     else
