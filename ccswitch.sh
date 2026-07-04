@@ -598,6 +598,10 @@ setup_directories() {
 # mkdir is atomic everywhere; macOS lacks flock. Steals a lock whose owner PID
 # is gone. Returns 0 on success, 1 on timeout.
 acquire_switch_lock() {
+    # Reentrant when a caller up the stack (cmd_rate_check) already holds the
+    # lock for the whole decision loop — skip re-acquiring so perform_switch
+    # calls inside that loop don't deadlock waiting on their own parent's lock.
+    [[ "${CCS_LOCK_HELD:-}" == "1" ]] && return 0
     local timeout_s="${1:-10}"
     local max_iters=$(( timeout_s * 5 ))   # 0.2s per iteration
     local i=0
@@ -622,6 +626,7 @@ acquire_switch_lock() {
 
 # Release the switch lock. Idempotent (safe to call when not held).
 release_switch_lock() {
+    [[ "${CCS_LOCK_HELD:-}" == "1" ]] && return 0
     rm -rf "$LOCK_DIR" 2>/dev/null || true
 }
 
@@ -3093,6 +3098,21 @@ fetch_usage_data() {
 # Usage: ccs rate-check [--threshold N] [--auto-switch] [--hook-mode] [--refresh] [--max-age SECONDS]
 # Exit codes: 0=ok, 1=exceeded (switched if --auto-switch), 2=error, 3=all accounts limited
 cmd_rate_check() {
+    # Serialize the ENTIRE decision loop (usage check -> reclaim/switch
+    # candidates), not just individual perform_switch writes. The statusline
+    # spawns this in the background on every render with no dedup, so without
+    # a whole-call lock, overlapping invocations interleave: each reads a
+    # different in-flight active-account state and both drive perform_switch
+    # on the same target accounts concurrently, corrupting credential files.
+    # Non-blocking: a busy lock means another invocation is already running
+    # the exact same decision, so just skip rather than queue and thrash.
+    if ! acquire_switch_lock 0; then
+        [[ "${CCS_SILENT:-}" == "1" ]] || echo "rate-check already running elsewhere, skipping." >&2
+        return 0
+    fi
+    export CCS_LOCK_HELD=1
+    trap 'release_switch_lock; unset CCS_LOCK_HELD' RETURN EXIT
+
     local threshold=""
     local auto_switch=false
     local hook_mode=false
