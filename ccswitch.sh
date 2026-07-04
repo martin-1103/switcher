@@ -3319,41 +3319,21 @@ cmd_rate_check() {
                 exit 2
             fi
 
-            # Invalidate cache and re-fetch for new account
+            # Trust auto_switch_candidates' selection (already based on the
+            # cached/coordinator snapshot) instead of re-fetching from the API
+            # to verify — an extra fetch right after switching just doubles
+            # API calls and, on a 429, used to fall through to "assume OK" and
+            # get stuck, which caused an infinite reclaim/switch loop across
+            # accounts that were all actually still over threshold.
             rm -f "$cache_file"
-            if fetch_usage_data; then
-                local new_usage new_usage_int
-                new_usage=$(effective_usage_percent "$cache_file")
-                new_usage_int=$(printf "%.0f" "$new_usage" 2>/dev/null || echo "0")
-
-                if [[ "$new_usage_int" -lt "$threshold" ]]; then
-                    # Successfully switched to an account under the threshold
-                    log_switch_event "switch OK: Account-$starting_account -> Account-$next_account ($next_email), post-switch usage=${new_usage_int}%"
-                    if [[ "$hook_mode" == true ]]; then
-                        _rate_hook_deny "Rate limit exceeded. Switched to Account-$next_account ($next_email). Please restart Claude Code."
-                        exit 0
-                    fi
-                    local new_usage_summary
-                    new_usage_summary=$(format_usage_windows "$cache_file")
-                    echo "Switched to Account-$next_account ($next_email) — usage: ${new_usage_summary}"
-                    handle_restart_after_switch
-                    exit 1
-                fi
-                log_switch_event "candidate Account-$next_account ($next_email) still over threshold post-switch: ${new_usage_int}% — trying next"
-            else
-                # Can't verify new account's usage, assume it's OK
-                log_switch_event "switch OK (usage unverifiable): Account-$starting_account -> Account-$next_account ($next_email)"
-                if [[ "$hook_mode" == true ]]; then
-                    _rate_hook_deny "Rate limit exceeded. Switched to Account-$next_account ($next_email). Please restart Claude Code."
-                    exit 0
-                fi
-                echo "Switched to Account-$next_account ($next_email) — could not verify usage"
-                handle_restart_after_switch
-                exit 1
+            log_switch_event "switch OK: Account-$starting_account -> Account-$next_account ($next_email) (unverified, trusting candidate snapshot)"
+            if [[ "$hook_mode" == true ]]; then
+                _rate_hook_deny "Rate limit exceeded. Switched to Account-$next_account ($next_email). Please restart Claude Code."
+                exit 0
             fi
-
-            attempts=$((attempts + 1))
-            [[ $attempts -ge $max_attempts ]] && break
+            echo "Switched to Account-$next_account ($next_email)"
+            handle_restart_after_switch
+            exit 1
         done < <(auto_switch_candidates "$starting_account" "$threshold")
 
         # Restore the original account before reporting "all limited".
