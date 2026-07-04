@@ -673,64 +673,6 @@ highest_limit_percent() {
     ' "$cache_file" 2>/dev/null
 }
 
-effective_limit_source() {
-    local cache_file="$1"
-    jq -r '
-        [
-            (.limits // [])[] |
-            select((.is_active // false) == true) |
-            select((.percent? | type) == "number") |
-            {
-                percent: .percent,
-                label: "limit"
-            }
-        ] |
-        sort_by(.percent) |
-        last |
-        if . then "\(.percent)|\(.label)" else empty end
-    ' "$cache_file" 2>/dev/null
-}
-
-effective_usage_percent() {
-    local cache_file="$1"
-    local active_limit active_percent five_hour seven_day
-    active_limit=$(effective_limit_source "$cache_file")
-    if [[ -n "$active_limit" ]]; then
-        printf '%s\n' "${active_limit%%|*}"
-        return
-    fi
-
-    five_hour=$(usage_window_percent "$cache_file" "five_hour")
-    seven_day=$(usage_window_percent "$cache_file" "seven_day")
-
-    jq -nr \
-        --arg five "${five_hour:-0}" \
-        --arg seven "${seven_day:-0}" '
-        [
-            ($five | tonumber? // 0),
-            ($seven | tonumber? // 0)
-        ] | max
-    ' 2>/dev/null
-}
-
-effective_usage_source() {
-    local cache_file="$1"
-    local active_limit
-    active_limit=$(effective_limit_source "$cache_file")
-    if [[ -n "$active_limit" ]]; then
-        printf '%s\n' "${active_limit#*|}"
-    else
-        local seven_day seven_day_int
-        seven_day=$(usage_window_percent "$cache_file" "seven_day")
-        seven_day_int=$(printf "%.0f" "${seven_day:-0}" 2>/dev/null || echo "0")
-        if [[ "$seven_day_int" -gt 0 ]]; then
-            printf 'seven_day\n'
-        else
-            printf 'five_hour\n'
-        fi
-    fi
-}
-
 usage_window_reset() {
     local cache_file="$1"
     local key="$2"
@@ -1147,74 +1089,48 @@ cmd_warm_loop() {
     done
 }
 
-account_snapshot_usage() {
-    local account_num="$1"
-    local now_epoch reset_5h reset_7d five_expired=0 seven_expired=0
-    now_epoch=$(date +%s)
+# --- Rate-limit switch policy constants ---
+# Priority/ranking use the 5-hour window ONLY. The 7-day window never affects
+# ordering; it only hard-blocks an account near exhaustion. Switch away from the
+# active account once it has burned RL_MOVE_STEP more 5h than it had on entry
+# (anti-thrash), capped at RL_CAP_5H so we still move before the hard cap.
+readonly RL_MOVE_STEP=10   # extra 5h % to burn on the active account before switching
+readonly RL_CAP_5H=98      # 5h hard cap: an account at/above this is never used
+readonly RL_CAP_7D=99      # 7d hard cap: an account at/above this is never used
 
-    reset_5h=$(jq -r --arg num "$account_num" '.accounts[$num].lastKnownUsage.resetAt5h // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
-    if [[ -n "$reset_5h" ]]; then
-        local reset_5h_epoch
-        reset_5h_epoch=$(iso_to_epoch "$reset_5h")
-        [[ "$reset_5h_epoch" -gt 0 && "$reset_5h_epoch" -le "$now_epoch" ]] && five_expired=1
+# 5-hour utilization (integer %) for an account from its stored snapshot,
+# honoring reset expiry (a passed reset means the window is clear -> 0).
+account_five_hour() {
+    local num="$1" now reset r
+    now=$(date +%s)
+    reset=$(jq -r --arg n "$num" '.accounts[$n].lastKnownUsage.resetAt5h // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
+    if [[ -n "$reset" ]]; then
+        r=$(iso_to_epoch "$reset")
+        [[ "$r" -gt 0 && "$r" -le "$now" ]] && { echo 0; return; }
     fi
-
-    reset_7d=$(jq -r --arg num "$account_num" '.accounts[$num].lastKnownUsage.resetAt7d // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
-    if [[ -n "$reset_7d" ]]; then
-        local reset_7d_epoch
-        reset_7d_epoch=$(iso_to_epoch "$reset_7d")
-        [[ "$reset_7d_epoch" -gt 0 && "$reset_7d_epoch" -le "$now_epoch" ]] && seven_expired=1
-    fi
-
-    # Only the 5-hour window drives switch priority/ranking. sevenDay is still
-    # a hard block when it hits 100% (window truly exhausted, account unusable
-    # regardless of 5h), it just doesn't otherwise weigh into the score —
-    # activeLimit can be driven by the 7-day window (API picks whichever
-    # window is currently binding), which would leak sevenDay into ranking
-    # even though the auto-switch priority is 5h-only.
-    jq -r --arg num "$account_num" --argjson fiveExpired "$five_expired" --argjson sevenExpired "$seven_expired" '
-        (.accounts[$num].lastKnownUsage // {}) as $u |
-        (if $fiveExpired == 1 then 0 else ($u.fiveHour // 0) end) as $five |
-        (if $sevenExpired == 1 then 0 else ($u.sevenDay // 0) end) as $seven |
-        if ($five >= 100 or $seven >= 100) then 100000 + ([$five, $seven] | max) else $five * 1000 end
-    ' "$SEQUENCE_FILE" 2>/dev/null || echo "0"
+    jq -r --arg n "$num" '(.accounts[$n].lastKnownUsage.fiveHour // 0) | floor' "$SEQUENCE_FILE" 2>/dev/null || echo 0
 }
 
-candidate_over_threshold() {
-    local account_num="$1"
-    local threshold="$2"
-    local now_epoch reset_5h reset_7d five_expired=0 seven_expired=0
-    now_epoch=$(date +%s)
-
-    reset_5h=$(jq -r --arg num "$account_num" '.accounts[$num].lastKnownUsage.resetAt5h // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
-    if [[ -n "$reset_5h" ]]; then
-        local r5_epoch
-        r5_epoch=$(iso_to_epoch "$reset_5h")
-        [[ "$r5_epoch" -gt 0 && "$r5_epoch" -le "$now_epoch" ]] && five_expired=1
+# 7-day utilization (integer %), same reset-expiry rule.
+account_seven_day() {
+    local num="$1" now reset r
+    now=$(date +%s)
+    reset=$(jq -r --arg n "$num" '.accounts[$n].lastKnownUsage.resetAt7d // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
+    if [[ -n "$reset" ]]; then
+        r=$(iso_to_epoch "$reset")
+        [[ "$r" -gt 0 && "$r" -le "$now" ]] && { echo 0; return; }
     fi
-    reset_7d=$(jq -r --arg num "$account_num" '.accounts[$num].lastKnownUsage.resetAt7d // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
-    if [[ -n "$reset_7d" ]]; then
-        local r7_epoch
-        r7_epoch=$(iso_to_epoch "$reset_7d")
-        [[ "$r7_epoch" -gt 0 && "$r7_epoch" -le "$now_epoch" ]] && seven_expired=1
-    fi
+    jq -r --arg n "$num" '(.accounts[$n].lastKnownUsage.sevenDay // 0) | floor' "$SEQUENCE_FILE" 2>/dev/null || echo 0
+}
 
-    # Candidate's own binding limit (activeLimit — whichever window the API
-    # says is currently constraining it — falling back to fiveHour, with
-    # sevenDay as a hard block). This is a real "is this account itself still
-    # rate-limited" check, not the 5h-only ranking score: switching to a
-    # candidate that's still over threshold just moves the loop, it doesn't
-    # break it.
-    local usage_int
-    usage_int=$(jq -r --arg num "$account_num" --argjson fiveExpired "$five_expired" --argjson sevenExpired "$seven_expired" '
-        (.accounts[$num].lastKnownUsage // {}) as $u |
-        (if $fiveExpired == 1 then 0 else ($u.fiveHour // 0) end) as $five |
-        (if $sevenExpired == 1 then 0 else ($u.sevenDay // 0) end) as $seven |
-        (if (($u.activeLimit // 0) > 0 and $fiveExpired == 0 and $sevenExpired == 0) then ($u.activeLimit // 0) else $five end) as $primary |
-        [$primary, $seven] | max
-    ' "$SEQUENCE_FILE" 2>/dev/null || echo "0")
-    usage_int=$(printf "%.0f" "${usage_int:-0}" 2>/dev/null || echo "0")
-    [[ "$usage_int" -ge "$threshold" ]]
+# An account is hard-blocked (never usable) when either window is at/above its
+# cap. Ranking ignores 7d, but this gate does not: a 7d-exhausted account can't
+# serve traffic no matter how empty its 5h window is.
+account_hard_blocked() {
+    local num="$1" f s
+    f=$(account_five_hour "$num")
+    s=$(account_seven_day "$num")
+    (( f >= RL_CAP_5H || s >= RL_CAP_7D ))
 }
 
 account_group_type() {
@@ -1245,34 +1161,28 @@ account_type_priority() {
     esac
 }
 
+# Emit one row per non-active account: num|five|seven|priority|remote_count|known
+# five/seven are integer %; priority is account-type priority; remote_count is
+# how many OTHER servers currently hold the account (>0 = contended); known is
+# 1 if we have ever observed usage for it, else 0. A fresher fleet-wide snapshot
+# (coordinator) overrides the local one when its observedAt is newer.
 collect_switch_candidates() {
     local active_account="$1"
-    local ord=0 num usage known priority email remote_count
+    local num five seven priority email remote_count known
     while IFS= read -r num; do
         [[ -n "$num" ]] || continue
-        if [[ "$num" == "$active_account" ]]; then
-            ord=$((ord + 1))
-            continue
-        fi
+        [[ "$num" == "$active_account" ]] && continue
         email=$(jq -r --arg num "$num" '.accounts[$num].email // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
-        usage=$(account_snapshot_usage "$num")
-        if account_usage_known "$num"; then
-            known=1
-        else
-            known=0
-        fi
+        five=$(account_five_hour "$num")
+        seven=$(account_seven_day "$num")
         priority=$(account_type_priority "$num")
+        if account_usage_known "$num"; then known=1; else known=0; fi
         remote_count=0
         if [[ -n "$email" ]]; then
-            # Fetch coordinator state once: holder count + freshest other server's
-            # usage. Prefer remote usage only when it was observed more recently
-            # than our local snapshot, so a stale local number can't override a
-            # fresh fleet-wide one (and vice versa).
-            local remote_state remote_limit remote_5h remote_7d remote_observed remote_reset_5h remote_reset_7d local_observed
+            local remote_state remote_5h remote_7d remote_observed remote_reset_5h remote_reset_7d local_observed
             remote_state=$(coord_remote_owner_state "$email" 2>/dev/null || echo "0||||||")
             remote_count=$(printf '%s' "$remote_state" | cut -d'|' -f1)
             [[ "$remote_count" =~ ^[0-9]+$ ]] || remote_count=0
-            remote_limit=$(printf '%s' "$remote_state" | cut -d'|' -f2)
             remote_5h=$(printf '%s' "$remote_state" | cut -d'|' -f3)
             remote_7d=$(printf '%s' "$remote_state" | cut -d'|' -f4)
             remote_observed=$(printf '%s' "$remote_state" | cut -d'|' -f5)
@@ -1281,109 +1191,72 @@ collect_switch_candidates() {
             local_observed=$(jq -r --arg num "$num" '.accounts[$num].lastKnownUsage.observedAt // 0' "$SEQUENCE_FILE" 2>/dev/null || echo 0)
             [[ "$local_observed" =~ ^[0-9]+$ ]] || local_observed=0
             [[ "$remote_observed" =~ ^[0-9]+$ ]] || remote_observed=0
-            if [[ -n "$remote_5h$remote_7d$remote_limit" && "$remote_observed" -gt "$local_observed" ]]; then
-                # Apply the same reset-expiry rule account_snapshot_usage uses:
-                # a passed reset means that window is clear, usage is 0 — checked
-                # per-window (5h and 7d independently) rather than zeroing both.
-                local now_epoch five_expired=0 seven_expired=0
+            if [[ -n "$remote_5h$remote_7d" && "$remote_observed" -gt "$local_observed" ]]; then
+                # Fresher remote snapshot: adopt its 5h/7d, honoring reset expiry.
+                local now_epoch r
                 now_epoch=$(date +%s)
-                if [[ -n "$remote_reset_5h" ]]; then
-                    local r5_epoch
-                    r5_epoch=$(iso_to_epoch "$remote_reset_5h")
-                    [[ "$r5_epoch" -gt 0 && "$r5_epoch" -le "$now_epoch" ]] && five_expired=1
-                fi
-                if [[ -n "$remote_reset_7d" ]]; then
-                    local r7_epoch
-                    r7_epoch=$(iso_to_epoch "$remote_reset_7d")
-                    [[ "$r7_epoch" -gt 0 && "$r7_epoch" -le "$now_epoch" ]] && seven_expired=1
-                fi
-                [[ "$five_expired" -eq 1 ]] && remote_5h=0
-                [[ "$seven_expired" -eq 1 ]] && remote_7d=0
-                local remote_usage
-                if [[ -n "$remote_limit" && "$remote_limit" != "0" && "$five_expired" -eq 0 && "$seven_expired" -eq 0 ]]; then
-                    remote_usage="$remote_limit"
-                else
-                    remote_usage=$(jq -nr --arg five "${remote_5h:-0}" --arg seven "${remote_7d:-0}" '
-                        ($five|tonumber? // 0) as $five |
-                        ($seven|tonumber? // 0) as $seven |
-                        if ($five >= 100 or $seven >= 100) then 100000 + ([$five, $seven] | max)
-                        else $five * 1000 + $seven
-                        end
-                    ')
-                fi
-                usage="$remote_usage"
+                if [[ -n "$remote_reset_5h" ]]; then r=$(iso_to_epoch "$remote_reset_5h"); [[ "$r" -gt 0 && "$r" -le "$now_epoch" ]] && remote_5h=0; fi
+                if [[ -n "$remote_reset_7d" ]]; then r=$(iso_to_epoch "$remote_reset_7d"); [[ "$r" -gt 0 && "$r" -le "$now_epoch" ]] && remote_7d=0; fi
+                five=$(printf '%.0f' "${remote_5h:-0}" 2>/dev/null || echo 0)
+                seven=$(printf '%.0f' "${remote_7d:-0}" 2>/dev/null || echo 0)
                 known=1
             fi
         fi
-        printf '%s|%s|%s|%s|%s\n' "$num" "$usage" "$known" "$priority" "$remote_count"
-        ord=$((ord + 1))
+        printf '%s|%s|%s|%s|%s|%s\n' "$num" "$five" "$seven" "$priority" "$remote_count" "$known"
     done < <(jq -r '.sequence[]' "$SEQUENCE_FILE" 2>/dev/null)
 }
 
+# Ranked list of switch targets (account numbers), best first. Drops hard-blocked
+# accounts (5h>=cap or 7d>=cap). Order: unclaimed-by-others first, then
+# known-usage first, then lowest 5h, then higher account-type priority. The
+# 7-day window never affects ordering — only the hard-block filter above.
 auto_switch_candidates() {
     local active_account="$1"
-    local healthy_threshold="${2:-95}"
     local candidates
     candidates=$(collect_switch_candidates "$active_account")
     [[ -n "$candidates" ]] || return 0
 
-    local exclusive
-    exclusive=$(printf '%s\n' "$candidates" | awk -F'|' '$5 == 0')
-
-    local exclusive_healthy=""
-    if [[ -n "$exclusive" ]]; then
-        # Field 2 is the composite score (five*1000+seven, or 100000+ if either
-        # window is hard-blocked at >=100). "Healthy" means the 5h window
-        # (the primary usability gate) is below the threshold — extract it back
-        # out of the composite instead of comparing the raw score to a percent.
-        exclusive_healthy=$(printf '%s\n' "$exclusive" | awk -F'|' -v t="$healthy_threshold" '{five = ($2 >= 100000) ? 100 : int($2 / 1000); if (five < t) print}')
-    fi
-
-    if [[ -n "$exclusive_healthy" ]]; then
-        printf '%s\n' "$exclusive_healthy" \
-            | sort -t'|' -k4,4nr -k3,3nr -k2,2n -k1,1n \
-            | cut -d'|' -f1
-        return 0
-    fi
-
     printf '%s\n' "$candidates" \
-        | sort -t'|' -k3,3nr -k2,2n -k4,4nr -k5,5n -k1,1n \
+        | awk -F'|' -v c5="$RL_CAP_5H" -v c7="$RL_CAP_7D" '($2+0) < c5 && ($3+0) < c7' \
+        | sort -t'|' -k5,5n -k6,6nr -k2,2n -k4,4nr -k1,1n \
         | cut -d'|' -f1
 }
 
 should_reclaim_to_preferred_account() {
     local active_account="$1"
+    # The active account's live 5h comes from the fresh cache (passed in), not
+    # its stored snapshot — the snapshot lags and for the active account may be
+    # absent entirely. Fall back to the stored value only if no live one given.
+    local active_five="${2:-}"
     [[ -f "$SEQUENCE_FILE" ]] || return 1
 
     local best_account
-    best_account=$(auto_switch_candidates "$active_account" "${2:-95}" | head -n1)
+    best_account=$(auto_switch_candidates "$active_account" | head -n1)
     [[ -n "$best_account" ]] || return 1
+    # Only reclaim to an account whose usage we've actually observed. An unknown
+    # account reads as 0% and would always look emptier than the active one,
+    # triggering a blind reclaim to an account that may in fact be exhausted.
+    account_usage_known "$best_account" || return 1
 
-    local active_priority best_priority active_usage best_usage
+    local active_priority best_priority best_five
     active_priority=$(account_type_priority "$active_account")
     best_priority=$(account_type_priority "$best_account")
-    active_usage=$(account_snapshot_usage "$active_account")
-    best_usage=$(account_snapshot_usage "$best_account")
+    [[ -z "$active_five" ]] && active_five=$(account_five_hour "$active_account")
+    best_five=$(account_five_hour "$best_account")
 
-    if (( best_priority > active_priority )) && (( best_usage < active_usage )); then
+    # Higher-priority sibling that's less used -> reclaim it (put traffic back
+    # on the preferred tier as soon as it has room).
+    if (( best_priority > active_priority )) && (( best_five < active_five )); then
         echo "$best_account"
         return 0
     fi
 
-    # Same-priority accounts don't reclaim on any usage edge (that would
-    # thrash between two team accounts a few percent apart). But when the
-    # active account's 5h usage is at least double the candidate's, the gap
-    # is big enough that riding it out to the 95% hard-switch threshold
-    # wastes a mostly-empty sibling account for no reason — pull the primary
-    # (5h, or activeLimit) window back out of the composite score to compare.
-    if (( best_priority == active_priority )); then
-        local active_five best_five
-        active_five=$(( active_usage >= 100000 ? 100 : active_usage / 1000 ))
-        best_five=$(( best_usage >= 100000 ? 100 : best_usage / 1000 ))
-        if (( active_five > 0 && best_five * 2 < active_five )); then
-            echo "$best_account"
-            return 0
-        fi
+    # Same priority: don't reclaim on a small edge (that thrashes between two
+    # siblings a few percent apart). Only when the active account's 5h is at
+    # least double the candidate's is the gap big enough to bother.
+    if (( best_priority == active_priority )) && (( active_five > 0 && best_five * 2 < active_five )); then
+        echo "$best_account"
+        return 0
     fi
 
     return 1
@@ -3008,6 +2881,16 @@ perform_switch() {
         rm -f "$live_cache" 2>/dev/null || true
     fi
 
+    # Record the 5h utilization at the moment we land on this account. The
+    # switch-away trigger compares live 5h against this entry point + RL_MOVE_STEP
+    # (anti-thrash): an account we just moved to at 84% won't be abandoned until
+    # it has actually burned ~10% more, instead of immediately again.
+    local entry_five seq_entry
+    entry_five=$(account_five_hour "$target_account")
+    seq_entry=$(jq --arg num "$target_account" --argjson e "${entry_five:-0}" \
+        '.accounts[$num].entryFiveHour = $e' "$SEQUENCE_FILE" 2>/dev/null) || true
+    [[ -n "$seq_entry" ]] && write_json "$SEQUENCE_FILE" "$seq_entry" >/dev/null 2>&1 || true
+
     coord_publish_account_state "$target_account" "$target_email"
 
     if [[ "${CCS_HEADLESS_SMOKE:-0}" == "1" ]]; then
@@ -3151,7 +3034,6 @@ cmd_rate_check() {
     export CCS_LOCK_HELD=1
     trap 'release_switch_lock; unset CCS_LOCK_HELD' RETURN EXIT
 
-    local threshold=""
     local auto_switch=false
     local hook_mode=false
     local refresh=false
@@ -3162,7 +3044,10 @@ cmd_rate_check() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --threshold)
-                threshold="$2"
+                # Accepted for backward compatibility but no longer used: the
+                # switch decision is driven by the 5h entry+RL_MOVE_STEP
+                # hysteresis and the RL_CAP_5H/RL_CAP_7D hard caps, not a single
+                # threshold. Consume the value so it isn't mistaken for a flag.
                 shift 2
                 ;;
             --auto-switch)
@@ -3186,19 +3071,6 @@ cmd_rate_check() {
                 ;;
         esac
     done
-
-    # Read threshold from config if not explicitly passed via --threshold
-    if [[ -z "$threshold" ]]; then
-        if [[ -f "$SEQUENCE_FILE" ]]; then
-            local cfg_threshold
-            cfg_threshold=$(jq -r '.rateLimit.threshold // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
-            if [[ -n "$cfg_threshold" ]]; then
-                threshold="$cfg_threshold"
-            fi
-        fi
-        # Default if neither flag nor config provided
-        threshold="${threshold:-80}"
-    fi
 
     # Resolve cache TTL: --max-age flag > .rateLimit.cacheTtl config > default
     if [[ -z "$max_age" ]]; then
@@ -3247,36 +3119,60 @@ cmd_rate_check() {
         exit 2
     fi
 
-    # Read utilization
-    local usage usage_int usage_summary usage_source
-    usage=$(effective_usage_percent "$cache_file")
-    usage_int=$(printf "%.0f" "$usage" 2>/dev/null || echo "0")
+    # Human-readable window summary for non-hook output only. The switch
+    # decision below reads 5h/7d directly, not this string.
+    local usage_summary
     usage_summary=$(format_usage_windows "$cache_file")
-    usage_source=$(effective_usage_source "$cache_file")
 
-    local starting_account reclaim_target=""
+    local starting_account
     starting_account=$(jq -r '.activeAccountNumber // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
-    if [[ -n "$starting_account" && "$starting_account" != "null" ]]; then
-        reclaim_target=$(should_reclaim_to_preferred_account "$starting_account" "$threshold" 2>/dev/null || true)
-        if [[ -n "$reclaim_target" ]]; then
-            log_switch_event "reclaim candidate: active=Account-$starting_account target=Account-$reclaim_target usage=${usage_int}% threshold=${threshold}% auto_switch=$auto_switch"
-        fi
-    fi
 
-    # Below threshold — all good
-    if [[ "$usage_int" -lt "$threshold" ]]; then
+    # Active account's live 5h/7d from the fresh cache. Priority uses 5h only;
+    # 7d only forces a switch when it hits its hard cap (window truly exhausted).
+    local active_5h active_7d entry_five trigger_point forced=0 need_switch=0
+    active_5h=$(printf '%.0f' "$(usage_window_percent "$cache_file" five_hour)" 2>/dev/null || echo 0)
+    active_7d=$(printf '%.0f' "$(usage_window_percent "$cache_file" seven_day)" 2>/dev/null || echo 0)
+
+    # Hysteresis: don't abandon an account the moment it's "high" — ride it until
+    # it has burned RL_MOVE_STEP more 5h than it had on entry, capped at RL_CAP_5H.
+    # If no entry point was recorded yet (account was already active before this
+    # policy existed, or set manually), anchor to the current 5h so we start
+    # measuring the +STEP from here instead of switching away immediately.
+    entry_five=$(jq -r --arg n "$starting_account" '.accounts[$n].entryFiveHour // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
+    if [[ -z "$entry_five" || "$entry_five" == "null" ]]; then
+        entry_five=$active_5h
+        local seq_seed
+        seq_seed=$(jq --arg n "$starting_account" --argjson e "${entry_five:-0}" \
+            '.accounts[$n].entryFiveHour = $e' "$SEQUENCE_FILE" 2>/dev/null) || true
+        [[ -n "$seq_seed" ]] && write_json "$SEQUENCE_FILE" "$seq_seed" >/dev/null 2>&1 || true
+    fi
+    entry_five=$(printf '%.0f' "${entry_five:-0}" 2>/dev/null || echo 0)
+    trigger_point=$(( entry_five + RL_MOVE_STEP ))
+    (( trigger_point > RL_CAP_5H )) && trigger_point=$RL_CAP_5H
+
+    # Forced: the active account itself hit a hard cap and can't be used at all.
+    if (( active_5h >= RL_CAP_5H || active_7d >= RL_CAP_7D )); then forced=1; need_switch=1; fi
+    # Normal: burned enough 5h past the entry point to justify moving.
+    if (( active_5h >= trigger_point )); then need_switch=1; fi
+
+    # Not time to switch away yet. Optionally reclaim to a higher-priority
+    # (or much emptier same-priority) sibling, otherwise stay put.
+    if (( need_switch == 0 )); then
+        local reclaim_target=""
+        if [[ -n "$starting_account" && "$starting_account" != "null" ]]; then
+            reclaim_target=$(should_reclaim_to_preferred_account "$starting_account" "$active_5h" 2>/dev/null || true)
+        fi
         if [[ "$auto_switch" == true && -n "$reclaim_target" ]]; then
             local reclaim_email
             reclaim_email=$(jq -r --arg num "$reclaim_target" '.accounts[$num].email // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
+            log_switch_event "reclaim: Account-$starting_account -> Account-$reclaim_target ($reclaim_email) active5h=${active_5h}%"
             if ! (CCS_SWITCH_REASON=auto CCS_SILENT=1 CCS_SKIP_POST_SWITCH_USAGE_FETCH=1 perform_switch "$reclaim_target"); then
                 log_switch_event "reclaim FAILED: Account-$starting_account -> Account-$reclaim_target ($reclaim_email)"
-                if [[ "$hook_mode" == true ]]; then
-                    exit 0
-                fi
+                [[ "$hook_mode" == true ]] && exit 0
                 echo "Error: Failed to reclaim preferred account Account-$reclaim_target ($reclaim_email)" >&2
                 exit 2
             fi
-            log_switch_event "reclaim OK: Account-$starting_account -> Account-$reclaim_target ($reclaim_email), pre-switch usage=${usage_int}%"
+            log_switch_event "reclaim OK: Account-$starting_account -> Account-$reclaim_target ($reclaim_email)"
             rm -f "$cache_file"
             fetch_usage_data >/dev/null 2>&1 || true
             if [[ "$hook_mode" == true ]]; then
@@ -3287,128 +3183,88 @@ cmd_rate_check() {
             handle_restart_after_switch
             exit 1
         fi
-        if [[ "$hook_mode" != true ]]; then
-            echo "Usage: ${usage_summary} (threshold: ${threshold}% on ${usage_source}) — OK"
-        fi
+        [[ "$hook_mode" != true ]] && echo "Usage: ${usage_summary} — OK (5h ${active_5h}%, entry ${entry_five}%, switch at ${trigger_point}%)"
         exit 0
     fi
 
-    # Above threshold
-    if [[ "$hook_mode" != true ]]; then
-        echo "Usage: ${usage_summary} exceeds threshold ${threshold}% on ${usage_source}"
-    fi
-    log_switch_event "threshold exceeded: active=Account-${starting_account:-?} usage=${usage_int}% threshold=${threshold}% auto_switch=$auto_switch"
+    # Time to switch away.
+    [[ "$hook_mode" != true ]] && echo "Usage: ${usage_summary} — switching (5h ${active_5h}%, 7d ${active_7d}%, forced=${forced})"
+    log_switch_event "switch trigger: active=Account-${starting_account:-?} 5h=${active_5h}% 7d=${active_7d}% entry=${entry_five}% trigger=${trigger_point}% forced=${forced} auto_switch=$auto_switch"
 
-    if [[ "$auto_switch" == true ]]; then
-        if [[ ! -f "$SEQUENCE_FILE" ]]; then
-            if [[ "$hook_mode" == true ]]; then
-                exit 0  # Fail open
+    if [[ "$auto_switch" != true ]]; then
+        # No auto-switch: fail open (don't block). Reporting-only path.
+        [[ "$hook_mode" == true ]] && exit 0
+        exit 1
+    fi
+
+    if [[ ! -f "$SEQUENCE_FILE" ]]; then
+        [[ "$hook_mode" == true ]] && exit 0   # fail open
+        echo "Error: No accounts configured" >&2
+        exit 2
+    fi
+
+    # Candidate must have at least RL_MOVE_STEP headroom below the cap to be
+    # worth moving to (anti-thrash): switching to an account that's itself
+    # nearly full just relocates the problem and flip-flops. When the active
+    # account is FORCED (hard-capped), take any non-hard-blocked candidate —
+    # anything usable beats a dead account.
+    local accept_max=$(( RL_CAP_5H - RL_MOVE_STEP ))
+    (( forced == 1 )) && accept_max=$(( RL_CAP_5H - 1 ))
+
+    while IFS= read -r next_account; do
+        [[ -z "$next_account" ]] && continue
+        local next_email next_5h
+        next_email=$(jq -r --arg num "$next_account" '.accounts[$num].email' "$SEQUENCE_FILE")
+        next_5h=$(account_five_hour "$next_account")
+
+        if (( next_5h > accept_max )); then
+            log_switch_event "candidate Account-$next_account ($next_email) skipped: 5h ${next_5h}% > accept ${accept_max}% (forced=${forced})"
+            continue
+        fi
+
+        # Claim atomically before switching. 409 conflict (return 2) = another
+        # server grabbed it first, skip. Coordinator-unavailable (return 1) =
+        # fail open and switch anyway (degrade to autonomous, don't block).
+        if [[ -n "$next_email" && "$next_email" != "null" ]]; then
+            # Capture rc explicitly: coordinator-disabled returns 1, which under
+            # `set -e` would abort the whole command if left bare.
+            local claim_rc=0
+            coord_try_claim_exclusive "$next_account" "$next_email" || claim_rc=$?
+            if [[ "$claim_rc" -eq 2 ]]; then
+                log_switch_event "candidate Account-$next_account ($next_email) skipped: coordinator claim conflict"
+                continue
             fi
-            echo "Error: No accounts configured" >&2
+        fi
+
+        log_switch_event "attempting switch: Account-$starting_account -> Account-$next_account ($next_email) 5h=${next_5h}%"
+        if ! (CCS_SWITCH_REASON=auto CCS_SILENT=1 CCS_SKIP_POST_SWITCH_USAGE_FETCH=1 perform_switch "$next_account"); then
+            log_switch_event "switch FAILED: Account-$starting_account -> Account-$next_account ($next_email)"
+            [[ "$hook_mode" == true ]] && exit 0   # fail open
+            echo "Error: Failed to switch to Account-$next_account ($next_email)" >&2
             exit 2
         fi
 
-        local total_accounts
-        total_accounts=$(jq '.sequence | length' "$SEQUENCE_FILE" 2>/dev/null || echo "0")
-
-        if [[ "$total_accounts" -lt 2 ]]; then
-            if [[ "$hook_mode" == true ]]; then
-                _rate_hook_deny "Rate limit exceeded (${usage_int}%). No other accounts to switch to."
-                exit 0
-            fi
-            echo "Only one account configured, cannot auto-switch" >&2
-            exit 3
-        fi
-
-        # Try switching to next accounts, prioritizing team accounts before max20.
-        local attempts=0
-        local max_attempts=$((total_accounts - 1))
-        starting_account=$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")
-
-        while IFS= read -r next_account; do
-            [[ -z "$next_account" ]] && continue
-            local next_email
-            next_email=$(jq -r --arg num "$next_account" '.accounts[$num].email' "$SEQUENCE_FILE")
-
-            # Skip a candidate that is itself still over threshold (its own
-            # activeLimit/sevenDay, from the cached snapshot — no extra API
-            # call). Without this, auto_switch_candidates' 5h-only ranking can
-            # still pick an account that's over threshold via sevenDay/
-            # activeLimit; switching to it just moves the "over threshold"
-            # loop to the next account instead of ending it.
-            if candidate_over_threshold "$next_account" "$threshold"; then
-                log_switch_event "candidate Account-$next_account ($next_email) skipped: still over threshold (${threshold}%) per cached snapshot"
-                attempts=$((attempts + 1))
-                [[ $attempts -ge $max_attempts ]] && break
-                continue
-            fi
-
-            # Claim the account atomically BEFORE switching. On a 409 conflict
-            # (return 2) another server grabbed it first — skip to the next
-            # candidate instead of colliding. On coordinator-unavailable
-            # (return 1) fail open and switch anyway, so a down coordinator
-            # degrades to the old autonomous behaviour rather than blocking.
-            if [[ -n "$next_email" && "$next_email" != "null" ]]; then
-                coord_try_claim_exclusive "$next_account" "$next_email"
-                if [[ $? -eq 2 ]]; then
-                    log_switch_event "candidate Account-$next_account ($next_email) skipped: coordinator claim conflict (another server holds it)"
-                    attempts=$((attempts + 1))
-                    [[ $attempts -ge $max_attempts ]] && break
-                    continue
-                fi
-            fi
-
-            log_switch_event "attempting switch: Account-$starting_account -> Account-$next_account ($next_email)"
-            # Perform switch in subshell to catch exit 1 from perform_switch
-            if ! (CCS_SWITCH_REASON=auto CCS_SILENT=1 CCS_SKIP_POST_SWITCH_USAGE_FETCH=1 perform_switch "$next_account"); then
-                # Switch failed — fail open in hook mode
-                log_switch_event "switch FAILED: Account-$starting_account -> Account-$next_account ($next_email)"
-                if [[ "$hook_mode" == true ]]; then
-                    exit 0
-                fi
-                echo "Error: Failed to switch to Account-$next_account ($next_email)" >&2
-                exit 2
-            fi
-
-            # No post-switch verify fetch: the candidate was already checked
-            # against the cached snapshot above (candidate_over_threshold),
-            # and re-fetching from the API here just doubles API calls and,
-            # on a 429, used to fall through to "assume OK" and get stuck.
-            rm -f "$cache_file"
-            log_switch_event "switch OK: Account-$starting_account -> Account-$next_account ($next_email)"
-            if [[ "$hook_mode" == true ]]; then
-                _rate_hook_deny "Rate limit exceeded. Switched to Account-$next_account ($next_email). Please restart Claude Code."
-                exit 0
-            fi
-            echo "Switched to Account-$next_account ($next_email)"
-            handle_restart_after_switch
-            exit 1
-        done < <(auto_switch_candidates "$starting_account" "$threshold")
-
-        # Restore the original account before reporting "all limited".
-        local current_active
-        current_active=$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")
-        if [[ "$current_active" != "$starting_account" ]]; then
-            log_switch_event "restoring original Account-$starting_account after exhausting all candidates"
-            CCS_SILENT=1 CCS_SKIP_POST_SWITCH_USAGE_FETCH=1 perform_switch "$starting_account" >/dev/null 2>&1 || true
-        fi
-
-        # All accounts are limited
-        log_switch_event "all accounts above threshold (${threshold}%), staying on Account-$starting_account"
+        rm -f "$cache_file"
+        log_switch_event "switch OK: Account-$starting_account -> Account-$next_account ($next_email)"
         if [[ "$hook_mode" == true ]]; then
-            _rate_hook_deny "Rate limit exceeded on all accounts (${usage_int}%). Please wait for limits to reset."
+            _rate_hook_deny "Rate limit exceeded. Switched to Account-$next_account ($next_email). Please restart Claude Code."
             exit 0
         fi
-        echo "All accounts are above the threshold" >&2
-        exit 3
-    fi
+        echo "Switched to Account-$next_account ($next_email)"
+        handle_restart_after_switch
+        exit 1
+    done < <(auto_switch_candidates "$starting_account")
 
-    # No auto-switch, just report
+    # No candidate was usable (all hard-blocked, contended, or — when not forced
+    # — none had enough headroom to be worth the move). Stay on the current
+    # account and FAIL OPEN: blocking the user on top of being limited is
+    # strictly worse than letting the upstream API enforce its own limit.
+    log_switch_event "no usable candidate, staying on Account-$starting_account (fail-open, forced=${forced})"
     if [[ "$hook_mode" == true ]]; then
-        _rate_hook_deny "Rate limit exceeded (${usage_int}%). Run 'ccs sw' to switch accounts."
         exit 0
     fi
-    exit 1
+    echo "No account with enough headroom to switch to; staying put" >&2
+    exit 3
 }
 
 # Output hook-protocol JSON to deny a tool call

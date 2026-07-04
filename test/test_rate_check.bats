@@ -14,98 +14,251 @@ teardown() {
     teardown_test_env
 }
 
-# Helper to create a fake usage cache at the test cache path
-# Usage: create_test_cache <utilization> [email]
-create_test_cache() {
-    local utilization="${1:-50}"
-    local email="${2:-user1@example.com}"
-    cat > "$CACHE_FILE" <<EOF
-{
-  "five_hour": {
-    "utilization": $utilization,
-    "limit": 100,
-    "used": $utilization
-  },
-  "active_account": "$email",
-  "cached_at": $(date +%s)
-}
-EOF
+# Set the recorded 5h entry point for an account (the hysteresis anchor:
+# rate-check switches away once live 5h >= entry + RL_MOVE_STEP).
+seed_entry_five() {
+    local num="$1" val="$2" updated
+    updated=$(jq --arg n "$num" --argjson v "$val" '.accounts[$n].entryFiveHour = $v' "$SEQUENCE_FILE")
+    echo "$updated" > "$SEQUENCE_FILE"
 }
 
-@test "test_rate_check_below_threshold_returns_0" {
+# Seed a candidate account's last-known 5h/7d snapshot so ranking/hard-block
+# logic (which reads .accounts[n].lastKnownUsage) can see it as observed.
+seed_account_usage() {
+    local num="$1" five="$2" seven="${3:-0}" updated
+    updated=$(jq --arg n "$num" --argjson f "$five" --argjson s "$seven" --argjson now "$(date +%s)" '
+        .accounts[$n].lastKnownUsage = {fiveHour: $f, sevenDay: $s, activeLimit: $f, observedAt: $now}
+    ' "$SEQUENCE_FILE")
+    echo "$updated" > "$SEQUENCE_FILE"
+}
+
+# ---------------------------------------------------------------------------
+# Switch trigger: 5h entry+step hysteresis and hard caps
+# ---------------------------------------------------------------------------
+
+@test "test_rate_check_stays_when_5h_below_entry_plus_step" {
     setup_fake_account "user1@example.com" "uuid-1"
     add_account_to_sequence "1" "user1@example.com" "uuid-1" "true"
-
-    create_fake_usage_cache 50 "user1@example.com"
-
-    run run_ccswitch rate-check --threshold 80
-    [ "$status" -eq 0 ]
-    [[ "$output" == *"OK"* ]]
-}
-
-@test "test_rate_check_above_threshold_returns_1" {
-    setup_fake_account "user1@example.com" "uuid-1"
-    add_account_to_sequence "1" "user1@example.com" "uuid-1" "true"
-
+    add_account_to_sequence "2" "user2@example.com" "uuid-2" "false"
+    seed_entry_five "1" 84          # trigger point = 94
     create_fake_usage_cache 90 "user1@example.com"
 
-    run run_ccswitch rate-check --threshold 80
-    [ "$status" -eq 1 ]
-    [[ "$output" == *"exceeds"* ]]
+    # 90 < 94: not time to switch away yet.
+    run run_ccswitch rate-check --auto-switch
+    [ "$status" -eq 0 ]
+    local active
+    active=$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")
+    [ "$active" -eq 1 ]
 }
 
-@test "test_rate_check_reports_5h_and_7d_usage" {
+@test "test_rate_check_switches_when_5h_reaches_entry_plus_step" {
     setup_fake_account "user1@example.com" "uuid-1"
     add_account_to_sequence "1" "user1@example.com" "uuid-1" "true"
+    add_account_to_sequence "2" "user2@example.com" "uuid-2" "false"
+    create_fake_credentials "user1@example.com"
+    seed_entry_five "1" 84          # trigger point = 94
+    seed_account_usage "2" 10 5     # healthy candidate
+    create_fake_usage_cache 94 "user1@example.com"
 
-    create_fake_usage_cache 90 "user1@example.com" 13
-
-    run run_ccswitch rate-check --threshold 80
-    [ "$status" -eq 1 ]
-    [[ "$output" == *"5h 90% | 7d 13%"* ]]
+    run run_ccswitch rate-check --auto-switch
+    local active
+    active=$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")
+    [ "$active" -eq 2 ]
 }
 
-@test "test_rate_check_uses_highest_active_limit_when_above_5h" {
+@test "test_rate_check_forced_switch_when_5h_at_cap" {
     setup_fake_account "user1@example.com" "uuid-1"
     add_account_to_sequence "1" "user1@example.com" "uuid-1" "true"
+    add_account_to_sequence "2" "user2@example.com" "uuid-2" "false"
+    create_fake_credentials "user1@example.com"
+    seed_entry_five "1" 97          # trigger 98; but 5h=98 also hits hard cap -> forced
+    seed_account_usage "2" 10 5
+    create_fake_usage_cache 98 "user1@example.com"
 
-    create_fake_usage_cache 0 "user1@example.com" 13 95
-
-    run run_ccswitch rate-check --threshold 80
-    [ "$status" -eq 1 ]
-    [[ "$output" == *"limit 95%"* ]]
-    [[ "$output" == *"exceeds threshold 80% on limit"* ]]
+    run run_ccswitch rate-check --auto-switch
+    local active
+    active=$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")
+    [ "$active" -eq 2 ]
 }
 
-@test "test_rate_check_falls_back_to_seven_day_when_no_active_limit" {
+@test "test_rate_check_forced_switch_when_7d_at_cap_even_if_5h_low" {
     setup_fake_account "user1@example.com" "uuid-1"
     add_account_to_sequence "1" "user1@example.com" "uuid-1" "true"
+    add_account_to_sequence "2" "user2@example.com" "uuid-2" "false"
+    create_fake_credentials "user1@example.com"
+    seed_entry_five "1" 10          # 5h trigger far away
+    seed_account_usage "2" 10 5
+    # 5h=30 (low), 7d=99 (hard cap) -> forced switch
+    create_fake_usage_cache 30 "user1@example.com" 99
 
-    cat > /tmp/claude-usage-cache.json <<EOF
-{
-  "five_hour": { "utilization": 0 },
-  "seven_day": { "utilization": 91 },
-  "limits": [
-    { "kind": "weekly_all", "percent": 91, "is_active": false }
-  ],
-  "active_account": "user1@example.com",
-  "cached_at": $(date +%s)
+    run run_ccswitch rate-check --auto-switch
+    local active
+    active=$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")
+    [ "$active" -eq 2 ]
 }
-EOF
 
-    run run_ccswitch rate-check --threshold 80
-    [ "$status" -eq 1 ]
-    [[ "$output" == *"exceeds threshold 80% on seven_day"* ]]
+# ---------------------------------------------------------------------------
+# Candidate selection: hard-block, headroom, ranking
+# ---------------------------------------------------------------------------
+
+@test "test_rate_check_skips_hard_blocked_candidate" {
+    setup_fake_account "user1@example.com" "uuid-1"
+    add_account_to_sequence "1" "user1@example.com" "uuid-1" "true"
+    add_account_to_sequence "2" "user2@example.com" "uuid-2" "false"
+    add_account_to_sequence "3" "user3@example.com" "uuid-3" "false"
+    create_fake_credentials "user1@example.com"
+    seed_entry_five "1" 84
+    seed_account_usage "2" 99 5     # hard-blocked (5h >= 98)
+    seed_account_usage "3" 20 5     # healthy
+    create_fake_usage_cache 94 "user1@example.com"
+
+    run run_ccswitch rate-check --auto-switch
+    local active
+    active=$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")
+    [ "$active" -eq 3 ]
+}
+
+@test "test_rate_check_skips_candidate_without_headroom_when_not_forced" {
+    setup_fake_account "user1@example.com" "uuid-1"
+    add_account_to_sequence "1" "user1@example.com" "uuid-1" "true"
+    add_account_to_sequence "2" "user2@example.com" "uuid-2" "false"
+    create_fake_credentials "user1@example.com"
+    seed_entry_five "1" 84          # trigger 94, active reaches it
+    seed_account_usage "2" 90 5     # not hard-blocked, but > accept_max 88 -> no headroom
+    create_fake_usage_cache 94 "user1@example.com"
+
+    # No candidate worth moving to and not forced -> stay, fail open (exit 0 hook).
+    run run_ccswitch rate-check --auto-switch --hook-mode
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+    local active
+    active=$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")
+    [ "$active" -eq 1 ]
+}
+
+@test "test_rate_check_forced_accepts_candidate_with_little_headroom" {
+    setup_fake_account "user1@example.com" "uuid-1"
+    add_account_to_sequence "1" "user1@example.com" "uuid-1" "true"
+    add_account_to_sequence "2" "user2@example.com" "uuid-2" "false"
+    create_fake_credentials "user1@example.com"
+    seed_entry_five "1" 97
+    seed_account_usage "2" 95 5     # >88 (no normal headroom) but <98 (usable when forced)
+    create_fake_usage_cache 98 "user1@example.com"  # forced (5h cap)
+
+    run run_ccswitch rate-check --auto-switch
+    local active
+    active=$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")
+    [ "$active" -eq 2 ]
+}
+
+@test "test_rate_check_ranks_lowest_5h_first" {
+    setup_fake_account "user1@example.com" "uuid-1"
+    add_account_to_sequence "1" "user1@example.com" "uuid-1" "true"
+    add_account_to_sequence "2" "user2@example.com" "uuid-2" "false"
+    add_account_to_sequence "3" "user3@example.com" "uuid-3" "false"
+    create_fake_credentials "user1@example.com"
+    seed_entry_five "1" 84
+    seed_account_usage "2" 60 5     # higher 5h
+    seed_account_usage "3" 20 90    # lower 5h, high 7d (7d must NOT affect ranking)
+    create_fake_usage_cache 94 "user1@example.com"
+
+    run run_ccswitch rate-check --auto-switch
+    local active
+    active=$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")
+    [ "$active" -eq 3 ]
+}
+
+# ---------------------------------------------------------------------------
+# Fail-open: never block the user when there's nowhere better
+# ---------------------------------------------------------------------------
+
+@test "test_rate_check_all_hard_blocked_fails_open_no_deny" {
+    setup_fake_account "user1@example.com" "uuid-1"
+    add_account_to_sequence "1" "user1@example.com" "uuid-1" "true"
+    add_account_to_sequence "2" "user2@example.com" "uuid-2" "false"
+    create_fake_credentials "user1@example.com"
+    seed_entry_five "1" 84
+    seed_account_usage "2" 99 5     # only other account is hard-blocked
+    create_fake_usage_cache 94 "user1@example.com"
+
+    # Nowhere usable -> fail open (allow), no deny JSON, stay put.
+    run run_ccswitch rate-check --auto-switch --hook-mode
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+    local active
+    active=$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")
+    [ "$active" -eq 1 ]
+}
+
+@test "test_rate_check_single_account_over_cap_fails_open" {
+    setup_fake_account "user1@example.com" "uuid-1"
+    add_account_to_sequence "1" "user1@example.com" "uuid-1" "true"
+    seed_entry_five "1" 97
+    create_fake_usage_cache 98 "user1@example.com"  # forced but no other account
+
+    run run_ccswitch rate-check --auto-switch --hook-mode
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+}
+
+# ---------------------------------------------------------------------------
+# Hook-mode output protocol
+# ---------------------------------------------------------------------------
+
+@test "test_rate_check_hook_mode_silent_on_allow" {
+    setup_fake_account "user1@example.com" "uuid-1"
+    add_account_to_sequence "1" "user1@example.com" "uuid-1" "true"
+    seed_entry_five "1" 40
+    create_fake_usage_cache 50 "user1@example.com"
+
+    run run_ccswitch rate-check --hook-mode
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+}
+
+@test "test_rate_check_hook_mode_deny_json_on_successful_switch" {
+    setup_fake_account "user1@example.com" "uuid-1"
+    add_account_to_sequence "1" "user1@example.com" "uuid-1" "true"
+    add_account_to_sequence "2" "user2@example.com" "uuid-2" "false"
+    create_fake_credentials "user1@example.com"
+    seed_entry_five "1" 84
+    seed_account_usage "2" 10 5
+    create_fake_usage_cache 94 "user1@example.com"
+
+    run run_ccswitch rate-check --auto-switch --hook-mode
+    [ "$status" -eq 0 ]
+    echo "$output" | jq . >/dev/null 2>&1
+    local decision reason
+    decision=$(echo "$output" | jq -r '.hookSpecificOutput.permissionDecision')
+    reason=$(echo "$output" | jq -r '.hookSpecificOutput.permissionDecisionReason')
+    [ "$decision" = "deny" ]
+    [[ "$reason" == *"Switched to Account-2"* ]]
+}
+
+@test "test_rate_check_hook_mode_can_suppress_deny_output" {
+    setup_fake_account "user1@example.com" "uuid-1"
+    add_account_to_sequence "1" "user1@example.com" "uuid-1" "true"
+    add_account_to_sequence "2" "user2@example.com" "uuid-2" "false"
+    create_fake_credentials "user1@example.com"
+    seed_entry_five "1" 84
+    seed_account_usage "2" 10 5
+    create_fake_usage_cache 94 "user1@example.com"
+
+    run env HOME="$TEST_HOME" PATH="$MOCK_BIN:$ORIGINAL_PATH" CCS_SUPPRESS_HOOK_MESSAGE=1 /bin/bash "$CCSWITCH_SCRIPT" rate-check --auto-switch --hook-mode
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+    # Switch still happened; only the message was suppressed.
+    local active
+    active=$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")
+    [ "$active" -eq 2 ]
 }
 
 @test "test_rate_check_no_cache_returns_2" {
     setup_fake_account "user1@example.com" "uuid-1"
     add_account_to_sequence "1" "user1@example.com" "uuid-1" "true"
-
-    # Ensure no cache file exists
     rm -f /tmp/claude-usage-cache.json
 
-    # Offline: a failing fetch with no cache to fall back to → error exit 2.
+    # Offline: a failing fetch with no cache to fall back to -> error exit 2.
     cat > "$MOCK_BIN/curl" << 'MOCK_EOF'
 #!/bin/bash
 exit 1
@@ -116,664 +269,45 @@ MOCK_EOF
     [ "$status" -eq 2 ]
 }
 
-@test "test_rate_check_custom_threshold_flag" {
+# ---------------------------------------------------------------------------
+# Reclaim to a higher-priority sibling when the active account is under trigger
+# ---------------------------------------------------------------------------
+
+@test "test_rate_check_reclaims_higher_priority_sibling_when_under_trigger" {
+    # Active is a low-priority "other" account under its trigger; a higher
+    # priority (team) sibling with lower 5h exists -> reclaim to it.
     setup_fake_account "user1@example.com" "uuid-1"
     add_account_to_sequence "1" "user1@example.com" "uuid-1" "true"
-
-    create_fake_usage_cache 50 "user1@example.com"
-
-    # With threshold 40, 50% should exceed
-    run run_ccswitch rate-check --threshold 40
-    [ "$status" -eq 1 ]
-
-    # With threshold 60, 50% should be OK
-    run run_ccswitch rate-check --threshold 60
-    [ "$status" -eq 0 ]
-}
-
-@test "test_rate_check_custom_threshold_from_config" {
-    setup_fake_account "user1@example.com" "uuid-1"
-    add_account_to_sequence "1" "user1@example.com" "uuid-1" "true"
-
-    # Set threshold to 40 in config
-    local updated
-    updated=$(jq '.rateLimit = {enabled: true, threshold: 40}' "$SEQUENCE_FILE")
-    echo "$updated" > "$SEQUENCE_FILE"
-
-    create_fake_usage_cache 50 "user1@example.com"
-
-    # 50% should exceed config threshold of 40
-    run run_ccswitch rate-check
-    [ "$status" -eq 1 ]
-}
-
-@test "test_rate_check_hook_mode_outputs_valid_json_on_deny" {
-    setup_fake_account "user1@example.com" "uuid-1"
-    add_account_to_sequence "1" "user1@example.com" "uuid-1" "true"
-
-    create_fake_usage_cache 90 "user1@example.com"
-
-    run run_ccswitch rate-check --hook-mode --threshold 80
-    [ "$status" -eq 0 ]
-    # Validate JSON output
-    echo "$output" | jq . >/dev/null 2>&1
-    # Check hook protocol fields
-    local decision
-    decision=$(echo "$output" | jq -r '.hookSpecificOutput.permissionDecision')
-    [ "$decision" = "deny" ]
-}
-
-@test "test_rate_check_hook_mode_can_suppress_deny_output" {
-    setup_fake_account "user1@example.com" "uuid-1"
-    add_account_to_sequence "1" "user1@example.com" "uuid-1" "true"
-
-    create_fake_usage_cache 90 "user1@example.com"
-
-    run env HOME="$TEST_HOME" PATH="$MOCK_BIN:$ORIGINAL_PATH" CCS_SUPPRESS_HOOK_MESSAGE=1 /bin/bash "$CCSWITCH_SCRIPT" rate-check --hook-mode --threshold 80
-    [ "$status" -eq 0 ]
-    [ -z "$output" ]
-}
-
-@test "test_rate_check_hook_mode_silent_on_allow" {
-    setup_fake_account "user1@example.com" "uuid-1"
-    add_account_to_sequence "1" "user1@example.com" "uuid-1" "true"
-
-    create_fake_usage_cache 50 "user1@example.com"
-
-    run run_ccswitch rate-check --hook-mode --threshold 80
-    [ "$status" -eq 0 ]
-    [ -z "$output" ]
-}
-
-@test "test_rate_check_auto_switch_rotates_account" {
-    # Set up two accounts
-    setup_fake_account "user1@example.com" "uuid-1"
-    add_account_to_sequence "1" "user1@example.com" "uuid-1" "true"
-    add_account_to_sequence "2" "user2@example.com" "uuid-2" "false"
+    add_account_to_sequence "2" "team@example.com" "uuid-2" "false"
     create_fake_credentials "user1@example.com"
 
-    create_fake_usage_cache 90 "user1@example.com"
+    # Make account 2 team-priority, account 1 other-priority.
+    local updated
+    updated=$(jq '.accounts["1"].accountType = "other" | .accounts["2"].accountType = "team"' "$SEQUENCE_FILE")
+    echo "$updated" > "$SEQUENCE_FILE"
 
-    # Mock curl for fetch_usage_data (it will fail, but that's OK — we verify switch happened)
-    cat > "$MOCK_BIN/curl" << 'MOCK_EOF'
-#!/bin/bash
-# Return a low-usage response for any API call
-echo '{"five_hour":{"utilization":10,"limit":100,"used":10}}'
-echo "200"
-MOCK_EOF
-    chmod +x "$MOCK_BIN/curl"
+    seed_entry_five "1" 40          # trigger 50, active below it
+    seed_account_usage "2" 10 5     # healthy higher-priority sibling
+    create_fake_usage_cache 45 "user1@example.com"
 
-    run run_ccswitch rate-check --auto-switch --threshold 80
-    # Should exit 1 (switched) or could fail on fetch — check switch happened
+    run run_ccswitch rate-check --auto-switch
     local active
     active=$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")
     [ "$active" -eq 2 ]
 }
 
-@test "test_rate_check_auto_switch_all_limited_returns_3" {
-    # Set up two accounts
-    setup_fake_account "user1@example.com" "uuid-1"
-    add_account_to_sequence "1" "user1@example.com" "uuid-1" "true"
-    add_account_to_sequence "2" "user2@example.com" "uuid-2" "false"
-    create_fake_credentials "user1@example.com"
-
-    create_fake_usage_cache 90 "user1@example.com"
-
-    # Mock curl to return high usage for all accounts
-    cat > "$MOCK_BIN/curl" << 'MOCK_EOF'
-#!/bin/bash
-echo '{"five_hour":{"utilization":95,"limit":100,"used":95}}'
-echo "200"
-MOCK_EOF
-    chmod +x "$MOCK_BIN/curl"
-
-    run run_ccswitch rate-check --auto-switch --threshold 80
-    [ "$status" -eq 3 ]
-}
-
-@test "test_rate_check_auto_switch_prioritizes_team_before_max20" {
-    setup_fake_account "max@example.com" "uuid-max"
-    add_account_to_sequence "1" "max@example.com" "uuid-max" "true"
-    add_account_to_sequence "2" "team1@example.com" "uuid-team1" "false"
-    add_account_to_sequence "3" "team2@example.com" "uuid-team2" "false"
-    create_fake_credentials "max@example.com"
-
-    local updated
-    updated=$(jq '
-        .accounts["1"].accountType = "max20" |
-        .accounts["2"].accountType = "team" |
-        .accounts["3"].accountType = "team"
-    ' "$SEQUENCE_FILE")
-    echo "$updated" > "$SEQUENCE_FILE"
-
-    create_fake_usage_cache 90 "max@example.com"
-
-    cat > "$MOCK_BIN/curl" << 'MOCK_EOF'
-#!/bin/bash
-if [[ ! -f "$HOME/.curl_calls" ]]; then
-  echo 0 > "$HOME/.curl_calls"
-fi
-calls=$(cat "$HOME/.curl_calls")
-calls=$((calls + 1))
-echo "$calls" > "$HOME/.curl_calls"
-if [[ "$calls" -eq 1 ]]; then
-  echo '{"five_hour":{"utilization":10,"limit":100,"used":10}}'
-else
-  echo '{"five_hour":{"utilization":95,"limit":100,"used":95}}'
-fi
-echo "200"
-MOCK_EOF
-    chmod +x "$MOCK_BIN/curl"
-
-    run run_ccswitch rate-check --auto-switch --threshold 80
-    [ "$status" -eq 1 ]
-    active=$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")
-    [ "$active" -eq 2 ]
-}
-
-@test "test_rate_check_auto_switch_prioritizes_known_zero_usage_team_first" {
-    setup_fake_account "max@example.com" "uuid-max"
-    add_account_to_sequence "1" "max@example.com" "uuid-max" "true"
-    add_account_to_sequence "2" "team-used@example.com" "uuid-team-used" "false"
-    add_account_to_sequence "3" "team-fresh@example.com" "uuid-team-fresh" "false"
-    create_fake_credentials "max@example.com"
-
-    local updated
-    updated=$(jq '
-        .accounts["1"].accountType = "max20" |
-        .accounts["2"].accountType = "team" |
-        .accounts["3"].accountType = "team" |
-        .accounts["2"].lastKnownUsage = {
-            fiveHour: 10,
-            sevenDay: 0,
-            activeLimit: 10,
-            observedAt: 123
-        } |
-        .accounts["3"].lastKnownUsage = {
-            fiveHour: 0,
-            sevenDay: 0,
-            activeLimit: 0,
-            observedAt: 123
-        }
-    ' "$SEQUENCE_FILE")
-    echo "$updated" > "$SEQUENCE_FILE"
-
-    create_fake_usage_cache 90 "max@example.com"
-
-    cat > "$MOCK_BIN/curl" << 'MOCK_EOF'
-#!/bin/bash
-if [[ ! -f "$HOME/.curl_calls" ]]; then
-  echo 0 > "$HOME/.curl_calls"
-fi
-calls=$(cat "$HOME/.curl_calls")
-calls=$((calls + 1))
-echo "$calls" > "$HOME/.curl_calls"
-if [[ "$calls" -eq 1 ]]; then
-  echo '{"five_hour":{"utilization":0,"limit":100,"used":0}}'
-else
-  echo '{"five_hour":{"utilization":95,"limit":100,"used":95}}'
-fi
-echo "200"
-MOCK_EOF
-    chmod +x "$MOCK_BIN/curl"
-
-    run run_ccswitch rate-check --auto-switch --threshold 80
-    [ "$status" -eq 1 ]
-    active=$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")
-    [ "$active" -eq 3 ]
-}
-
-@test "test_rate_check_auto_switch_holds_group_stage_until_all_team_reach_it" {
-    setup_fake_account "max@example.com" "uuid-max"
-    add_account_to_sequence "1" "max@example.com" "uuid-max" "true"
-    add_account_to_sequence "2" "team-over20@example.com" "uuid-team-over20" "false"
-    add_account_to_sequence "3" "team-under20@example.com" "uuid-team-under20" "false"
-    create_fake_credentials "max@example.com"
-
-    local updated
-    updated=$(jq '
-        .accounts["1"].accountType = "max20" |
-        .accounts["2"].accountType = "team" |
-        .accounts["3"].accountType = "team" |
-        .accounts["2"].lastKnownUsage = {
-            fiveHour: 25,
-            sevenDay: 0,
-            activeLimit: 25,
-            observedAt: 123
-        } |
-        .accounts["3"].lastKnownUsage = {
-            fiveHour: 10,
-            sevenDay: 0,
-            activeLimit: 10,
-            observedAt: 123
-        }
-    ' "$SEQUENCE_FILE")
-    echo "$updated" > "$SEQUENCE_FILE"
-
-    create_fake_usage_cache 90 "max@example.com"
-
-    cat > "$MOCK_BIN/curl" << 'MOCK_EOF'
-#!/bin/bash
-if [[ ! -f "$HOME/.curl_calls" ]]; then
-  echo 0 > "$HOME/.curl_calls"
-fi
-calls=$(cat "$HOME/.curl_calls")
-calls=$((calls + 1))
-echo "$calls" > "$HOME/.curl_calls"
-if [[ "$calls" -eq 1 ]]; then
-  echo '{"five_hour":{"utilization":10,"limit":100,"used":10}}'
-else
-  echo '{"five_hour":{"utilization":95,"limit":100,"used":95}}'
-fi
-echo "200"
-MOCK_EOF
-    chmod +x "$MOCK_BIN/curl"
-
-    run run_ccswitch rate-check --auto-switch --threshold 80
-    [ "$status" -eq 1 ]
-    active=$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")
-    [ "$active" -eq 3 ]
-}
-
-@test "test_rate_check_auto_switch_skips_team_account_leased_by_other_server" {
-    setup_fake_account "max@example.com" "uuid-max"
-    add_account_to_sequence "1" "max@example.com" "uuid-max" "true"
-    add_account_to_sequence "2" "team1@example.com" "uuid-team1" "false"
-    add_account_to_sequence "3" "team2@example.com" "uuid-team2" "false"
-    create_fake_credentials "max@example.com"
-
-    local updated
-    updated=$(jq '
-        .accounts["1"].accountType = "max20" |
-        .accounts["2"].accountType = "team" |
-        .accounts["3"].accountType = "team" |
-        .coordination = {
-            mode: "mysql",
-            serverId: "srv-a",
-            leaseTtlSeconds: 180,
-            mysql: {
-                host: "127.0.0.1",
-                port: "3306",
-                database: "ccs",
-                user: "ccs",
-                password: "secret"
-            }
-        }
-    ' "$SEQUENCE_FILE")
-    echo "$updated" > "$SEQUENCE_FILE"
-
-    create_fake_usage_cache 90 "max@example.com"
-
-    cat > "$MOCK_BIN/mysql" << 'MOCK_EOF'
-#!/bin/bash
-args="$*"
-if [[ "$args" == *"CREATE DATABASE IF NOT EXISTS"* ]] || [[ "$args" == *"CREATE TABLE IF NOT EXISTS account_leases"* ]]; then
-  exit 0
-fi
-if [[ "$args" == *"email = 'team1@example.com'"* ]]; then
-  echo "srv-b"
-fi
-exit 0
-MOCK_EOF
-    chmod +x "$MOCK_BIN/mysql"
-
-    cat > "$MOCK_BIN/curl" << 'MOCK_EOF'
-#!/bin/bash
-if [[ ! -f "$HOME/.curl_calls" ]]; then
-  echo 0 > "$HOME/.curl_calls"
-fi
-calls=$(cat "$HOME/.curl_calls")
-calls=$((calls + 1))
-echo "$calls" > "$HOME/.curl_calls"
-if [[ "$calls" -eq 1 ]]; then
-  echo '{"five_hour":{"utilization":10,"limit":100,"used":10}}'
-else
-  echo '{"five_hour":{"utilization":95,"limit":100,"used":95}}'
-fi
-echo "200"
-MOCK_EOF
-    chmod +x "$MOCK_BIN/curl"
-
-    run run_ccswitch rate-check --auto-switch --threshold 80
-    [ "$status" -eq 1 ]
-    active=$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")
-    [ "$active" -eq 3 ]
-}
-
-@test "test_rate_check_auto_switch_skips_team_account_leased_by_other_server_via_http" {
-    setup_fake_account "max@example.com" "uuid-max"
-    add_account_to_sequence "1" "max@example.com" "uuid-max" "true"
-    add_account_to_sequence "2" "team1@example.com" "uuid-team1" "false"
-    add_account_to_sequence "3" "team2@example.com" "uuid-team2" "false"
-    create_fake_credentials "max@example.com"
-
-    local updated
-    updated=$(jq '
-        .accounts["1"].accountType = "max20" |
-        .accounts["2"].accountType = "team" |
-        .accounts["3"].accountType = "team" |
-        .coordination = {
-            mode: "http",
-            serverId: "srv-a",
-            leaseTtlSeconds: 180,
-            http: {
-                url: "http://127.0.0.1:19090",
-                token: "token-123"
-            }
-        }
-    ' "$SEQUENCE_FILE")
-    echo "$updated" > "$SEQUENCE_FILE"
-
-    create_fake_usage_cache 90 "max@example.com"
-
-    cat > "$MOCK_BIN/curl" << 'MOCK_EOF'
-#!/bin/bash
-args="$*"
-if [[ "$args" == *"/v1/leases/owner?email=team1%40example.com&serverId=srv-a"* ]]; then
-  echo '{"owner":{"serverId":"srv-b"},"owners":[{"serverId":"srv-b"}],"holderCount":1}'
-  echo "200"
-elif [[ "$args" == *"/v1/leases/owner?email=team2%40example.com&serverId=srv-a"* ]]; then
-  echo '{"owner":null,"owners":[],"holderCount":0}'
-  echo "200"
-elif [[ "$args" == *"/v1/leases/claim"* ]]; then
-  echo '{"ok":true}'
-  echo "200"
-elif [[ "$args" == *"/v1/leases/release"* ]]; then
-  echo '{"ok":true}'
-  echo "200"
-elif [[ ! -f "$HOME/.curl_calls" ]]; then
-  echo 1 > "$HOME/.curl_calls"
-  echo '{"five_hour":{"utilization":10,"limit":100,"used":10}}'
-  echo "200"
-else
-  echo '{"five_hour":{"utilization":95,"limit":100,"used":95}}'
-  echo "200"
-fi
-MOCK_EOF
-    chmod +x "$MOCK_BIN/curl"
-
-    run run_ccswitch rate-check --auto-switch --threshold 80
-    [ "$status" -eq 1 ]
-    active=$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")
-    [ "$active" -eq 3 ]
-}
-
-@test "test_rate_check_treats_team_snapshot_as_zero_after_reset_at_passes" {
-    setup_fake_account "max@example.com" "uuid-max"
-    add_account_to_sequence "1" "max@example.com" "uuid-max" "true"
-    add_account_to_sequence "2" "team-stale@example.com" "uuid-team-stale" "false"
-    add_account_to_sequence "3" "team-busy@example.com" "uuid-team-busy" "false"
-    create_fake_credentials "max@example.com"
-
-    local updated
-    updated=$(jq '
-        .accounts["1"].accountType = "max20" |
-        .accounts["2"].accountType = "team" |
-        .accounts["3"].accountType = "team" |
-        .accounts["2"].lastKnownUsage = {
-            fiveHour: 97,
-            sevenDay: 20,
-            activeLimit: 97,
-            resetAt5h: "2026-06-19T00:00:00Z",
-            observedAt: 123
-        } |
-        .accounts["3"].lastKnownUsage = {
-            fiveHour: 40,
-            sevenDay: 20,
-            activeLimit: 40,
-            resetAt5h: "2099-06-19T00:00:00Z",
-            observedAt: 123
-        }
-    ' "$SEQUENCE_FILE")
-    echo "$updated" > "$SEQUENCE_FILE"
-
-    create_fake_usage_cache 90 "max@example.com"
-
-    cat > "$MOCK_BIN/curl" << 'MOCK_EOF'
-#!/bin/bash
-if [[ ! -f "$HOME/.curl_calls" ]]; then
-  echo 0 > "$HOME/.curl_calls"
-fi
-calls=$(cat "$HOME/.curl_calls")
-calls=$((calls + 1))
-echo "$calls" > "$HOME/.curl_calls"
-if [[ "$calls" -eq 1 ]]; then
-  echo '{"five_hour":{"utilization":10,"limit":100,"used":10}}'
-else
-  echo '{"five_hour":{"utilization":95,"limit":100,"used":95}}'
-fi
-echo "200"
-MOCK_EOF
-    chmod +x "$MOCK_BIN/curl"
-
-    run run_ccswitch rate-check --auto-switch --threshold 80
-    [ "$status" -eq 1 ]
-    active=$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")
-    [ "$active" -eq 2 ]
-}
-
-@test "test_rate_check_allows_shared_fallback_when_no_exclusive_candidate_left" {
-    setup_fake_account "team-active@example.com" "uuid-active"
-    add_account_to_sequence "1" "team-active@example.com" "uuid-active" "true"
-    add_account_to_sequence "2" "shared-a@example.com" "uuid-a" "false"
-    add_account_to_sequence "3" "shared-b@example.com" "uuid-b" "false"
-    create_fake_credentials "team-active@example.com"
-
-    local updated
-    updated=$(jq '
-        .accounts["1"].accountType = "team" |
-        .accounts["2"].accountType = "team" |
-        .accounts["3"].accountType = "team" |
-        .accounts["2"].lastKnownUsage = {
-            fiveHour: 5,
-            sevenDay: 10,
-            activeLimit: 5,
-            observedAt: 123
-        } |
-        .accounts["3"].lastKnownUsage = {
-            fiveHour: 20,
-            sevenDay: 20,
-            activeLimit: 20,
-            observedAt: 123
-        } |
-        .coordination = {
-            mode: "http",
-            serverId: "srv-a",
-            leaseTtlSeconds: 180,
-            http: {
-                url: "http://127.0.0.1:19090",
-                token: "token-123"
-            }
-        }
-    ' "$SEQUENCE_FILE")
-    echo "$updated" > "$SEQUENCE_FILE"
-
-    create_fake_usage_cache 90 "team-active@example.com"
-
-    cat > "$MOCK_BIN/curl" << 'MOCK_EOF'
-#!/bin/bash
-args="$*"
-if [[ "$args" == *"/v1/leases/owner?email=shared-a%40example.com&serverId=srv-a"* ]]; then
-  echo '{"owner":{"serverId":"srv-b"},"owners":[{"serverId":"srv-b"}],"holderCount":1}'
-  echo "200"
-elif [[ "$args" == *"/v1/leases/owner?email=shared-b%40example.com&serverId=srv-a"* ]]; then
-  echo '{"owner":{"serverId":"srv-c"},"owners":[{"serverId":"srv-c"}],"holderCount":1}'
-  echo "200"
-elif [[ "$args" == *"/v1/leases/claim"* ]]; then
-  echo '{"ok":true}'
-  echo "200"
-elif [[ "$args" == *"/v1/leases/release"* ]]; then
-  echo '{"ok":true}'
-  echo "200"
-elif [[ ! -f "$HOME/.curl_calls" ]]; then
-  echo 1 > "$HOME/.curl_calls"
-  echo '{"five_hour":{"utilization":10,"limit":100,"used":10}}'
-  echo "200"
-else
-  echo '{"five_hour":{"utilization":95,"limit":100,"used":95}}'
-  echo "200"
-fi
-MOCK_EOF
-    chmod +x "$MOCK_BIN/curl"
-
-    run run_ccswitch rate-check --auto-switch --threshold 80
-    [ "$status" -eq 1 ]
-    active=$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")
-    [ "$active" -eq 2 ]
-}
-
-@test "test_rate_check_allows_shared_fallback_when_exclusive_candidates_are_unhealthy" {
-    setup_fake_account "team-active@example.com" "uuid-active"
-    add_account_to_sequence "1" "team-active@example.com" "uuid-active" "true"
-    add_account_to_sequence "2" "shared-good@example.com" "uuid-a" "false"
-    add_account_to_sequence "3" "exclusive-bad@example.com" "uuid-b" "false"
-    create_fake_credentials "team-active@example.com"
-
-    local updated
-    updated=$(jq '
-        .accounts["1"].accountType = "team" |
-        .accounts["2"].accountType = "max20" |
-        .accounts["3"].accountType = "team" |
-        .accounts["2"].lastKnownUsage = {
-            fiveHour: 1,
-            sevenDay: 5,
-            activeLimit: 1,
-            observedAt: 123
-        } |
-        .accounts["3"].lastKnownUsage = {
-            fiveHour: 96,
-            sevenDay: 20,
-            activeLimit: 96,
-            observedAt: 123
-        } |
-        .coordination = {
-            mode: "http",
-            serverId: "srv-a",
-            leaseTtlSeconds: 180,
-            http: {
-                url: "http://127.0.0.1:19090",
-                token: "token-123"
-            }
-        }
-    ' "$SEQUENCE_FILE")
-    echo "$updated" > "$SEQUENCE_FILE"
-
-    create_fake_usage_cache 100 "team-active@example.com"
-
-    cat > "$MOCK_BIN/curl" << 'MOCK_EOF'
-#!/bin/bash
-args="$*"
-if [[ "$args" == *"/v1/leases/owner?email=shared-good%40example.com&serverId=srv-a"* ]]; then
-  echo '{"owner":{"serverId":"srv-b"},"owners":[{"serverId":"srv-b"}],"holderCount":1}'
-  echo "200"
-elif [[ "$args" == *"/v1/leases/owner?email=exclusive-bad%40example.com&serverId=srv-a"* ]]; then
-  echo '{"owner":null,"owners":[],"holderCount":0}'
-  echo "200"
-elif [[ "$args" == *"/v1/leases/claim"* ]]; then
-  echo '{"ok":true}'
-  echo "200"
-elif [[ "$args" == *"/v1/leases/release"* ]]; then
-  echo '{"ok":true}'
-  echo "200"
-elif [[ ! -f "$HOME/.curl_calls" ]]; then
-  echo 1 > "$HOME/.curl_calls"
-  echo '{"five_hour":{"utilization":5,"limit":100,"used":5}}'
-  echo "200"
-else
-  echo '{"five_hour":{"utilization":100,"limit":100,"used":100}}'
-  echo "200"
-fi
-MOCK_EOF
-    chmod +x "$MOCK_BIN/curl"
-
-    run run_ccswitch rate-check --auto-switch --threshold 95
-    [ "$status" -eq 1 ]
-    active=$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")
-    [ "$active" -eq 2 ]
-}
-
-@test "test_rate_check_reclaims_preferred_team_when_active_fallback_is_lower_priority" {
-    setup_fake_account "fallback@example.com" "uuid-fallback"
-    add_account_to_sequence "1" "team-fresh@example.com" "uuid-team" "false"
-    add_account_to_sequence "2" "fallback@example.com" "uuid-fallback" "true"
-    create_fake_credentials "fallback@example.com"
-
-    local updated
-    updated=$(jq '
-        .accounts["1"].accountType = "team" |
-        .accounts["1"].lastKnownUsage = {
-            fiveHour: 95,
-            sevenDay: 20,
-            activeLimit: 95,
-            resetAt5h: "2026-06-19T00:00:00Z",
-            observedAt: 123
-        } |
-        .accounts["2"].accountType = "max20" |
-        .accounts["2"].lastKnownUsage = {
-            fiveHour: 10,
-            sevenDay: 70,
-            activeLimit: 70,
-            observedAt: 123
-        }
-    ' "$SEQUENCE_FILE")
-    echo "$updated" > "$SEQUENCE_FILE"
-
-    create_fake_usage_cache 10 "fallback@example.com" 70 70
-
-    cat > "$MOCK_BIN/curl" << 'MOCK_EOF'
-#!/bin/bash
-if [[ ! -f "$HOME/.curl_calls" ]]; then
-  echo 0 > "$HOME/.curl_calls"
-fi
-calls=$(cat "$HOME/.curl_calls")
-calls=$((calls + 1))
-echo "$calls" > "$HOME/.curl_calls"
-if [[ "$calls" -eq 1 ]]; then
-  echo '{"five_hour":{"utilization":0,"limit":100,"used":0}}'
-else
-  echo '{"five_hour":{"utilization":5,"limit":100,"used":5}}'
-fi
-echo "200"
-MOCK_EOF
-    chmod +x "$MOCK_BIN/curl"
-
-    run run_ccswitch rate-check --auto-switch --threshold 95
-    [ "$status" -eq 1 ]
-    [[ "$output" == *"Switched back to preferred account"* ]]
-    active=$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")
-    [ "$active" -eq 1 ]
-}
-
-@test "test_rate_check_auto_switch_all_limited_restores_original_account" {
-    setup_fake_account "user1@example.com" "uuid-1"
-    add_account_to_sequence "1" "user1@example.com" "uuid-1" "true"
-    add_account_to_sequence "2" "user2@example.com" "uuid-2" "false"
-    add_account_to_sequence "3" "user3@example.com" "uuid-3" "false"
-    create_fake_credentials "user1@example.com"
-
-    create_fake_usage_cache 90 "user1@example.com"
-
-    cat > "$MOCK_BIN/curl" << 'MOCK_EOF'
-#!/bin/bash
-echo '{"five_hour":{"utilization":95,"limit":100,"used":95}}'
-echo "200"
-MOCK_EOF
-    chmod +x "$MOCK_BIN/curl"
-
-    run run_ccswitch rate-check --auto-switch --threshold 80
-    [ "$status" -eq 3 ]
-    active=$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")
-    [ "$active" -eq 1 ]
-}
+# ---------------------------------------------------------------------------
+# Cache freshness / refetch plumbing (unchanged behavior)
+# ---------------------------------------------------------------------------
 
 @test "test_rate_check_stale_cache_account_mismatch_refetches" {
     setup_fake_account "user1@example.com" "uuid-1"
     add_account_to_sequence "1" "user1@example.com" "uuid-1" "true"
 
-    # Create cache with different account email
+    # Cache belongs to a different account -> must refetch.
     create_fake_usage_cache 50 "other@example.com"
+    seed_entry_five "1" 90
 
-    # Mock curl to return fresh data
     cat > "$MOCK_BIN/curl" << 'MOCK_EOF'
 #!/bin/bash
 echo '{"five_hour":{"utilization":30,"limit":100,"used":30}}'
@@ -781,9 +315,8 @@ echo "200"
 MOCK_EOF
     chmod +x "$MOCK_BIN/curl"
 
-    run run_ccswitch rate-check --threshold 80
+    run run_ccswitch rate-check
     [ "$status" -eq 0 ]
-    [[ "$output" == *"OK"* ]]
 }
 
 # Write a cache at the real path with a custom age (seconds ago) and account.
@@ -804,11 +337,11 @@ EOF
 @test "test_rate_check_stale_cache_triggers_refresh" {
     setup_fake_account "user1@example.com" "uuid-1"
     add_account_to_sequence "1" "user1@example.com" "uuid-1" "true"
+    seed_entry_five "1" 90
 
-    # Cache is 5 minutes old (older than the 60s default TTL) and shows high usage.
+    # 5 min old (older than 60s TTL), shows high usage; refresh returns low.
     create_aged_cache 300 95 "user1@example.com"
 
-    # A refresh returns low usage — the stale value must be replaced by this.
     cat > "$MOCK_BIN/curl" << 'MOCK_EOF'
 #!/bin/bash
 echo '{"five_hour":{"utilization":20,"limit":100,"used":20}}'
@@ -816,35 +349,31 @@ echo "200"
 MOCK_EOF
     chmod +x "$MOCK_BIN/curl"
 
-    run run_ccswitch rate-check --threshold 80
+    run run_ccswitch rate-check
     [ "$status" -eq 0 ]
-    [[ "$output" == *"OK"* ]]
 }
 
 @test "test_rate_check_fresh_cache_within_max_age_does_not_fetch" {
     setup_fake_account "user1@example.com" "uuid-1"
     add_account_to_sequence "1" "user1@example.com" "uuid-1" "true"
-
-    # Cache is 30s old, under threshold.
+    seed_entry_five "1" 90
     create_aged_cache 30 50 "user1@example.com"
 
-    # curl would FAIL if called — proves no fetch happens when cache is fresh.
+    # curl FAILS if called -> proves no fetch when cache is fresh.
     cat > "$MOCK_BIN/curl" << 'MOCK_EOF'
 #!/bin/bash
 exit 1
 MOCK_EOF
     chmod +x "$MOCK_BIN/curl"
 
-    run run_ccswitch rate-check --threshold 80 --max-age 60
+    run run_ccswitch rate-check --max-age 60
     [ "$status" -eq 0 ]
-    [[ "$output" == *"OK"* ]]
 }
 
 @test "test_rate_check_max_age_zero_forces_refresh" {
     setup_fake_account "user1@example.com" "uuid-1"
     add_account_to_sequence "1" "user1@example.com" "uuid-1" "true"
-
-    # Fresh cache showing high usage, but --max-age 0 makes everything stale.
+    seed_entry_five "1" 90
     create_aged_cache 1 95 "user1@example.com"
 
     cat > "$MOCK_BIN/curl" << 'MOCK_EOF'
@@ -854,16 +383,14 @@ echo "200"
 MOCK_EOF
     chmod +x "$MOCK_BIN/curl"
 
-    run run_ccswitch rate-check --threshold 80 --max-age 0
+    run run_ccswitch rate-check --max-age 0
     [ "$status" -eq 0 ]
-    [[ "$output" == *"OK"* ]]
 }
 
 @test "test_rate_check_refresh_failure_falls_back_to_stale_cache" {
     setup_fake_account "user1@example.com" "uuid-1"
     add_account_to_sequence "1" "user1@example.com" "uuid-1" "true"
-
-    # Stale cache, under threshold. Refresh fails — we should fall back to it.
+    seed_entry_five "1" 90
     create_aged_cache 300 40 "user1@example.com"
 
     cat > "$MOCK_BIN/curl" << 'MOCK_EOF'
@@ -872,23 +399,9 @@ exit 1
 MOCK_EOF
     chmod +x "$MOCK_BIN/curl"
 
-    run run_ccswitch rate-check --threshold 80
+    run run_ccswitch rate-check
     [ "$status" -eq 0 ]
     [[ "$output" == *"using cached data"* ]]
-}
-
-@test "test_rate_check_perform_switch_failure_fails_open" {
-    # Set up one account only (switch will fail — no target)
-    setup_fake_account "user1@example.com" "uuid-1"
-    add_account_to_sequence "1" "user1@example.com" "uuid-1" "true"
-
-    create_fake_usage_cache 90 "user1@example.com"
-
-    # Only 1 account, auto-switch should report no accounts
-    run run_ccswitch rate-check --auto-switch --hook-mode --threshold 80
-    [ "$status" -eq 0 ]
-    # Should output deny JSON since there's only one account
-    echo "$output" | jq . >/dev/null 2>&1
 }
 
 @test "test_warm_check_only_refreshes_active_account" {
