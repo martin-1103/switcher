@@ -1436,6 +1436,17 @@ log_credential_event() {
     printf '%s pid=%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" "$msg" >> "$log_file" 2>/dev/null || true
 }
 
+# Append a timestamped line to a persistent auto-switch decision log, so
+# rate-check/reclaim behavior (which mostly runs silently via hook/statusline
+# background calls) can be traced after the fact instead of guessed from
+# sequence.json's final state.
+log_switch_event() {
+    local msg="$1"
+    local log_file="${BACKUP_DIR}/autoswitch.log"
+    mkdir -p "$BACKUP_DIR" 2>/dev/null || true
+    printf '%s pid=%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" "$msg" >> "$log_file" 2>/dev/null || true
+}
+
 credential_is_usable() {
     local creds="$1"
     local access refresh expires now
@@ -3189,6 +3200,9 @@ cmd_rate_check() {
     starting_account=$(jq -r '.activeAccountNumber // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
     if [[ -n "$starting_account" && "$starting_account" != "null" ]]; then
         reclaim_target=$(should_reclaim_to_preferred_account "$starting_account" "$threshold" 2>/dev/null || true)
+        if [[ -n "$reclaim_target" ]]; then
+            log_switch_event "reclaim candidate: active=Account-$starting_account target=Account-$reclaim_target usage=${usage_int}% threshold=${threshold}% auto_switch=$auto_switch"
+        fi
     fi
 
     # Below threshold — all good
@@ -3197,12 +3211,14 @@ cmd_rate_check() {
             local reclaim_email
             reclaim_email=$(jq -r --arg num "$reclaim_target" '.accounts[$num].email // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
             if ! (CCS_SWITCH_REASON=auto CCS_SILENT=1 CCS_SKIP_POST_SWITCH_USAGE_FETCH=1 perform_switch "$reclaim_target"); then
+                log_switch_event "reclaim FAILED: Account-$starting_account -> Account-$reclaim_target ($reclaim_email)"
                 if [[ "$hook_mode" == true ]]; then
                     exit 0
                 fi
                 echo "Error: Failed to reclaim preferred account Account-$reclaim_target ($reclaim_email)" >&2
                 exit 2
             fi
+            log_switch_event "reclaim OK: Account-$starting_account -> Account-$reclaim_target ($reclaim_email), pre-switch usage=${usage_int}%"
             rm -f "$cache_file"
             fetch_usage_data >/dev/null 2>&1 || true
             if [[ "$hook_mode" == true ]]; then
@@ -3223,6 +3239,7 @@ cmd_rate_check() {
     if [[ "$hook_mode" != true ]]; then
         echo "Usage: ${usage_summary} exceeds threshold ${threshold}% on ${usage_source}"
     fi
+    log_switch_event "threshold exceeded: active=Account-${starting_account:-?} usage=${usage_int}% threshold=${threshold}% auto_switch=$auto_switch"
 
     if [[ "$auto_switch" == true ]]; then
         if [[ ! -f "$SEQUENCE_FILE" ]]; then
@@ -3263,15 +3280,18 @@ cmd_rate_check() {
             if [[ -n "$next_email" && "$next_email" != "null" ]]; then
                 coord_try_claim_exclusive "$next_account" "$next_email"
                 if [[ $? -eq 2 ]]; then
+                    log_switch_event "candidate Account-$next_account ($next_email) skipped: coordinator claim conflict (another server holds it)"
                     attempts=$((attempts + 1))
                     [[ $attempts -ge $max_attempts ]] && break
                     continue
                 fi
             fi
 
+            log_switch_event "attempting switch: Account-$starting_account -> Account-$next_account ($next_email)"
             # Perform switch in subshell to catch exit 1 from perform_switch
             if ! (CCS_SWITCH_REASON=auto CCS_SILENT=1 CCS_SKIP_POST_SWITCH_USAGE_FETCH=1 perform_switch "$next_account"); then
                 # Switch failed — fail open in hook mode
+                log_switch_event "switch FAILED: Account-$starting_account -> Account-$next_account ($next_email)"
                 if [[ "$hook_mode" == true ]]; then
                     exit 0
                 fi
@@ -3288,6 +3308,7 @@ cmd_rate_check() {
 
                 if [[ "$new_usage_int" -lt "$threshold" ]]; then
                     # Successfully switched to an account under the threshold
+                    log_switch_event "switch OK: Account-$starting_account -> Account-$next_account ($next_email), post-switch usage=${new_usage_int}%"
                     if [[ "$hook_mode" == true ]]; then
                         _rate_hook_deny "Rate limit exceeded. Switched to Account-$next_account ($next_email). Please restart Claude Code."
                         exit 0
@@ -3298,8 +3319,10 @@ cmd_rate_check() {
                     handle_restart_after_switch
                     exit 1
                 fi
+                log_switch_event "candidate Account-$next_account ($next_email) still over threshold post-switch: ${new_usage_int}% — trying next"
             else
                 # Can't verify new account's usage, assume it's OK
+                log_switch_event "switch OK (usage unverifiable): Account-$starting_account -> Account-$next_account ($next_email)"
                 if [[ "$hook_mode" == true ]]; then
                     _rate_hook_deny "Rate limit exceeded. Switched to Account-$next_account ($next_email). Please restart Claude Code."
                     exit 0
@@ -3317,10 +3340,12 @@ cmd_rate_check() {
         local current_active
         current_active=$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")
         if [[ "$current_active" != "$starting_account" ]]; then
+            log_switch_event "restoring original Account-$starting_account after exhausting all candidates"
             CCS_SILENT=1 CCS_SKIP_POST_SWITCH_USAGE_FETCH=1 perform_switch "$starting_account" >/dev/null 2>&1 || true
         fi
 
         # All accounts are limited
+        log_switch_event "all accounts above threshold (${threshold}%), staying on Account-$starting_account"
         if [[ "$hook_mode" == true ]]; then
             _rate_hook_deny "Rate limit exceeded on all accounts (${usage_int}%). Please wait for limits to reset."
             exit 0
