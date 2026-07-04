@@ -762,23 +762,57 @@ format_usage_windows() {
 
 format_usage_snapshot() {
     local account_num="$1"
+    local email="$2"
     local line observed_at age now_epoch reset_5h reset_7d five_expired=0 seven_expired=0
+    local usage_json local_observed remote_state remote_count remote_limit remote_5h remote_7d remote_observed remote_reset_5h remote_reset_7d remote_note=""
     now_epoch=$(date +%s)
-    reset_5h=$(jq -r --arg num "$account_num" '.accounts[$num].lastKnownUsage.resetAt5h // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
+
+    usage_json=$(jq -c --arg num "$account_num" '.accounts[$num].lastKnownUsage // {}' "$SEQUENCE_FILE" 2>/dev/null || echo '{}')
+    local_observed=$(printf '%s' "$usage_json" | jq -r '.observedAt // 0' 2>/dev/null || echo 0)
+    [[ "$local_observed" =~ ^[0-9]+$ ]] || local_observed=0
+
+    # Cross-check the coordinator: another server may hold a fresher snapshot
+    # for this account than what we last observed locally (see coord_remote_owner_state).
+    if [[ -n "$email" ]]; then
+        remote_state=$(coord_remote_owner_state "$email" 2>/dev/null || echo "0||||||")
+        remote_count=$(printf '%s' "$remote_state" | cut -d'|' -f1)
+        remote_limit=$(printf '%s' "$remote_state" | cut -d'|' -f2)
+        remote_5h=$(printf '%s' "$remote_state" | cut -d'|' -f3)
+        remote_7d=$(printf '%s' "$remote_state" | cut -d'|' -f4)
+        remote_observed=$(printf '%s' "$remote_state" | cut -d'|' -f5)
+        remote_reset_5h=$(printf '%s' "$remote_state" | cut -d'|' -f6)
+        remote_reset_7d=$(printf '%s' "$remote_state" | cut -d'|' -f7)
+        [[ "$remote_observed" =~ ^[0-9]+$ ]] || remote_observed=0
+        if [[ -n "$remote_5h$remote_7d$remote_limit" && "$remote_observed" -gt "$local_observed" ]]; then
+            usage_json=$(jq -cn --arg five "${remote_5h:-0}" --arg seven "${remote_7d:-0}" --arg limit "${remote_limit:-0}" \
+                --arg r5 "$remote_reset_5h" --arg r7 "$remote_reset_7d" --arg obs "$remote_observed" '
+                {
+                    fiveHour: ($five|tonumber?//0),
+                    sevenDay: ($seven|tonumber?//0),
+                    activeLimit: ($limit|tonumber?//0),
+                    resetAt5h: (if $r5 == "" then null else $r5 end),
+                    resetAt7d: (if $r7 == "" then null else $r7 end),
+                    observedAt: ($obs|tonumber?//0)
+                }')
+            remote_note=" [remote]"
+        fi
+    fi
+
+    reset_5h=$(printf '%s' "$usage_json" | jq -r '.resetAt5h // empty' 2>/dev/null || true)
     if [[ -n "$reset_5h" ]]; then
         local r5_epoch
         r5_epoch=$(iso_to_epoch "$reset_5h")
         [[ "$r5_epoch" -gt 0 && "$r5_epoch" -le "$now_epoch" ]] && five_expired=1
     fi
-    reset_7d=$(jq -r --arg num "$account_num" '.accounts[$num].lastKnownUsage.resetAt7d // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
+    reset_7d=$(printf '%s' "$usage_json" | jq -r '.resetAt7d // empty' 2>/dev/null || true)
     if [[ -n "$reset_7d" ]]; then
         local r7_epoch
         r7_epoch=$(iso_to_epoch "$reset_7d")
         [[ "$r7_epoch" -gt 0 && "$r7_epoch" -le "$now_epoch" ]] && seven_expired=1
     fi
 
-    line=$(jq -r --arg num "$account_num" --argjson fiveExpired "$five_expired" --argjson sevenExpired "$seven_expired" '
-        (.accounts[$num].lastKnownUsage // {}) as $u |
+    line=$(printf '%s' "$usage_json" | jq -r --argjson fiveExpired "$five_expired" --argjson sevenExpired "$seven_expired" '
+        . as $u |
         (if $fiveExpired == 1 then 0 else $u.fiveHour end) as $five |
         (if $sevenExpired == 1 then 0 else $u.sevenDay end) as $seven |
         (if ($fiveExpired == 1 or $sevenExpired == 1) then null else $u.activeLimit end) as $limit |
@@ -787,9 +821,10 @@ format_usage_snapshot() {
             (if ($seven != null) then "7d \($seven | round)%" else empty end),
             (if ($limit != null) then "limit \($limit | round)%" else empty end)
         ] | map(select(length > 0)) | join(" | ")
-    ' "$SEQUENCE_FILE" 2>/dev/null)
+    ' 2>/dev/null)
     [[ -z "$line" ]] && return
-    observed_at=$(jq -r --arg num "$account_num" '.accounts[$num].lastKnownUsage.observedAt // empty' "$SEQUENCE_FILE" 2>/dev/null)
+    line="${line}${remote_note}"
+    observed_at=$(printf '%s' "$usage_json" | jq -r '.observedAt // empty' 2>/dev/null)
     if [[ "$observed_at" =~ ^[0-9]+$ ]]; then
         age=$(( $(date +%s) - observed_at ))
         line="${line} (updated $(format_relative_age "$age") lalu)"
@@ -2561,7 +2596,7 @@ cmd_list() {
 
         echo "  ${num}: ${email}${prof}${type}${active}"
 
-        usage_line=$(format_usage_snapshot "$num")
+        usage_line=$(format_usage_snapshot "$num" "$email")
         reset_line=$(format_usage_resets_snapshot "$num")
         [[ -n "$usage_line" ]] && echo "      usage: ${usage_line}"
         [[ -n "$reset_line" ]] && echo "      reset: ${reset_line}"
