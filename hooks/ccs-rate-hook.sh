@@ -11,14 +11,32 @@
 
 set -uo pipefail  # No -e: we handle errors manually
 
+# Claude/agent hooks can run with HOME unset; ccs state lives under root on this host.
+if [[ -z "${HOME:-}" ]]; then
+    if [[ "${USER:-}" == "root" || $(id -u) -eq 0 ]]; then
+        export HOME=/root
+    else
+        export HOME="$(getent passwd "$(id -u)" | cut -d: -f6)"
+    fi
+fi
+
 # Consume stdin (required by hook protocol)
 # shellcheck disable=SC2034  # INPUT consumed per hook protocol, not used in script
 INPUT=$(cat)
 
 CACHE_FILE="/tmp/claude-usage-cache.json"
 HOOK_LOCK_DIR="/tmp/ccs-rate-hook.lock"
+HOOK_LOG_FILE="/tmp/ccs-rate-hook.log"
 THRESHOLD=80
 CACHE_TTL=60
+
+hook_log() {
+    local ts msg
+    ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    msg="$1"
+    printf '%s %s\n' "$ts" "$msg" >> "$HOOK_LOG_FILE" 2>/dev/null || true
+    tail -n 200 "$HOOK_LOG_FILE" > "${HOOK_LOG_FILE}.tmp" 2>/dev/null && mv "${HOOK_LOG_FILE}.tmp" "$HOOK_LOG_FILE" 2>/dev/null || true
+}
 
 # Resolve ccs early so both the fast path and delegate path use the same binary.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -38,12 +56,14 @@ if [[ -f "$SEQ" ]]; then
     ttl=$(jq -r '.rateLimit.cacheTtl // empty' "$SEQ" 2>/dev/null || true)
     [[ -n "$ttl" ]] && CACHE_TTL="$ttl"
     enabled=$(jq -r '.rateLimit.enabled // true' "$SEQ" 2>/dev/null || echo "true")
-    [[ "$enabled" == "false" ]] && exit 0
+    if [[ "$enabled" == "false" ]]; then
+        hook_log "skip enabled=false"
+        exit 0
+    fi
 fi
 
-# Fast path: if the cache is fresh (younger than the TTL) AND under threshold,
-# allow the tool call without spawning ccs. Any other case (missing, stale, or
-# over threshold) falls through to the delegate below, which refreshes as needed.
+# Cache-only path: statusline owns usage refresh. Hook must not call rate-check,
+# because invalid credentials make rate-check fail open and leave us stuck.
 fast_ok=false
 if [[ -f "$CACHE_FILE" ]]; then
     cached_at=$(jq -r '.cached_at // 0' "$CACHE_FILE" 2>/dev/null || echo 0)
@@ -68,25 +88,51 @@ if [[ -f "$CACHE_FILE" ]]; then
         fast_ok=true
     fi
 fi
-[[ "$fast_ok" == true ]] && exit 0
+if [[ "$fast_ok" == true ]]; then
+    hook_log "fast-ok account=${current_email:-unknown} usage=${usage_int:-0} threshold=$THRESHOLD age=${age:-na}"
+    exit 0
+fi
 
-# Delegate to ccs rate-check (refreshes the cache if missing/stale, then switches
-# if over threshold).
-[[ -x "$CCS" ]] || { echo "ccs not found" >&2; exit 0; }
+if [[ ! -x "$CCS" ]]; then
+    hook_log "skip ccs-missing"
+    echo "ccs not found" >&2
+    exit 0
+fi
+
+if [[ ! -f "$CACHE_FILE" ]]; then
+    hook_log "skip cache-missing"
+    exit 0
+fi
+
+if [[ "${cached_at:-0}" -le 0 || "${age:-999999}" -ge "$CACHE_TTL" ]]; then
+    hook_log "skip cache-stale age=${age:-na} ttl=$CACHE_TTL"
+    exit 0
+fi
+
+if [[ "${cache_matches:-false}" != true ]]; then
+    hook_log "skip cache-account-mismatch current=${current_email:-unknown} cached=${cached_email:-unknown}"
+    exit 0
+fi
+
+if [[ "${usage_int:-0}" -lt "$THRESHOLD" ]]; then
+    hook_log "skip below-threshold usage=${usage_int:-0} threshold=$THRESHOLD"
+    exit 0
+fi
 
 # Guard against concurrent PreToolUse invocations racing each other.
-# Only one hook instance should drive rate-check/switch at a time.
+# Only one hook instance should switch at a time.
 if ! mkdir "$HOOK_LOCK_DIR" 2>/dev/null; then
+    hook_log "skip hook-lock-busy"
     exit 0
 fi
 trap 'rmdir "$HOOK_LOCK_DIR" 2>/dev/null || true; exit 0' EXIT ERR
 
-# Run in subshell, capture output. On any failure → fail open.
-result=$(CCS_SUPPRESS_HOOK_MESSAGE=1 "$CCS" rate-check --auto-switch --hook-mode --threshold "$THRESHOLD" --max-age "$CACHE_TTL" 2>/dev/null) || true
+hook_log "switch-start account=${current_email:-unknown} usage=${usage_int:-0} threshold=$THRESHOLD"
+result=$(CCS_SWITCH_REASON=auto CCS_SILENT=1 CCS_SKIP_POST_SWITCH_USAGE_FETCH=1 CCS_HEADLESS_SMOKE=1 "$CCS" sw 2>&1) || true
 
 if [[ -n "$result" ]]; then
-    echo "$result"
+    hook_log "switch-result $(printf '%s' "$result" | tr '\n' ' ' | cut -c1-180)"
 else
-    # Fallback: just warn, don't block
-    exit 0
+    hook_log "switch-empty"
 fi
+exit 0

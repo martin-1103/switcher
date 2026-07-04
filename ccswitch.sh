@@ -5,6 +5,15 @@
 
 set -euo pipefail
 
+# Some hook/agent environments launch with HOME unset. Keep root installs usable under nounset.
+if [[ -z "${HOME:-}" ]]; then
+    if [[ "${USER:-}" == "root" || $(id -u) -eq 0 ]]; then
+        export HOME=/root
+    else
+        export HOME="$(getent passwd "$(id -u)" | cut -d: -f6)"
+    fi
+fi
+
 # Version
 readonly VERSION="0.3.2"
 
@@ -20,6 +29,8 @@ readonly LOCK_DIR="$BACKUP_DIR/.switch.lock"
 # Override per-install with .rateLimit.cacheTtl in sequence.json.
 readonly DEFAULT_CACHE_TTL=60
 readonly DEFAULT_COORD_LEASE_TTL=150
+readonly DEFAULT_CURL_CONNECT_TIMEOUT=3
+readonly DEFAULT_CURL_MAX_TIME=10
 
 # Global flags (set during argument parsing)
 DRY_RUN=false
@@ -242,9 +253,13 @@ coord_http_request() {
     local url token response http_code payload
     url="$(coord_config_value '.coordination.http.url')$path"
     token=$(coord_config_value '.coordination.http.token')
+    local connect_timeout="${CCS_CURL_CONNECT_TIMEOUT:-$DEFAULT_CURL_CONNECT_TIMEOUT}"
+    local max_time="${CCS_CURL_MAX_TIME:-$DEFAULT_CURL_MAX_TIME}"
 
     if [[ -n "$body" ]]; then
         response=$(curl -sS -w "\n%{http_code}" \
+            --connect-timeout "$connect_timeout" \
+            --max-time "$max_time" \
             -X "$method" \
             -H "Authorization: Bearer $token" \
             -H "Content-Type: application/json" \
@@ -252,6 +267,8 @@ coord_http_request() {
             "$url" 2>/dev/null) || return 1
     else
         response=$(curl -sS -w "\n%{http_code}" \
+            --connect-timeout "$connect_timeout" \
+            --max-time "$max_time" \
             -X "$method" \
             -H "Authorization: Bearer $token" \
             "$url" 2>/dev/null) || return 1
@@ -654,6 +671,46 @@ format_usage_windows() {
     fi
 }
 
+format_usage_snapshot() {
+    local account_num="$1"
+    jq -r --arg num "$account_num" '
+        (.accounts[$num].lastKnownUsage // {}) as $u |
+        [
+            (if ($u.fiveHour? != null) then "5h \($u.fiveHour | round)%" else empty end),
+            (if ($u.sevenDay? != null) then "7d \($u.sevenDay | round)%" else empty end),
+            (if ($u.activeLimit? != null) then "limit \($u.activeLimit | round)%" else empty end)
+        ] | map(select(length > 0)) | join(" | ")
+    ' "$SEQUENCE_FILE" 2>/dev/null
+}
+
+format_usage_resets_snapshot() {
+    local account_num="$1"
+    local reset_5h reset_7d now_epoch reset_epoch delta parts=()
+    now_epoch=$(date +%s)
+    reset_5h=$(jq -r --arg num "$account_num" '.accounts[$num].lastKnownUsage.resetAt5h // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
+    reset_7d=$(jq -r --arg num "$account_num" '.accounts[$num].lastKnownUsage.resetAt7d // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
+
+    if [[ -n "$reset_5h" ]]; then
+        reset_epoch=$(iso_to_epoch "$reset_5h")
+        delta=$((reset_epoch - now_epoch))
+        parts+=("5h $(format_relative_duration "$delta") (${reset_5h})")
+    fi
+
+    if [[ -n "$reset_7d" ]]; then
+        reset_epoch=$(iso_to_epoch "$reset_7d")
+        delta=$((reset_epoch - now_epoch))
+        parts+=("7d $(format_relative_duration "$delta") (${reset_7d})")
+    fi
+
+    if [[ ${#parts[@]} -gt 0 ]]; then
+        printf '%s' "${parts[0]}"
+        local i
+        for ((i = 1; i < ${#parts[@]}; i++)); do
+            printf ' | %s' "${parts[i]}"
+        done
+    fi
+}
+
 update_account_usage_snapshot() {
     local email="$1"
     local cache_file="$2"
@@ -691,6 +748,29 @@ iso_to_epoch() {
     date -d "$iso" +%s 2>/dev/null || date -j -f "%Y-%m-%dT%H:%M:%S%z" "$iso" +%s 2>/dev/null || echo 0
 }
 
+format_relative_duration() {
+    local seconds="$1"
+    if [[ -z "$seconds" || "$seconds" -le 0 ]]; then
+        echo "ready"
+        return
+    fi
+
+    local days hours mins
+    days=$((seconds / 86400))
+    hours=$(((seconds % 86400) / 3600))
+    mins=$(((seconds % 3600) / 60))
+
+    if [[ "$days" -gt 0 ]]; then
+        echo "${days}d ${hours}h lagi"
+    elif [[ "$hours" -gt 0 ]]; then
+        echo "${hours}j ${mins}m lagi"
+    elif [[ "$mins" -gt 0 ]]; then
+        echo "${mins}m lagi"
+    else
+        echo "<1m lagi"
+    fi
+}
+
 write_account_credentials_if_active() {
     local email="$1"
     local creds="$2"
@@ -715,7 +795,12 @@ fetch_usage_for_account() {
     [[ -n "$access_token" ]] || return 1
 
     local response http_code body
+    local connect_timeout="${CCS_CURL_CONNECT_TIMEOUT:-$DEFAULT_CURL_CONNECT_TIMEOUT}"
+    local max_time="${CCS_CURL_MAX_TIME:-$DEFAULT_CURL_MAX_TIME}"
+
     response=$(curl -sS -w "\n%{http_code}" \
+        --connect-timeout "$connect_timeout" \
+        --max-time "$max_time" \
         -H "Authorization: Bearer $access_token" \
         -H "anthropic-beta: oauth-2025-04-20" \
         "https://api.anthropic.com/api/oauth/usage" 2>/dev/null) || return 1
@@ -730,6 +815,8 @@ fetch_usage_for_account() {
         [[ -n "$refresh_token" ]] || return 1
 
         refresh_response=$(curl -sS -w "\n%{http_code}" \
+            --connect-timeout "$connect_timeout" \
+            --max-time "$max_time" \
             -X POST \
             -H "Content-Type: application/json" \
             -d "{\"grant_type\":\"refresh_token\",\"refresh_token\":\"$refresh_token\",\"client_id\":\"$client_id\"}" \
@@ -749,6 +836,8 @@ fetch_usage_for_account() {
         write_account_credentials_if_active "$email" "$updated_creds"
 
         response=$(curl -sS -w "\n%{http_code}" \
+            --connect-timeout "$connect_timeout" \
+            --max-time "$max_time" \
             -H "Authorization: Bearer $new_access" \
             -H "anthropic-beta: oauth-2025-04-20" \
             "https://api.anthropic.com/api/oauth/usage" 2>/dev/null) || return 1
@@ -774,7 +863,11 @@ send_warm_ping() {
     local access_token="$1"
     local model="${CCS_PING_MODEL:-claude-3-5-haiku-latest}"
     local response_code
+    local connect_timeout="${CCS_CURL_CONNECT_TIMEOUT:-$DEFAULT_CURL_CONNECT_TIMEOUT}"
+    local max_time="${CCS_CURL_MAX_TIME:-$DEFAULT_CURL_MAX_TIME}"
     response_code=$(curl -sS -o /dev/null -w "%{http_code}" \
+        --connect-timeout "$connect_timeout" \
+        --max-time "$max_time" \
         -X POST \
         -H "Authorization: Bearer $access_token" \
         -H "anthropic-beta: oauth-2025-04-20" \
@@ -1086,6 +1179,58 @@ credential_refresh_token() {
     ' 2>/dev/null
 }
 
+credential_is_usable() {
+    local creds="$1"
+    local access refresh expires now
+    access=$(credential_access_token "$creds")
+    refresh=$(credential_refresh_token "$creds")
+    expires=$(echo "$creds" | jq -r '.expires_at // .claudeAiOauth.expiresAt // 0' 2>/dev/null || echo 0)
+    [[ -n "$access" && -n "$refresh" ]] || return 1
+    [[ "$expires" =~ ^[0-9]+$ ]] || expires=0
+    now=$(date +%s)
+    if [[ "$expires" -gt 1000000000000 ]]; then
+        expires=$((expires / 1000))
+    fi
+    [[ "$expires" -eq 0 || "$expires" -gt "$now" ]]
+}
+
+mark_account_auth_invalid() {
+    local account_num="$1"
+    local reason="$2"
+    local now updated
+    [[ -f "$SEQUENCE_FILE" ]] || return 0
+    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    updated=$(jq \
+        --arg num "$account_num" \
+        --arg reason "$reason" \
+        --arg now "$now" '
+        .accounts[$num].authState = "invalid" |
+        .accounts[$num].lastAuthError = $reason |
+        .accounts[$num].lastAuthErrorAt = $now
+    ' "$SEQUENCE_FILE" 2>/dev/null) || return 0
+    write_json "$SEQUENCE_FILE" "$updated" >/dev/null 2>&1 || true
+}
+
+clear_account_auth_invalid() {
+    local account_num="$1"
+    local updated
+    [[ -f "$SEQUENCE_FILE" ]] || return 0
+    updated=$(jq --arg num "$account_num" '
+        del(.accounts[$num].authState) |
+        del(.accounts[$num].lastAuthError) |
+        del(.accounts[$num].lastAuthErrorAt)
+    ' "$SEQUENCE_FILE" 2>/dev/null) || return 0
+    write_json "$SEQUENCE_FILE" "$updated" >/dev/null 2>&1 || true
+}
+
+headless_auth_smoke() {
+    local out rc
+    command -v claude >/dev/null 2>&1 || return 0
+    out=$(claude -p 'Reply exactly: HEADLESS_OK' 2>&1)
+    rc=$?
+    [[ "$rc" -eq 0 && "$out" == *"HEADLESS_OK"* ]]
+}
+
 # Update tokens while preserving the credential JSON shape Claude Code expects.
 update_credential_tokens() {
     local creds="$1"
@@ -1151,6 +1296,16 @@ write_account_credentials() {
     local email="$2"
     local credentials="$3"
     local platform
+
+    if ! credential_is_usable "$credentials"; then
+        local existing
+        existing=$(read_account_credentials "$account_num" "$email")
+        if credential_is_usable "$existing"; then
+            echo "Warning: refusing to overwrite valid backup for Account-$account_num ($email) with empty/expired credentials" >&2
+            return 0
+        fi
+    fi
+
     platform=$(detect_platform)
 
     case "$platform" in
@@ -1543,18 +1698,7 @@ handle_restart_after_switch() {
             echo "Please restart Claude Code to use the new authentication."
             ;;
         *)
-            # Default: ask user (skip if non-interactive)
-            if [[ -t 0 ]]; then
-                echo -n "Restart Claude Code now? [Y/n] "
-                read -r response
-                if [[ "$response" == "n" || "$response" == "N" ]]; then
-                    echo "Please restart Claude Code to use the new authentication."
-                else
-                    restart_claude_code
-                fi
-            else
-                echo "Please restart Claude Code to use the new authentication."
-            fi
+            echo "Please restart Claude Code to use the new authentication."
             ;;
     esac
 }
@@ -2208,17 +2352,24 @@ cmd_list() {
     fi
 
     echo "Accounts:"
-    jq -r --arg active "$active_account_num" '
-        .sequence[] as $num |
-        .accounts["\($num)"] |
-        (if .profile then " [\(.profile)]" else "" end) as $prof |
-        (if .accountType then " {\(.accountType)}" else "" end) as $type |
-        if "\($num)" == $active then
-            "  \($num): \(.email)\($prof)\($type) (active)"
-        else
-            "  \($num): \(.email)\($prof)\($type)"
-        end
-    ' "$SEQUENCE_FILE"
+
+    local accounts
+    accounts=$(jq -r '.sequence[] as $num | "\($num)|\(.accounts["\($num)"].email)|\(.accounts["\($num)"].profile // "")|\(.accounts["\($num)"].accountType // "")"' "$SEQUENCE_FILE")
+
+    while IFS='|' read -r num email profile account_type; do
+        [[ -z "$num" ]] && continue
+        local prof="" type="" active="" usage_line reset_line
+        [[ -n "$profile" ]] && prof=" [$profile]"
+        [[ -n "$account_type" ]] && type=" {$account_type}"
+        [[ "$num" == "$active_account_num" ]] && active=" (active)"
+
+        echo "  ${num}: ${email}${prof}${type}${active}"
+
+        usage_line=$(format_usage_snapshot "$num")
+        reset_line=$(format_usage_resets_snapshot "$num")
+        [[ -n "$usage_line" ]] && echo "      usage: ${usage_line}"
+        [[ -n "$reset_line" ]] && echo "      reset: ${reset_line}"
+    done <<< "$accounts"
 }
 
 # Switch to next account
@@ -2252,10 +2403,19 @@ cmd_switch() {
     local active_account next_account
     active_account=$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")
     next_account=$(jq -r --argjson active "$active_account" '
+        . as $root |
         .sequence as $seq |
         ($seq | index($active) // 0) as $idx |
-        $seq[($idx + 1) % ($seq | length)]
+        [range(1; ($seq | length) + 1) as $offset |
+            $seq[($idx + $offset) % ($seq | length)] |
+            select((. as $n | ($root.accounts["\($n)"].authState // "") != "invalid"))
+        ][0] // empty
     ' "$SEQUENCE_FILE")
+
+    if [[ -z "$next_account" ]]; then
+        echo "Error: no usable account found (all other accounts are marked authState=invalid)"
+        exit 1
+    fi
 
     CCS_SWITCH_REASON=manual perform_switch "$next_account"
 }
@@ -2341,9 +2501,26 @@ perform_switch() {
     current_account=$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")
     current_email=$(get_current_account)
 
+    local real_current_account
+    real_current_account=$(jq -r --arg email "$current_email" '
+        (.accounts | to_entries[] | select(.value.email == $email) | .key) // empty
+    ' "$SEQUENCE_FILE" 2>/dev/null)
+    local current_account_is_managed=true
+    if [[ -z "$real_current_account" ]]; then
+        current_account_is_managed=false
+        if [[ "${CCS_SILENT:-}" != "1" ]]; then
+            echo "Notice: active account ($current_email) is not managed. Switching directly to Account-$target_account without updating source-account stats/backups."
+        fi
+    elif [[ "$real_current_account" != "$current_account" ]]; then
+        if [[ "${CCS_SILENT:-}" != "1" ]]; then
+            echo "Note: corrected active account $current_account -> $real_current_account (source: live Claude config)."
+        fi
+        current_account="$real_current_account"
+    fi
+
     # No-op guard: if we're already on the target (e.g. a concurrent switch beat
     # us to it), release and return without thrashing the credential store.
-    if [[ "$current_account" == "$target_account" ]]; then
+    if [[ "$current_account_is_managed" == true && "$current_account" == "$target_account" ]]; then
         release_switch_lock
         if [[ "${CCS_SILENT:-}" != "1" ]]; then
             echo "Already on Account-$target_account ($target_email)."
@@ -2381,13 +2558,15 @@ perform_switch() {
     current_creds=$(read_credentials)
     current_config=$(cat "$(get_claude_config_path)")
 
-    if ! write_account_credentials "$current_account" "$current_email" "$current_creds"; then
-        rollback
-        exit 1
-    fi
-    if ! write_account_config "$current_account" "$current_email" "$current_config"; then
-        rollback
-        exit 1
+    if [[ "$current_account_is_managed" == true ]]; then
+        if ! write_account_credentials "$current_account" "$current_email" "$current_creds"; then
+            rollback
+            exit 1
+        fi
+        if ! write_account_config "$current_account" "$current_email" "$current_config"; then
+            rollback
+            exit 1
+        fi
     fi
 
     # Step 2: Retrieve target account
@@ -2455,35 +2634,52 @@ perform_switch() {
     fi
 
     local updated_sequence
-    updated_sequence=$(jq \
-        --arg num "$target_account" \
-        --arg cur "$current_account" \
-        --arg now "$now" \
-        --arg reason "$switch_reason" \
-        --argjson elapsed "$elapsed_seconds" '
-        # Update time on old account
-        .accounts[$cur].totalSeconds = ((.accounts[$cur].totalSeconds // 0) + $elapsed) |
-        .accounts[$cur].lastUsed = $now |
-        # Increment switch count on target
-        .accounts[$num].switchCount = ((.accounts[$num].switchCount // 0) + 1) |
-        .accounts[$num].lastUsed = $now |
-        # Update active account
-        .activeAccountNumber = ($num | tonumber) |
-        .lastUpdated = $now |
-        (if $reason == "auto" then .lastAutoSwitchAt = $now else . end) |
-        (if $reason == "manual" then .lastManualSwitchAt = $now else . end)
-    ' "$SEQUENCE_FILE")
+    if [[ "$current_account_is_managed" == true ]]; then
+        updated_sequence=$(jq \
+            --arg num "$target_account" \
+            --arg cur "$current_account" \
+            --arg now "$now" \
+            --arg reason "$switch_reason" \
+            --argjson elapsed "$elapsed_seconds" '
+            # Update time on old account
+            .accounts[$cur].totalSeconds = ((.accounts[$cur].totalSeconds // 0) + $elapsed) |
+            .accounts[$cur].lastUsed = $now |
+            # Increment switch count on target
+            .accounts[$num].switchCount = ((.accounts[$num].switchCount // 0) + 1) |
+            .accounts[$num].lastUsed = $now |
+            # Update active account
+            .activeAccountNumber = ($num | tonumber) |
+            .lastUpdated = $now |
+            (if $reason == "auto" then .lastAutoSwitchAt = $now else . end) |
+            (if $reason == "manual" then .lastManualSwitchAt = $now else . end)
+        ' "$SEQUENCE_FILE")
+    else
+        updated_sequence=$(jq \
+            --arg num "$target_account" \
+            --arg now "$now" \
+            --arg reason "$switch_reason" '
+            .accounts[$num].switchCount = ((.accounts[$num].switchCount // 0) + 1) |
+            .accounts[$num].lastUsed = $now |
+            .activeAccountNumber = ($num | tonumber) |
+            .lastUpdated = $now |
+            (if $reason == "auto" then .lastAutoSwitchAt = $now else . end) |
+            (if $reason == "manual" then .lastManualSwitchAt = $now else . end)
+        ' "$SEQUENCE_FILE")
+    fi
 
     if ! write_json "$SEQUENCE_FILE" "$updated_sequence"; then
         rollback
         exit 1
     fi
+    clear_account_auth_invalid "$target_account"
 
     # Invalidate any stale usage cache from the previous account immediately.
     # The next hook/statusline pass must fetch fresh usage for the new account.
     rm -f "$cache_file" 2>/dev/null || true
 
-    coord_release_account_state "$current_email"
+    if [[ "$current_account_is_managed" == true ]]; then
+        coord_release_account_state "$current_email"
+    fi
 
     # Best effort: once the target account is active, refresh its usage snapshot
     # immediately. On this host non-active backup credentials are unreliable, but
@@ -2496,6 +2692,14 @@ perform_switch() {
     fi
 
     coord_publish_account_state "$target_account" "$target_email"
+
+    if [[ "${CCS_HEADLESS_SMOKE:-0}" == "1" ]]; then
+        if ! headless_auth_smoke; then
+            mark_account_auth_invalid "$target_account" "headless auth smoke failed"
+            rollback
+            exit 1
+        fi
+    fi
 
     # Switch is committed; release the lock before any interactive display/restart
     # so we never hold it while waiting on the user.
