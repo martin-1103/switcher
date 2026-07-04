@@ -1130,10 +1130,11 @@ account_snapshot_usage() {
         (.accounts[$num].lastKnownUsage // {}) as $u |
         (if $fiveExpired == 1 then 0 else ($u.fiveHour // 0) end) as $five |
         (if $sevenExpired == 1 then 0 else ($u.sevenDay // 0) end) as $seven |
-        if (($u.activeLimit // 0) > 0 and $fiveExpired == 0 and $sevenExpired == 0) then
-            ($u.activeLimit // 0)
+        (if (($u.activeLimit // 0) > 0 and $fiveExpired == 0 and $sevenExpired == 0) then ($u.activeLimit // 0) else $five end) as $primary |
+        if ($primary >= 100 or $seven >= 100) then
+            100000 + ([$primary, $seven] | max)
         else
-            [$five, $seven] | max
+            $primary * 1000 + $seven
         end
     ' "$SEQUENCE_FILE" 2>/dev/null || echo "0"
 }
@@ -1224,7 +1225,13 @@ collect_switch_candidates() {
                 if [[ -n "$remote_limit" && "$remote_limit" != "0" && "$five_expired" -eq 0 && "$seven_expired" -eq 0 ]]; then
                     remote_usage="$remote_limit"
                 else
-                    remote_usage=$(jq -nr --arg five "${remote_5h:-0}" --arg seven "${remote_7d:-0}" '[($five|tonumber?//0), ($seven|tonumber?//0)] | max')
+                    remote_usage=$(jq -nr --arg five "${remote_5h:-0}" --arg seven "${remote_7d:-0}" '
+                        ($five|tonumber?//0) as $five |
+                        ($seven|tonumber?//0) as $seven |
+                        if ($five >= 100 or $seven >= 100) then 100000 + ([$five, $seven] | max)
+                        else $five * 1000 + $seven
+                        end
+                    ')
                 fi
                 usage="$remote_usage"
                 known=1
@@ -1247,7 +1254,11 @@ auto_switch_candidates() {
 
     local exclusive_healthy=""
     if [[ -n "$exclusive" ]]; then
-        exclusive_healthy=$(printf '%s\n' "$exclusive" | awk -F'|' -v t="$healthy_threshold" '$2 < t')
+        # Field 2 is the composite score (five*1000+seven, or 100000+ if either
+        # window is hard-blocked at >=100). "Healthy" means the 5h window
+        # (the primary usability gate) is below the threshold — extract it back
+        # out of the composite instead of comparing the raw score to a percent.
+        exclusive_healthy=$(printf '%s\n' "$exclusive" | awk -F'|' -v t="$healthy_threshold" '{five = ($2 >= 100000) ? 100 : int($2 / 1000); if (five < t) print}')
     fi
 
     if [[ -n "$exclusive_healthy" ]]; then
