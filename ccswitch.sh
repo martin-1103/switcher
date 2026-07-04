@@ -493,6 +493,33 @@ coord_remote_lease_count() {
     fi
 }
 
+# Single coordinator read returning "holderCount|usage|observedAt|resetAt5h" for
+# an email. Usage/observedAt come from the freshest OTHER holder (owner list
+# already excludes our serverId, ordered most-recent). This lets switch
+# selection use fleet-wide usage instead of only this server's local snapshot.
+# Non-HTTP (mysql) mode has no usage in the owner query, so it returns just the
+# count with empty usage fields and the caller keeps its local snapshot.
+coord_remote_owner_state() {
+    local email="$1"
+    if coord_http_ready; then
+        local encoded
+        encoded=$(printf '%s' "$email" | jq -sRr @uri)
+        coord_http_request GET "/v1/leases/owner?email=${encoded}&serverId=$(printf '%s' "$(coord_server_id)" | jq -sRr @uri)" 2>/dev/null \
+            | jq -r '
+                (.holderCount // 0) as $c |
+                (.owner // null) as $o |
+                if $o == null then "\($c)|||"
+                else
+                    (if (($o.activeLimit // 0) > 0) then ($o.activeLimit)
+                     else ([($o.fiveHour // 0), ($o.sevenDay // 0)] | max) end) as $u |
+                    "\($c)|\($u)|\($o.observedAt // 0)|\($o.resetAt5h // "")"
+                end
+            ' 2>/dev/null
+        return 0
+    fi
+    printf '%s|||\n' "$(coord_remote_lease_count "$email" 2>/dev/null || echo 0)"
+}
+
 coord_release_account_state() {
     local email="$1"
     [[ -n "$email" ]] || return 0
@@ -1063,7 +1090,33 @@ collect_switch_candidates() {
         priority=$(account_type_priority "$num")
         remote_count=0
         if [[ -n "$email" ]]; then
-            remote_count=$(coord_remote_lease_count "$email" 2>/dev/null || echo 0)
+            # Fetch coordinator state once: holder count + freshest other server's
+            # usage. Prefer remote usage only when it was observed more recently
+            # than our local snapshot, so a stale local number can't override a
+            # fresh fleet-wide one (and vice versa).
+            local remote_state remote_usage remote_observed remote_reset local_observed
+            remote_state=$(coord_remote_owner_state "$email" 2>/dev/null || echo "0|||")
+            remote_count=$(printf '%s' "$remote_state" | cut -d'|' -f1)
+            [[ "$remote_count" =~ ^[0-9]+$ ]] || remote_count=0
+            remote_usage=$(printf '%s' "$remote_state" | cut -d'|' -f2)
+            remote_observed=$(printf '%s' "$remote_state" | cut -d'|' -f3)
+            remote_reset=$(printf '%s' "$remote_state" | cut -d'|' -f4)
+            local_observed=$(jq -r --arg num "$num" '.accounts[$num].lastKnownUsage.observedAt // 0' "$SEQUENCE_FILE" 2>/dev/null || echo 0)
+            [[ "$local_observed" =~ ^[0-9]+$ ]] || local_observed=0
+            [[ "$remote_observed" =~ ^[0-9]+$ ]] || remote_observed=0
+            if [[ -n "$remote_usage" && "$remote_observed" -gt "$local_observed" ]]; then
+                # Apply the same reset-expiry rule account_snapshot_usage uses:
+                # a passed 5h reset means the window is clear, usage is 0.
+                if [[ -n "$remote_reset" ]]; then
+                    local rr_epoch
+                    rr_epoch=$(iso_to_epoch "$remote_reset")
+                    if [[ "$rr_epoch" -gt 0 && "$rr_epoch" -le "$(date +%s)" ]]; then
+                        remote_usage=0
+                    fi
+                fi
+                usage="$remote_usage"
+                known=1
+            fi
         fi
         printf '%s|%s|%s|%s|%s\n' "$num" "$usage" "$known" "$priority" "$remote_count"
         ord=$((ord + 1))
