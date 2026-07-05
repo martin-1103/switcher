@@ -3,6 +3,7 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { URL } = require('url');
 
 const PORT = Number(process.env.CCS_COORD_PORT || 19090);
@@ -10,10 +11,46 @@ const HOST = process.env.CCS_COORD_HOST || '0.0.0.0';
 const TOKEN = process.env.CCS_COORD_TOKEN || '';
 const STATE_FILE = process.env.CCS_COORD_STATE_FILE || '/var/lib/ccs-coordinator/state.json';
 const LEASE_TTL = Number(process.env.CCS_COORD_LEASE_TTL || 180);
+const CRED_KEY_HEX = process.env.CCS_COORD_CRED_KEY || '';
 
 if (!TOKEN) {
   console.error('CCS_COORD_TOKEN is required');
   process.exit(1);
+}
+
+// Credential publish/fetch endpoints are opt-in: only enabled once a key is
+// configured, so a deploy that never sets it can never persist tokens in
+// plaintext by accident.
+let CRED_KEY = null;
+if (CRED_KEY_HEX) {
+  const keyBuf = Buffer.from(CRED_KEY_HEX, 'hex');
+  if (keyBuf.length !== 32) {
+    console.error('CCS_COORD_CRED_KEY must be 32 bytes hex-encoded (64 hex chars)');
+    process.exit(1);
+  }
+  CRED_KEY = keyBuf;
+}
+
+function encryptCredential(plaintextObj) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', CRED_KEY, iv);
+  const ciphertext = Buffer.concat([cipher.update(JSON.stringify(plaintextObj), 'utf8'), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return {
+    iv: iv.toString('base64'),
+    tag: tag.toString('base64'),
+    ciphertext: ciphertext.toString('base64'),
+  };
+}
+
+function decryptCredential(record) {
+  const iv = Buffer.from(record.iv, 'base64');
+  const tag = Buffer.from(record.tag, 'base64');
+  const ciphertext = Buffer.from(record.ciphertext, 'base64');
+  const decipher = crypto.createDecipheriv('aes-256-gcm', CRED_KEY, iv);
+  decipher.setAuthTag(tag);
+  const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+  return JSON.parse(plaintext.toString('utf8'));
 }
 
 fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
@@ -27,9 +64,12 @@ function loadState() {
     if (!state.usageSnapshots || typeof state.usageSnapshots !== 'object') {
       state.usageSnapshots = {};
     }
+    if (!state.credentials || typeof state.credentials !== 'object') {
+      state.credentials = {};
+    }
     return state;
   } catch {
-    return { leases: {}, usageSnapshots: {} };
+    return { leases: {}, usageSnapshots: {}, credentials: {} };
   }
 }
 
@@ -251,6 +291,51 @@ const server = http.createServer(async (req, res) => {
       fresh.usageSnapshots[body.email] = { ...body };
       saveState(fresh);
       return send(res, 200, { ok: true, lease: flattenLease(body.email, fresh.leases[body.email], fresh.usageSnapshots[body.email]) });
+    }
+
+    if (req.method === 'POST' && url.pathname === '/v1/credentials/publish') {
+      if (!CRED_KEY) {
+        return send(res, 501, { error: 'credential store not configured (CCS_COORD_CRED_KEY unset)' });
+      }
+      const body = await readJson(req);
+      const email = String(body.email || '').trim();
+      const accessToken = String(body.accessToken || '');
+      const refreshToken = String(body.refreshToken || '');
+      const expiresAt = Number(body.expiresAt || 0);
+      if (!email || !accessToken || !refreshToken) {
+        return send(res, 400, { error: 'email, accessToken, refreshToken required' });
+      }
+      // Reload fresh AFTER the await, mutate+save synchronously — same
+      // atomic-claim pattern as /v1/leases/claim, closes the same race.
+      const fresh = loadState();
+      const existing = fresh.credentials[email];
+      // Freshness compare on expiresAt (not wall-clock updatedAt): a host that
+      // just refreshed always has a later expiresAt than a stale copy, so this
+      // is safe even if server clocks disagree slightly.
+      if (existing) {
+        const existingPlain = decryptCredential(existing);
+        if (Number(existingPlain.expiresAt || 0) >= expiresAt) {
+          return send(res, 200, { ok: true, accepted: false, reason: 'existing credential is fresher or equal' });
+        }
+      }
+      fresh.credentials[email] = encryptCredential({ accessToken, refreshToken, expiresAt, updatedAt: now });
+      saveState(fresh);
+      return send(res, 200, { ok: true, accepted: true });
+    }
+
+    if (req.method === 'GET' && url.pathname === '/v1/credentials/fetch') {
+      if (!CRED_KEY) {
+        return send(res, 501, { error: 'credential store not configured (CCS_COORD_CRED_KEY unset)' });
+      }
+      const email = String(url.searchParams.get('email') || '').trim();
+      if (!email) {
+        return send(res, 400, { error: 'email required' });
+      }
+      const record = state.credentials[email];
+      if (!record) {
+        return send(res, 404, { error: 'not found' });
+      }
+      return send(res, 200, decryptCredential(record));
     }
 
     if (req.method === 'POST' && url.pathname === '/v1/leases/release') {

@@ -953,6 +953,7 @@ fetch_usage_for_account() {
             write_account_credentials "$account_num" "$email" "$updated_creds" >/dev/null 2>&1 || true
         fi
         write_account_credentials_if_active "$email" "$updated_creds"
+        coord_publish_credential "$email" "$updated_creds"
 
         response=$(curl -sS -w "\n%{http_code}" \
             --connect-timeout "$connect_timeout" \
@@ -1454,6 +1455,45 @@ write_credentials() {
             chmod 600 "$HOME/.claude/.credentials.json"
             ;;
     esac
+}
+
+# Push a freshly refreshed credential to the coordinator's encrypted store, so
+# other hosts can recover it if their own backup goes stale. Best-effort: a
+# failure here must never block the caller's own (successful) local refresh.
+coord_publish_credential() {
+    local email="$1"
+    local creds="$2"
+    coord_http_ready || return 0
+    local access_token refresh_token expires_at
+    access_token=$(credential_access_token "$creds")
+    refresh_token=$(credential_refresh_token "$creds")
+    expires_at=$(echo "$creds" | jq -r '.expires_at // .claudeAiOauth.expiresAt // 0' 2>/dev/null || echo 0)
+    [[ -n "$access_token" && -n "$refresh_token" ]] || return 0
+    local payload
+    payload=$(jq -n --arg email "$email" --arg at "$access_token" --arg rt "$refresh_token" --argjson exp "${expires_at:-0}" \
+        '{email: $email, accessToken: $at, refreshToken: $rt, expiresAt: $exp}')
+    coord_http_request POST "/v1/credentials/publish" "$payload" >/dev/null 2>&1 || true
+}
+
+# Pull a credential from the coordinator's encrypted store. Returns the same
+# shape as read_account_credentials (a claudeAiOauth-wrapped JSON blob) so
+# callers can feed it straight into credential_is_usable/write_credentials.
+coord_fetch_credential() {
+    local email="$1"
+    coord_http_ready || return 1
+    local url token response http_code payload
+    url="$(coord_config_value '.coordination.http.url')/v1/credentials/fetch?email=$(printf '%s' "$email" | jq -sRr @uri)"
+    token=$(coord_config_value '.coordination.http.token')
+    response=$(curl -sS -w "\n%{http_code}" \
+        --connect-timeout "${CCS_CURL_CONNECT_TIMEOUT:-$DEFAULT_CURL_CONNECT_TIMEOUT}" \
+        --max-time "${CCS_CURL_MAX_TIME:-$DEFAULT_CURL_MAX_TIME}" \
+        -H "Authorization: Bearer $token" \
+        "$url" 2>/dev/null) || return 1
+    http_code=$(echo "$response" | tail -n1)
+    payload=$(echo "$response" | sed '$d')
+    [[ "$http_code" == "200" ]] || return 1
+    jq -n --argjson r "$payload" \
+        '{claudeAiOauth: {accessToken: $r.accessToken, refreshToken: $r.refreshToken, expiresAt: $r.expiresAt}}' 2>/dev/null || return 1
 }
 
 # Read account credentials from backup
@@ -2771,10 +2811,20 @@ perform_switch() {
     fi
 
     if ! credential_is_usable "$target_creds"; then
-        log_credential_event "refused to switch to Account-$target_account ($target_email): backup credentials are empty/expired (caller=perform_switch)"
-        echo "Error: Account-$target_account ($target_email) has empty/expired backup credentials. Re-login to that account first (ccs to $target_account after logging in), then retry." >&2
-        rollback
-        exit 1
+        # Local backup is dead — try the coordinator before giving up; another
+        # host may hold a fresher copy of this account's token.
+        local coord_creds
+        coord_creds=$(coord_fetch_credential "$target_email" 2>/dev/null || true)
+        if [[ -n "$coord_creds" ]] && credential_is_usable "$coord_creds"; then
+            log_credential_event "recovered Account-$target_account ($target_email) backup from coordinator (caller=perform_switch)"
+            target_creds="$coord_creds"
+            write_account_credentials "$target_account" "$target_email" "$target_creds" >/dev/null 2>&1 || true
+        else
+            log_credential_event "refused to switch to Account-$target_account ($target_email): backup credentials are empty/expired (caller=perform_switch)"
+            echo "Error: Account-$target_account ($target_email) has empty/expired backup credentials. Re-login to that account first (ccs to $target_account after logging in), then retry." >&2
+            rollback
+            exit 1
+        fi
     fi
 
     # Step 3: Activate target account
@@ -2990,6 +3040,7 @@ fetch_usage_data() {
 
         updated_creds=$(update_credential_tokens "$creds" "$new_access" "${new_refresh:-$refresh_token}")
         write_credentials "$updated_creds"
+        coord_publish_credential "$current_email" "$updated_creds"
 
         # Retry the usage API with new token
         response=$(curl -sS -w "\n%{http_code}" \
@@ -3232,9 +3283,17 @@ cmd_rate_check() {
         local next_creds
         next_creds=$(read_account_credentials "$next_account" "$next_email")
         if ! credential_is_usable "$next_creds"; then
-            log_switch_event "candidate Account-$next_account ($next_email) skipped: backup credentials empty/expired"
-            log_credential_event "candidate Account-$next_account ($next_email) skipped by auto-switch: backup credentials empty/expired (caller=cmd_rate_check)"
-            continue
+            local coord_creds
+            coord_creds=$(coord_fetch_credential "$next_email" 2>/dev/null || true)
+            if [[ -n "$coord_creds" ]] && credential_is_usable "$coord_creds"; then
+                log_credential_event "recovered Account-$next_account ($next_email) backup from coordinator (caller=cmd_rate_check)"
+                next_creds="$coord_creds"
+                write_account_credentials "$next_account" "$next_email" "$next_creds" >/dev/null 2>&1 || true
+            else
+                log_switch_event "candidate Account-$next_account ($next_email) skipped: backup credentials empty/expired"
+                log_credential_event "candidate Account-$next_account ($next_email) skipped by auto-switch: backup credentials empty/expired (caller=cmd_rate_check)"
+                continue
+            fi
         fi
 
         # Claim atomically before switching. 409 conflict (return 2) = another
