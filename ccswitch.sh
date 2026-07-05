@@ -2402,13 +2402,13 @@ cmd_add_account() {
         exit 1
     fi
 
+    local account_num is_update=0
     if account_exists "$current_email"; then
-        echo "Account $current_email is already managed."
-        exit 0
+        account_num=$(resolve_account_identifier "$current_email")
+        is_update=1
+    else
+        account_num=$(get_next_account_number)
     fi
-
-    local account_num
-    account_num=$(get_next_account_number)
 
     if [[ -z "$account_type" && -t 0 ]]; then
         echo -n "Account type [team/max20, empty=skip]: "
@@ -2440,20 +2440,26 @@ cmd_add_account() {
     # Update sequence.json
     local updated_sequence
     updated_sequence=$(jq --arg num "$account_num" --arg email "$current_email" --arg uuid "$account_uuid" --arg type "$account_type" --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
-        .accounts[$num] = {
+        .accounts[$num] = (.accounts[$num] // {}) + {
             email: $email,
             uuid: $uuid,
-            added: $now
+            added: (.accounts[$num].added // $now)
         } |
         (if ($type | length) > 0 then .accounts[$num].accountType = $type else . end) |
-        .sequence += [$num | tonumber] |
+        .sequence = ((.sequence // []) + [$num | tonumber] | unique) |
         .activeAccountNumber = ($num | tonumber) |
         .lastUpdated = $now
     ' "$SEQUENCE_FILE")
 
     write_json "$SEQUENCE_FILE" "$updated_sequence"
 
-    echo "Added Account $account_num: $current_email"
+    coord_publish_credential "$current_email" "$current_creds"
+
+    if [[ "$is_update" -eq 1 ]]; then
+        echo "Updated Account $account_num: $current_email"
+    else
+        echo "Added Account $account_num: $current_email"
+    fi
 }
 
 # Remove account
