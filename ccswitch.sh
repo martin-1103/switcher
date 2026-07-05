@@ -1510,7 +1510,7 @@ cmd_keepalive() {
             continue
         fi
 
-        if updated_creds=$(refresh_credential_tokens "$creds"); then
+        if updated_creds=$(refresh_credential_tokens "$creds") && credential_is_usable "$updated_creds"; then
             write_account_credentials "$num" "$email" "$updated_creds"
             write_account_credentials_if_active "$email" "$updated_creds"
             coord_publish_credential "$email" "$updated_creds"
