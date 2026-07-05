@@ -1435,6 +1435,95 @@ update_credential_tokens() {
     ' 2>/dev/null
 }
 
+# Call the OAuth refresh endpoint directly for one credential blob (no usage
+# API call first). Returns the updated credentials JSON on stdout, or fails.
+refresh_credential_tokens() {
+    local creds="$1"
+    local connect_timeout="${CCS_CURL_CONNECT_TIMEOUT:-$DEFAULT_CURL_CONNECT_TIMEOUT}"
+    local max_time="${CCS_CURL_MAX_TIME:-$DEFAULT_CURL_MAX_TIME}"
+    local client_id="9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+
+    local refresh_token
+    refresh_token=$(credential_refresh_token "$creds")
+    [[ -n "$refresh_token" ]] || return 1
+
+    local refresh_response refresh_code refresh_body new_access new_refresh
+    refresh_response=$(curl -sS -w "\n%{http_code}" \
+        --connect-timeout "$connect_timeout" \
+        --max-time "$max_time" \
+        -X POST \
+        -H "Content-Type: application/json" \
+        -d "{\"grant_type\":\"refresh_token\",\"refresh_token\":\"$refresh_token\",\"client_id\":\"$client_id\"}" \
+        "https://console.anthropic.com/v1/oauth/token" 2>/dev/null) || return 1
+    refresh_code=$(echo "$refresh_response" | tail -n1)
+    refresh_body=$(echo "$refresh_response" | sed '$d')
+    [[ "$refresh_code" == "200" ]] || return 1
+
+    new_access=$(echo "$refresh_body" | jq -r '.access_token // empty' 2>/dev/null)
+    new_refresh=$(echo "$refresh_body" | jq -r '.refresh_token // empty' 2>/dev/null)
+    [[ -n "$new_access" ]] || return 1
+
+    update_credential_tokens "$creds" "$new_access" "${new_refresh:-$refresh_token}"
+}
+
+# Refresh every managed account's refresh_token before it goes idle-stale
+# (see credential-events.log era invalid_grant reports). Each account is
+# rate-limited to at most one refresh per --min-age window (default 6h),
+# tracked in sequence.json, so re-running this on a schedule never spams
+# Anthropic's oauth/token endpoint beyond one call per account per window.
+cmd_keepalive() {
+    local min_age=21600
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --min-age)
+                min_age="$2"
+                shift 2
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    [[ -f "$SEQUENCE_FILE" ]] || { echo "Error: No accounts configured"; exit 1; }
+
+    local now_epoch
+    now_epoch=$(date +%s)
+    local nums
+    nums=$(jq -r '.accounts | keys[]' "$SEQUENCE_FILE" 2>/dev/null)
+
+    local num email creds last_refresh updated_creds
+    for num in $nums; do
+        email=$(jq -r --arg num "$num" '.accounts[$num].email // empty' "$SEQUENCE_FILE")
+        [[ -n "$email" ]] || continue
+
+        last_refresh=$(jq -r --arg num "$num" '.accounts[$num].lastKeepaliveAt // 0' "$SEQUENCE_FILE" 2>/dev/null || echo 0)
+        [[ "$last_refresh" =~ ^[0-9]+$ ]] || last_refresh=0
+        if [[ $((now_epoch - last_refresh)) -lt "$min_age" ]]; then
+            echo "Account-$num ($email): skipped, refreshed recently"
+            continue
+        fi
+
+        creds=$(read_account_credentials "$num" "$email")
+        if ! credential_is_usable "$creds"; then
+            echo "Account-$num ($email): skipped, no usable local credential"
+            continue
+        fi
+
+        if updated_creds=$(refresh_credential_tokens "$creds"); then
+            write_account_credentials "$num" "$email" "$updated_creds"
+            write_account_credentials_if_active "$email" "$updated_creds"
+            coord_publish_credential "$email" "$updated_creds"
+            local seq
+            seq=$(jq --arg num "$num" --arg now "$now_epoch" '.accounts[$num].lastKeepaliveAt = ($now | tonumber)' "$SEQUENCE_FILE")
+            write_json "$SEQUENCE_FILE" "$seq"
+            echo "Account-$num ($email): refreshed"
+        else
+            echo "Account-$num ($email): refresh failed (refresh_token likely dead)"
+        fi
+    done
+}
+
 # Write credentials based on platform
 write_credentials() {
     local credentials="$1"
@@ -3716,6 +3805,10 @@ main() {
         warm-loop)
             shift
             cmd_warm_loop "$@"
+            ;;
+        keepalive)
+            shift
+            cmd_keepalive "$@"
             ;;
         coord-setup)
             shift
