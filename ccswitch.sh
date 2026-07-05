@@ -937,9 +937,10 @@ fetch_usage_for_account() {
             --connect-timeout "$connect_timeout" \
             --max-time "$max_time" \
             -X POST \
-            -H "Content-Type: application/json" \
-            -d "{\"grant_type\":\"refresh_token\",\"refresh_token\":\"$refresh_token\",\"client_id\":\"$client_id\"}" \
-            "https://console.anthropic.com/v1/oauth/token" 2>/dev/null) || return 1
+            --data-urlencode "grant_type=refresh_token" \
+            --data-urlencode "refresh_token=$refresh_token" \
+            --data-urlencode "client_id=$client_id" \
+            "https://platform.claude.com/v1/oauth/token" 2>/dev/null) || return 1
         refresh_code=$(echo "$refresh_response" | tail -n1)
         refresh_body=$(echo "$refresh_response" | sed '$d')
         [[ "$refresh_code" == "200" ]] || return 1
@@ -1452,9 +1453,10 @@ refresh_credential_tokens() {
         --connect-timeout "$connect_timeout" \
         --max-time "$max_time" \
         -X POST \
-        -H "Content-Type: application/json" \
-        -d "{\"grant_type\":\"refresh_token\",\"refresh_token\":\"$refresh_token\",\"client_id\":\"$client_id\"}" \
-        "https://console.anthropic.com/v1/oauth/token" 2>/dev/null) || return 1
+        --data-urlencode "grant_type=refresh_token" \
+        --data-urlencode "refresh_token=$refresh_token" \
+        --data-urlencode "client_id=$client_id" \
+        "https://platform.claude.com/v1/oauth/token" 2>/dev/null) || return 1
     refresh_code=$(echo "$refresh_response" | tail -n1)
     refresh_body=$(echo "$refresh_response" | sed '$d')
     [[ "$refresh_code" == "200" ]] || return 1
@@ -3112,9 +3114,10 @@ fetch_usage_data() {
         local refresh_response refresh_code
         refresh_response=$(curl -sS -w "\n%{http_code}" \
             -X POST \
-            -H "Content-Type: application/json" \
-            -d "{\"grant_type\":\"refresh_token\",\"refresh_token\":\"$refresh_token\",\"client_id\":\"$client_id\"}" \
-            "https://console.anthropic.com/v1/oauth/token" 2>/dev/null) || return 1
+            --data-urlencode "grant_type=refresh_token" \
+            --data-urlencode "refresh_token=$refresh_token" \
+            --data-urlencode "client_id=$client_id" \
+            "https://platform.claude.com/v1/oauth/token" 2>/dev/null) || return 1
 
         refresh_code=$(echo "$refresh_response" | tail -n1)
         local refresh_body
