@@ -2597,6 +2597,12 @@ cmd_add_token() {
     write_account_credentials "$account_num" "$email" "$creds"
     write_account_credentials_if_active "$email" "$creds"
 
+    local existing_config
+    existing_config=$(read_account_config "$account_num" "$email")
+    if [[ -z "$existing_config" ]]; then
+        write_account_config "$account_num" "$email" '{"oauthAccount": {"accountUuid": null}}'
+    fi
+
     local updated_sequence
     updated_sequence=$(jq --arg num "$account_num" --arg email "$email" --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
         .accounts[$num] = (.accounts[$num] // {}) + {
