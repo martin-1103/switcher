@@ -98,36 +98,13 @@ detect_platform() {
 
 # Get Claude configuration file path with fallback
 get_claude_config_path() {
-    local primary_config="$HOME/.claude/.claude.json"
-    local fallback_config="$HOME/.claude.json"
-    local primary_valid=false
-    local fallback_valid=false
-
-    if [[ -f "$primary_config" ]] && jq -e '.oauthAccount' "$primary_config" >/dev/null 2>&1; then
-        primary_valid=true
-    fi
-    if [[ -f "$fallback_config" ]] && jq -e '.oauthAccount' "$fallback_config" >/dev/null 2>&1; then
-        fallback_valid=true
-    fi
-
-    if [[ "$primary_valid" == true && "$fallback_valid" == true ]]; then
-        local primary_mtime fallback_mtime
-        primary_mtime=$(stat -c '%Y' "$primary_config" 2>/dev/null || stat -f '%m' "$primary_config" 2>/dev/null || echo 0)
-        fallback_mtime=$(stat -c '%Y' "$fallback_config" 2>/dev/null || stat -f '%m' "$fallback_config" 2>/dev/null || echo 0)
-        if [[ "$fallback_mtime" -gt "$primary_mtime" ]]; then
-            echo "$fallback_config"
-        else
-            echo "$primary_config"
-        fi
+    local config_dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+    local dotconfig="$config_dir/.config.json"
+    if [[ -f "$dotconfig" ]]; then
+        echo "$dotconfig"
         return
     fi
-
-    if [[ "$primary_valid" == true ]]; then
-        echo "$primary_config"
-        return
-    fi
-
-    echo "$fallback_config"
+    echo "${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json"
 }
 
 # Basic validation that JSON is valid
