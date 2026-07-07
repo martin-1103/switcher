@@ -2982,9 +2982,15 @@ perform_switch() {
         exit 1
     fi
 
-    # Merge with current config and validate
+    # Merge with current config and validate. Also carry over onboarding/theme
+    # state from the backup: a live config missing these re-triggers the
+    # theme/login-method wizard on interactive start even with a valid oauthAccount.
     local merged_config
-    if ! merged_config=$(jq --argjson oauth "$oauth_section" '.oauthAccount = $oauth' "$(get_claude_config_path)" 2>/dev/null); then
+    if ! merged_config=$(jq --argjson oauth "$oauth_section" --argjson backup "$target_config" '
+        .oauthAccount = $oauth
+        | (if $backup.hasCompletedOnboarding then .hasCompletedOnboarding = $backup.hasCompletedOnboarding else . end)
+        | (if $backup.theme then .theme = $backup.theme else . end)
+    ' "$(get_claude_config_path)" 2>/dev/null); then
         echo "Error: Failed to merge config"
         rollback
         exit 1
