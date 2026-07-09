@@ -2547,68 +2547,6 @@ cmd_add_account() {
     fi
 }
 
-# Register a long-lived `claude setup-token` OAuth token as an account's credential
-cmd_add_token() {
-    if [[ $# -lt 2 ]]; then
-        echo "Usage: ccs add-token <account_number|email> <token>"
-        exit 1
-    fi
-    local identifier="$1"
-    local token="$2"
-
-    if [[ ! "$token" =~ ^sk-ant-oat01- ]]; then
-        echo "Error: token must be a 'claude setup-token' OAuth token (starts with sk-ant-oat01-)"
-        exit 1
-    fi
-
-    setup_directories
-    init_sequence_file
-
-    local account_num email
-    if [[ "$identifier" =~ ^[0-9]+$ ]]; then
-        account_num="$identifier"
-        email=$(jq -r --arg num "$account_num" '.accounts[$num].email // empty' "$SEQUENCE_FILE")
-        [[ -n "$email" ]] || { echo "Error: Account $account_num not found. Use an email for a new account."; exit 1; }
-    else
-        email="$identifier"
-        if account_exists "$email"; then
-            account_num=$(resolve_account_identifier "$email")
-        else
-            account_num=$(get_next_account_number)
-        fi
-    fi
-
-    local far_future
-    far_future=$(( $(date +%s) * 1000 + 31536000000 ))
-    local creds
-    creds=$(jq -n --arg token "$token" --argjson exp "$far_future" \
-        '{claudeAiOauth: {accessToken: $token, refreshToken: "", expiresAt: $exp, scopes: ["user:inference"]}}')
-
-    write_account_credentials "$account_num" "$email" "$creds"
-    write_account_credentials_if_active "$email" "$creds"
-
-    local existing_config
-    existing_config=$(read_account_config "$account_num" "$email")
-    if [[ -z "$existing_config" ]]; then
-        write_account_config "$account_num" "$email" '{"oauthAccount": {"accountUuid": null}}'
-    fi
-
-    local updated_sequence
-    updated_sequence=$(jq --arg num "$account_num" --arg email "$email" --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
-        .accounts[$num] = (.accounts[$num] // {}) + {
-            email: $email,
-            added: (.accounts[$num].added // $now)
-        } |
-        .sequence = ((.sequence // []) + [$num | tonumber] | unique) |
-        .lastUpdated = $now
-    ' "$SEQUENCE_FILE")
-    write_json "$SEQUENCE_FILE" "$updated_sequence"
-
-    coord_publish_credential "$email" "$creds"
-
-    echo "Account $account_num ($email): setup-token registered, expires in ~1 year"
-}
-
 # Remove account
 cmd_remove_account() {
     if [[ $# -eq 0 ]]; then
@@ -3825,10 +3763,6 @@ main() {
         add|--add-account)
             shift
             cmd_add_account "$@"
-            ;;
-        add-token)
-            shift
-            cmd_add_token "$@"
             ;;
         rm|--remove-account)
             shift
