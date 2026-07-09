@@ -1279,6 +1279,15 @@ get_current_account() {
     echo "${email:-none}"
 }
 
+# Usage cache keyed per-account-email so a stale/wrong-scope fetch for one
+# account can never be read back as another account's usage after a switch.
+usage_cache_file() {
+    local email="${1:-$(get_current_account)}"
+    local safe
+    safe=$(echo "$email" | tr -c 'A-Za-z0-9._-' '_')
+    echo "/tmp/claude-usage-cache-${safe}.json"
+}
+
 # Read credentials based on platform
 read_credentials() {
     local platform
@@ -1485,6 +1494,7 @@ cmd_keepalive() {
 
         creds=$(read_account_credentials "$num" "$email")
         if ! credential_is_usable "$creds"; then
+            log_credential_event "keepalive Account-$num ($email): skipped, no usable local credential"
             echo "Account-$num ($email): skipped, no usable local credential"
             continue
         fi
@@ -1500,8 +1510,10 @@ cmd_keepalive() {
             local seq
             seq=$(jq --arg num "$num" --arg now "$now_epoch" '.accounts[$num].lastKeepaliveAt = ($now | tonumber)' "$SEQUENCE_FILE")
             write_json "$SEQUENCE_FILE" "$seq"
+            log_credential_event "keepalive Account-$num ($email): refreshed"
             echo "Account-$num ($email): refreshed"
         else
+            log_credential_event "keepalive Account-$num ($email): refresh failed (refresh_token likely dead)"
             echo "Account-$num ($email): refresh failed (refresh_token likely dead)"
         fi
     done
@@ -2221,7 +2233,8 @@ cmd_status() {
         echo "Token status:    No credentials found"
     fi
 
-    local cache_file="/tmp/claude-usage-cache.json"
+    local cache_file
+    cache_file=$(usage_cache_file "$current_email")
     if [[ -f "$cache_file" ]]; then
         local usage_summary five_reset seven_reset
         usage_summary=$(format_usage_windows "$cache_file")
@@ -2839,7 +2852,6 @@ cmd_switch_to() {
 perform_switch() {
     local target_account="$1"
     local switch_reason="${CCS_SWITCH_REASON:-}"
-    local cache_file="/tmp/claude-usage-cache.json"
 
     # Get current and target account info
     local current_account target_email current_email
@@ -3072,10 +3084,6 @@ perform_switch() {
     fi
     clear_account_auth_invalid "$target_account"
 
-    # Invalidate any stale usage cache from the previous account immediately.
-    # The next hook/statusline pass must fetch fresh usage for the new account.
-    rm -f "$cache_file" 2>/dev/null || true
-
     if [[ "$current_account_is_managed" == true ]]; then
         coord_release_account_state "$current_email"
     fi
@@ -3126,12 +3134,13 @@ perform_switch() {
 }
 
 # Fetch usage data from Anthropic OAuth Usage API
-# Writes to /tmp/claude-usage-cache.json with active_account field
+# Writes to the per-account usage cache (see usage_cache_file) with active_account field
 # Returns 0 on success, 1 on failure
 fetch_usage_data() {
-    local cache_file="/tmp/claude-usage-cache.json"
     local current_email
     current_email=$(get_current_account)
+    local cache_file
+    cache_file=$(usage_cache_file "$current_email")
 
     # Read credentials and extract access token
     local creds access_token
@@ -3249,7 +3258,6 @@ cmd_rate_check() {
     local hook_mode=false
     local refresh=false
     local max_age=""
-    local cache_file="/tmp/claude-usage-cache.json"
 
     # Parse flags
     while [[ $# -gt 0 ]]; do
@@ -3293,8 +3301,9 @@ cmd_rate_check() {
         max_age="${max_age:-$DEFAULT_CACHE_TTL}"
     fi
 
-    local current_email
+    local current_email cache_file
     current_email=$(get_current_account)
+    cache_file=$(usage_cache_file "$current_email")
 
     # Decide whether we need fresh data: forced, or the cache is missing / stale /
     # for a different account than the one currently active. This is what makes the
@@ -3384,7 +3393,6 @@ cmd_rate_check() {
                 exit 2
             fi
             log_switch_event "reclaim OK: Account-$starting_account -> Account-$reclaim_target ($reclaim_email)"
-            rm -f "$cache_file"
             fetch_usage_data >/dev/null 2>&1 || true
             if [[ "$hook_mode" == true ]]; then
                 _rate_hook_deny "Switched back to preferred account Account-$reclaim_target ($reclaim_email). Please restart Claude Code."
@@ -3471,7 +3479,6 @@ cmd_rate_check() {
             exit 2
         fi
 
-        rm -f "$cache_file"
         log_switch_event "switch OK: Account-$starting_account -> Account-$next_account ($next_email)"
         if [[ "$hook_mode" == true ]]; then
             _rate_hook_deny "Rate limit exceeded. Switched to Account-$next_account ($next_email). Please restart Claude Code."
