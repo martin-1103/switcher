@@ -44,6 +44,7 @@ else
 fi
 
 # Container detection
+# ===== PLATFORM / SETUP =====
 is_running_in_container() {
     # Check for Docker environment file
     if [[ -f /.dockerenv ]]; then
@@ -178,6 +179,7 @@ check_dependencies() {
     fi
 }
 
+# ===== COORDINATION (multi-host lease/lock) =====
 coord_enabled() {
     [[ -f "$SEQUENCE_FILE" ]] || return 1
     [[ "$(jq -r '.coordination.mode // empty' "$SEQUENCE_FILE" 2>/dev/null || true)" != "" ]]
@@ -563,6 +565,7 @@ WHERE email = '$(sql_escape "$email")'
 }
 
 # Setup backup directories
+# ===== LOCKING / CACHE HELPERS =====
 setup_directories() {
     mkdir -p "$BACKUP_DIR"/{configs,credentials}
     chmod 700 "$BACKUP_DIR"
@@ -882,6 +885,7 @@ write_account_credentials_if_active() {
 # platform.claude.com/v1/oauth/token and one cooldown/lead-window governing it.
 # A 401 here just means the access token is expired; the caller gets a plain
 # failure and the next keepalive run (<=15min away) will refresh it.
+# ===== USAGE FETCH =====
 fetch_usage_for_account() {
     local email="$1"
     local creds="$2"
@@ -1227,6 +1231,7 @@ wait_for_claude_close() {
 }
 
 # Get current account info from .claude.json
+# ===== ACCOUNT RESOLUTION / CREDENTIALS =====
 get_current_account() {
     if [[ ! -f "$(get_claude_config_path)" ]]; then
         echo "none"
@@ -1436,6 +1441,7 @@ refresh_credential_tokens() {
 # trigger: the actual trigger is "expiresAt within lead_seconds" below. This
 # guards against overlapping/duplicate keepalive runs re-refreshing the same
 # account seconds apart, nothing more.
+# ===== KEEPALIVE (sole OAuth refresh path) =====
 cmd_keepalive() {
     local min_age=300
     local lead_seconds=1800
@@ -1508,6 +1514,7 @@ cmd_keepalive() {
 }
 
 # Write credentials based on platform
+# ===== CREDENTIAL STORAGE =====
 write_credentials() {
     local credentials="$1"
     local platform
@@ -1962,6 +1969,7 @@ decode_jwt_payload() {
 }
 
 # Kill Claude Code processes
+# ===== PROCESS CONTROL =====
 kill_claude_processes() {
     local pids
     pids=$(ps -eo pid,comm,args | awk '$2 == "claude" || $3 == "claude" {print $1}')
@@ -2006,6 +2014,7 @@ handle_restart_after_switch() {
 }
 
 # Backup integrity check
+# ===== CMD_* ENTRYPOINTS =====
 cmd_check() {
     if [[ ! -f "$SEQUENCE_FILE" ]]; then
         echo "No accounts are managed yet. Nothing to check."
@@ -3062,6 +3071,7 @@ perform_switch() {
 # Fetch usage data from Anthropic OAuth Usage API
 # Writes to the per-account usage cache (see usage_cache_file) with active_account field
 # Returns 0 on success, 1 on failure
+# ===== RATE-CHECK / AUTO-SWITCH DECISION =====
 fetch_usage_data() {
     local current_email
     current_email=$(get_current_account)
@@ -3394,6 +3404,7 @@ EOF
 
 # Rate limit auto-switch setup
 # Usage: ccs rate-setup [--threshold N] [--disable]
+# ===== SETUP WIZARDS =====
 cmd_rate_setup() {
     local threshold=80
     local disable=false
@@ -3594,6 +3605,7 @@ cmd_statusline_setup() {
 }
 
 # Show usage
+# ===== CLI DISPATCH =====
 show_usage() {
     echo "Multi-Account Switcher for Claude Code v${VERSION}"
     echo "Usage: ccs [OPTIONS] <command> [args]"
