@@ -16,8 +16,17 @@ set -uo pipefail
 INPUT=$(cat 2>/dev/null || true)
 
 HOME="${HOME:-/root}"
-CACHE_FILE="/tmp/claude-usage-cache.json"
 SEQ="$HOME/.claude-switch-backup/sequence.json"
+
+# Cache filename must mirror ccswitch.sh's usage_cache_file() exactly — one
+# cache file per account, so a stale/failed fetch for one account can never
+# be read back as another account's usage after a switch.
+usage_cache_file() {
+    local email="$1"
+    local safe
+    safe=$(echo "$email" | tr -c 'A-Za-z0-9._-' '_')
+    echo "/tmp/claude-usage-cache-${safe}.json"
+}
 
 # Resolve ccs: 1) CCS_PATH env (set by statusline-setup), 2) sibling of this
 # script's dir, 3) PATH, 4) common locations.
@@ -26,6 +35,9 @@ CCS="${CCS_PATH:-}"
 [[ -z "$CCS" || ! -x "$CCS" ]] && CCS="${SCRIPT_DIR}/../ccswitch.sh"
 [[ -x "$CCS" ]] || CCS=$(command -v ccs 2>/dev/null || echo "")
 [[ -z "$CCS" || ! -x "$CCS" ]] && CCS="/usr/local/bin/ccs"
+
+current_email=$("$CCS" status 2>/dev/null | sed -n 's/^Current account: //p' | head -n1)
+CACHE_FILE=$(usage_cache_file "${current_email:-unknown}")
 
 # Kick a TTL-aware refresh + reclaim check in the background. The hook only
 # fires on a tool call, so an idle session (Claude Code open, no tool calls)

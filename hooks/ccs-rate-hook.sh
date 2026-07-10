@@ -24,10 +24,19 @@ fi
 # shellcheck disable=SC2034  # INPUT consumed per hook protocol, not used in script
 INPUT=$(cat)
 
-CACHE_FILE="/tmp/claude-usage-cache.json"
 HOOK_LOG_FILE="/tmp/ccs-rate-hook.log"
 THRESHOLD=80
 CACHE_TTL=60
+
+# Cache filename must mirror ccswitch.sh's usage_cache_file() exactly — one
+# cache file per account, so a stale/failed fetch for one account can never
+# be read back as another account's usage after a switch.
+usage_cache_file() {
+    local email="$1"
+    local safe
+    safe=$(echo "$email" | tr -c 'A-Za-z0-9._-' '_')
+    echo "/tmp/claude-usage-cache-${safe}.json"
+}
 
 hook_log() {
     local ts msg
@@ -63,14 +72,15 @@ fi
 
 # Cache-only path: statusline owns usage refresh. Hook must not call rate-check,
 # because invalid credentials make rate-check fail open and leave us stuck.
+current_email=$("$CCS" status 2>/dev/null | sed -n 's/^Current account: //p' | head -n1)
+CACHE_FILE=$(usage_cache_file "${current_email:-unknown}")
+
 fast_ok=false
 if [[ -f "$CACHE_FILE" ]]; then
     cached_at=$(jq -r '.cached_at // 0' "$CACHE_FILE" 2>/dev/null || echo 0)
     [[ "$cached_at" =~ ^[0-9]+$ ]] || cached_at=0
     now=$(date +%s)
     age=$(( now - cached_at ))
-    current_email=$("$CCS" status 2>/dev/null | sed -n 's/^Current account: //p' | head -n1)
-    cached_email=$(jq -r '.active_account // empty' "$CACHE_FILE" 2>/dev/null || true)
     usage=$(jq -r '
         (
             [(.limits // [])[] | select((.is_active // false) == true) | .percent? | select(type == "number")] | max
@@ -79,11 +89,7 @@ if [[ -f "$CACHE_FILE" ]]; then
         )
     ' "$CACHE_FILE" 2>/dev/null || echo "0")
     usage_int=$(printf "%.0f" "$usage" 2>/dev/null || echo "0")
-    cache_matches=true
-    if [[ -n "$current_email" && -n "$cached_email" && "$current_email" != "$cached_email" ]]; then
-        cache_matches=false
-    fi
-    if [[ "$cached_at" -gt 0 && "$age" -lt "$CACHE_TTL" && "$cache_matches" == true && "$usage_int" -lt "$THRESHOLD" ]]; then
+    if [[ "$cached_at" -gt 0 && "$age" -lt "$CACHE_TTL" && "$usage_int" -lt "$THRESHOLD" ]]; then
         fast_ok=true
     fi
 fi
@@ -105,11 +111,6 @@ fi
 
 if [[ "${cached_at:-0}" -le 0 || "${age:-999999}" -ge "$CACHE_TTL" ]]; then
     hook_log "skip cache-stale age=${age:-na} ttl=$CACHE_TTL"
-    exit 0
-fi
-
-if [[ "${cache_matches:-false}" != true ]]; then
-    hook_log "skip cache-account-mismatch current=${current_email:-unknown} cached=${cached_email:-unknown}"
     exit 0
 fi
 
