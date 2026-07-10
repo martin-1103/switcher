@@ -5,4 +5,4 @@ Description=CCS Keepalive (refresh idle account tokens)
 Type=oneshot
 Environment=HOME=/root
 Environment=CCS_SILENT=1
-ExecStart=/usr/local/bin/ccs keepalive --min-age 21600
+ExecStart=/usr/local/bin/ccs keepalive --min-age 300 --lead-seconds 1800

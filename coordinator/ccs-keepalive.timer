@@ -1,9 +1,9 @@
 [Unit]
-Description=Run CCS Keepalive every 6 hours
+Description=Run CCS Keepalive every 15 minutes
 
 [Timer]
-OnBootSec=10min
-OnUnitActiveSec=6h
+OnBootSec=2min
+OnUnitActiveSec=15min
 Persistent=true
 
 [Install]

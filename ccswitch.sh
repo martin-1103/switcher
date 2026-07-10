@@ -877,12 +877,15 @@ write_account_credentials_if_active() {
     fi
 }
 
+# Note: does NOT refresh on 401. Token refresh is owned solely by cmd_keepalive
+# (see its header comment) so there is exactly one place that calls
+# platform.claude.com/v1/oauth/token and one cooldown/lead-window governing it.
+# A 401 here just means the access token is expired; the caller gets a plain
+# failure and the next keepalive run (<=15min away) will refresh it.
 fetch_usage_for_account() {
-    local account_num="$1"
-    local email="$2"
-    local creds="$3"
-    local cache_file="$4"
-    local persist_backup="${5:-true}"
+    local email="$1"
+    local creds="$2"
+    local cache_file="$3"
 
     [[ -n "$creds" ]] || return 1
 
@@ -903,45 +906,6 @@ fetch_usage_for_account() {
 
     http_code=$(echo "$response" | tail -n1)
     body=$(echo "$response" | sed '$d')
-
-    if [[ "$http_code" == "401" ]]; then
-        local refresh_token client_id refresh_response refresh_code refresh_body new_access new_refresh updated_creds
-        refresh_token=$(credential_refresh_token "$creds")
-        client_id="9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-        [[ -n "$refresh_token" ]] || return 1
-
-        refresh_response=$(curl -sS -w "\n%{http_code}" \
-            --connect-timeout "$connect_timeout" \
-            --max-time "$max_time" \
-            -X POST \
-            --data-urlencode "grant_type=refresh_token" \
-            --data-urlencode "refresh_token=$refresh_token" \
-            --data-urlencode "client_id=$client_id" \
-            "https://platform.claude.com/v1/oauth/token" 2>/dev/null) || return 1
-        refresh_code=$(echo "$refresh_response" | tail -n1)
-        refresh_body=$(echo "$refresh_response" | sed '$d')
-        [[ "$refresh_code" == "200" ]] || return 1
-
-        new_access=$(echo "$refresh_body" | jq -r '.access_token // empty' 2>/dev/null)
-        new_refresh=$(echo "$refresh_body" | jq -r '.refresh_token // empty' 2>/dev/null)
-        [[ -n "$new_access" ]] || return 1
-
-        updated_creds=$(update_credential_tokens "$creds" "$new_access" "${new_refresh:-$refresh_token}")
-        if [[ "$persist_backup" == "true" ]]; then
-            write_account_credentials "$account_num" "$email" "$updated_creds" >/dev/null 2>&1 || true
-        fi
-        write_account_credentials_if_active "$email" "$updated_creds"
-        coord_publish_credential "$email" "$updated_creds"
-
-        response=$(curl -sS -w "\n%{http_code}" \
-            --connect-timeout "$connect_timeout" \
-            --max-time "$max_time" \
-            -H "Authorization: Bearer $new_access" \
-            -H "anthropic-beta: oauth-2025-04-20" \
-            "https://api.anthropic.com/api/oauth/usage" 2>/dev/null) || return 1
-        http_code=$(echo "$response" | tail -n1)
-        body=$(echo "$response" | sed '$d')
-    fi
 
     [[ "$http_code" == "200" ]] || return 1
     echo "$body" | jq . >/dev/null 2>&1 || return 1
@@ -1020,7 +984,7 @@ cmd_warm_check() {
     [[ -n "$creds" ]] || { echo "No active credentials."; return 0; }
 
     cache_file=$(mktemp "/tmp/ccs-warm-${active_num}-XXXXXX.json")
-    if ! fetch_usage_for_account "$active_num" "$active_email" "$creds" "$cache_file"; then
+    if ! fetch_usage_for_account "$active_email" "$creds" "$cache_file"; then
         rm -f "$cache_file"
         echo "Active account usage refresh failed."
         return 0
@@ -1351,18 +1315,25 @@ log_switch_event() {
     printf '%s pid=%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" "$msg" >> "$log_file" 2>/dev/null || true
 }
 
-credential_is_usable() {
+# Normalizes expiresAt to epoch seconds (input may be epoch ms or s, or absent).
+credential_expires_epoch() {
     local creds="$1"
-    local access refresh expires now
-    access=$(credential_access_token "$creds")
-    refresh=$(credential_refresh_token "$creds")
+    local expires
     expires=$(echo "$creds" | jq -r '.expires_at // .claudeAiOauth.expiresAt // 0' 2>/dev/null || echo 0)
-    [[ -n "$access" ]] || return 1
     [[ "$expires" =~ ^[0-9]+$ ]] || expires=0
-    now=$(date +%s)
     if [[ "$expires" -gt 1000000000000 ]]; then
         expires=$((expires / 1000))
     fi
+    echo "$expires"
+}
+
+credential_is_usable() {
+    local creds="$1"
+    local access expires now
+    access=$(credential_access_token "$creds")
+    [[ -n "$access" ]] || return 1
+    expires=$(credential_expires_epoch "$creds")
+    now=$(date +%s)
     [[ "$expires" -eq 0 || "$expires" -gt "$now" ]]
 }
 
@@ -1454,17 +1425,28 @@ refresh_credential_tokens() {
     update_credential_tokens "$creds" "$new_access" "${new_refresh:-$refresh_token}"
 }
 
-# Refresh every managed account's refresh_token before it goes idle-stale
-# (see credential-events.log era invalid_grant reports). Each account is
-# rate-limited to at most one refresh per --min-age window (default 6h),
-# tracked in sequence.json, so re-running this on a schedule never spams
-# Anthropic's oauth/token endpoint beyond one call per account per window.
+# Refresh every managed account's refresh_token before its access token expires.
+# This is the SOLE refresh path (fetch_usage_for_account no longer refreshes
+# reactively on 401 — see its header comment). The timer runs every 15min
+# (coordinator/ccs-keepalive.timer) so it catches tokens well before their
+# ~4h access-token lifetime runs out, instead of a fixed 6h schedule that could
+# leave a token dead for hours after it expired.
+#
+# --min-age is now a pure anti-hammer floor (default 5min), NOT the refresh
+# trigger: the actual trigger is "expiresAt within lead_seconds" below. This
+# guards against overlapping/duplicate keepalive runs re-refreshing the same
+# account seconds apart, nothing more.
 cmd_keepalive() {
-    local min_age=21600
+    local min_age=300
+    local lead_seconds=1800
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --min-age)
                 min_age="$2"
+                shift 2
+                ;;
+            --lead-seconds)
+                lead_seconds="$2"
                 shift 2
                 ;;
             *)
@@ -1480,7 +1462,7 @@ cmd_keepalive() {
     local nums
     nums=$(jq -r '.accounts | keys[]' "$SEQUENCE_FILE" 2>/dev/null)
 
-    local num email creds last_refresh updated_creds
+    local num email creds last_refresh updated_creds expires_at
     for num in $nums; do
         email=$(jq -r --arg num "$num" '.accounts[$num].email // empty' "$SEQUENCE_FILE")
         [[ -n "$email" ]] || continue
@@ -1500,6 +1482,12 @@ cmd_keepalive() {
         fi
         if [[ -z "$(credential_refresh_token "$creds")" ]]; then
             echo "Account-$num ($email): skipped, long-lived setup-token (no refresh needed)"
+            continue
+        fi
+
+        expires_at=$(credential_expires_epoch "$creds")
+        if [[ "$expires_at" -ne 0 && $((expires_at - now_epoch)) -gt "$lead_seconds" ]]; then
+            echo "Account-$num ($email): skipped, not near expiry yet (expires in $((expires_at - now_epoch))s)"
             continue
         fi
 
@@ -3032,7 +3020,7 @@ perform_switch() {
     if [[ "${CCS_SKIP_POST_SWITCH_USAGE_FETCH:-0}" != "1" ]]; then
         local live_cache
         live_cache=$(mktemp "/tmp/ccs-switch-${target_account}-XXXXXX.json")
-        fetch_usage_for_account "$target_account" "$target_email" "$target_creds" "$live_cache" >/dev/null 2>&1 || true
+        fetch_usage_for_account "$target_email" "$target_creds" "$live_cache" >/dev/null 2>&1 || true
         rm -f "$live_cache" 2>/dev/null || true
     fi
 
@@ -3103,55 +3091,9 @@ fetch_usage_data() {
     local body
     body=$(echo "$response" | sed '$d')
 
-    # Handle token refresh on 401
-    if [[ "$http_code" == "401" ]]; then
-        local refresh_token client_id
-        refresh_token=$(credential_refresh_token "$creds")
-        client_id="9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-
-        if [[ -z "$refresh_token" ]]; then
-            return 1
-        fi
-
-        local refresh_response refresh_code
-        refresh_response=$(curl -sS -w "\n%{http_code}" \
-            -X POST \
-            --data-urlencode "grant_type=refresh_token" \
-            --data-urlencode "refresh_token=$refresh_token" \
-            --data-urlencode "client_id=$client_id" \
-            "https://platform.claude.com/v1/oauth/token" 2>/dev/null) || return 1
-
-        refresh_code=$(echo "$refresh_response" | tail -n1)
-        local refresh_body
-        refresh_body=$(echo "$refresh_response" | sed '$d')
-
-        if [[ "$refresh_code" != "200" ]]; then
-            return 1
-        fi
-
-        # Update stored credentials with new tokens
-        local new_access new_refresh updated_creds
-        new_access=$(echo "$refresh_body" | jq -r '.access_token // empty' 2>/dev/null)
-        new_refresh=$(echo "$refresh_body" | jq -r '.refresh_token // empty' 2>/dev/null)
-
-        if [[ -z "$new_access" ]]; then
-            return 1
-        fi
-
-        updated_creds=$(update_credential_tokens "$creds" "$new_access" "${new_refresh:-$refresh_token}")
-        write_credentials "$updated_creds"
-        coord_publish_credential "$current_email" "$updated_creds"
-
-        # Retry the usage API with new token
-        response=$(curl -sS -w "\n%{http_code}" \
-            -H "Authorization: Bearer $new_access" \
-            -H "anthropic-beta: oauth-2025-04-20" \
-            "https://api.anthropic.com/api/oauth/usage" 2>/dev/null) || return 1
-
-        http_code=$(echo "$response" | tail -n1)
-        body=$(echo "$response" | sed '$d')
-    fi
-
+    # No reactive refresh here: cmd_keepalive is the sole refresh path (see its
+    # header comment). A 401 just means the access token expired; keepalive
+    # picks it up within its lead window (<=15min via the timer).
     if [[ "$http_code" != "200" ]]; then
         return 1
     fi
