@@ -1288,6 +1288,55 @@ credential_access_token() {
     ' 2>/dev/null
 }
 
+# Ask Anthropic directly which account a token belongs to. Unlike
+# oauthAccount.emailAddress in the config file (refreshed asynchronously by
+# the Claude Code CLI, can lag well behind a fresh login), this hits the
+# live endpoint the token itself is valid for — always current.
+fetch_oauth_profile_email() {
+    local access_token="$1"
+    [[ -n "$access_token" ]] || return 1
+
+    local connect_timeout="${CCS_CURL_CONNECT_TIMEOUT:-$DEFAULT_CURL_CONNECT_TIMEOUT}"
+    local max_time="${CCS_CURL_MAX_TIME:-$DEFAULT_CURL_MAX_TIME}"
+    local response http_code body
+    response=$(curl -sS -w "\n%{http_code}" \
+        --connect-timeout "$connect_timeout" \
+        --max-time "$max_time" \
+        -H "Authorization: Bearer $access_token" \
+        -H "anthropic-beta: oauth-2025-04-20" \
+        "https://api.anthropic.com/api/oauth/profile" 2>/dev/null) || return 1
+
+    http_code=$(echo "$response" | tail -n1)
+    body=$(echo "$response" | sed '$d')
+    [[ "$http_code" == "200" ]] || return 1
+
+    echo "$body" | jq -r '.account.email // empty' 2>/dev/null
+}
+
+# Same live endpoint as fetch_oauth_profile_email, but returns the account
+# uuid instead. Kept separate so callers that only need the email (the
+# common case) don't pay for a second field they don't use.
+fetch_oauth_profile_uuid() {
+    local access_token="$1"
+    [[ -n "$access_token" ]] || return 1
+
+    local connect_timeout="${CCS_CURL_CONNECT_TIMEOUT:-$DEFAULT_CURL_CONNECT_TIMEOUT}"
+    local max_time="${CCS_CURL_MAX_TIME:-$DEFAULT_CURL_MAX_TIME}"
+    local response http_code body
+    response=$(curl -sS -w "\n%{http_code}" \
+        --connect-timeout "$connect_timeout" \
+        --max-time "$max_time" \
+        -H "Authorization: Bearer $access_token" \
+        -H "anthropic-beta: oauth-2025-04-20" \
+        "https://api.anthropic.com/api/oauth/profile" 2>/dev/null) || return 1
+
+    http_code=$(echo "$response" | tail -n1)
+    body=$(echo "$response" | sed '$d')
+    [[ "$http_code" == "200" ]] || return 1
+
+    echo "$body" | jq -r '.account.uuid // empty' 2>/dev/null
+}
+
 # Extract refresh token from credentials in either legacy flat format or the
 # current Claude Code nested format.
 credential_refresh_token() {
@@ -2505,21 +2554,22 @@ cmd_add_account() {
     fi
 
     # oauthAccount.emailAddress in the config file is refreshed asynchronously
-    # by the Claude Code CLI itself, not synchronously at login. If the
-    # credentials file (the OAuth token) is newer than the last profile
-    # fetch, the config's email/uuid can still be pointing at the PREVIOUS
-    # account, and we'd stamp the new token under the wrong account entry.
-    local creds_file="$HOME/.claude/.credentials.json"
-    if [[ -f "$creds_file" ]]; then
-        local creds_mtime profile_fetched_ms
-        creds_mtime=$(stat -c %Y "$creds_file" 2>/dev/null || echo 0)
-        profile_fetched_ms=$(jq -r '.oauthAccount.profileFetchedAt // 0' "$(get_claude_config_path)" 2>/dev/null)
-        [[ "$profile_fetched_ms" =~ ^[0-9]+$ ]] || profile_fetched_ms=0
-        if [[ "$creds_mtime" -gt 0 && $(( profile_fetched_ms / 1000 )) -lt "$creds_mtime" ]]; then
-            echo "Error: Claude Code's account profile hasn't refreshed since the last login."
-            echo "Run 'claude' once (any prompt) so it can update its profile info, then retry 'ccs add'."
-            exit 1
-        fi
+    # by the Claude Code CLI itself, not synchronously at login — it can lag
+    # well behind a fresh login and still name the PREVIOUS account. Confirm
+    # against the live OAuth profile endpoint (always current for the token
+    # actually in credentials.json) before trusting it.
+    local live_creds live_token live_email
+    live_creds=$(read_credentials)
+    live_token=$(credential_access_token "$live_creds")
+    live_email=$(fetch_oauth_profile_email "$live_token")
+    if [[ -z "$live_email" ]]; then
+        echo "Error: Could not verify current account via Anthropic's OAuth profile endpoint."
+        echo "Check network connectivity and retry 'ccs add'."
+        exit 1
+    fi
+    if [[ "$live_email" != "$current_email" ]]; then
+        echo "Note: local config's email ($current_email) is stale; using live profile ($live_email)."
+        current_email="$live_email"
     fi
 
     local account_num is_update=0
@@ -2549,9 +2599,11 @@ cmd_add_account() {
         exit 1
     fi
 
-    # Get account UUID
+    # Get account UUID from the same live endpoint used for the email above,
+    # for the same reason: oauthAccount.accountUuid in the config can be stale.
     local account_uuid
-    account_uuid=$(jq -r '.oauthAccount.accountUuid' "$(get_claude_config_path)")
+    account_uuid=$(fetch_oauth_profile_uuid "$live_token")
+    [[ -n "$account_uuid" ]] || account_uuid=$(jq -r '.oauthAccount.accountUuid' "$(get_claude_config_path)")
 
     # Store backups
     write_account_credentials "$account_num" "$current_email" "$current_creds"
