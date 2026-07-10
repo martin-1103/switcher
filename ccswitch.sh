@@ -31,6 +31,25 @@ readonly DEFAULT_CACHE_TTL=60
 readonly DEFAULT_COORD_LEASE_TTL=150
 readonly DEFAULT_CURL_CONNECT_TIMEOUT=3
 readonly DEFAULT_CURL_MAX_TIME=10
+# How long an account whose backup credentials were just found empty/expired
+# is skipped as a switch target. Without this, auto-switch's reclaim path
+# (which — unlike the away-switch loop — has no credential_is_usable
+# pre-check) retries the same dead account every ~10-20s (once per
+# hook/statusline-triggered rate-check), spamming credential-events.log.
+readonly SWITCH_REFUSED_COOLDOWN_S=900
+# Shorter cooldown for a transient coordinator-lookup failure (timeout,
+# coordinator restart) — distinct from a confirmed-dead credential, which
+# can't self-heal by retrying sooner.
+readonly SWITCH_TRANSIENT_COOLDOWN_S=30
+readonly SWITCH_COOLDOWN_DIR="$BACKUP_DIR/.switch-cooldown"
+# Keepalive backoff state: once the OAuth refresh endpoint (POST
+# /v1/oauth/token) returns 429, back off the WHOLE keepalive run (not just
+# that account) since observed 429s rotate across different accounts on this
+# host — proof the limit is shared (client_id/IP), not per-token. Retrying
+# every fixed 15min just wastes calls into a still-blocked window.
+readonly KEEPALIVE_BACKOFF_FILE="$BACKUP_DIR/keepalive-backoff.json"
+readonly KEEPALIVE_BACKOFF_BASE_S=900
+readonly KEEPALIVE_BACKOFF_MAX_S=14400
 
 # Global flags (set during argument parsing)
 DRY_RUN=false
@@ -1482,6 +1501,82 @@ credential_is_usable() {
     [[ "$expires" -eq 0 || "$expires" -gt "$now" ]]
 }
 
+# mkdir-based marker (atomic, same pattern as the switch lock) recording that
+# Account-$1's backup credentials were just found empty/expired. Checked by
+# perform_switch before it even tries, so the reclaim/rate-check retry loop
+# backs off instead of re-attempting a dead account every rate-check tick.
+#
+# Duration is per-marker (stored alongside ts) rather than one fixed constant:
+# a confirmed-dead credential (coordinator reachable, genuinely has nothing)
+# earns the full cooldown, but a transient coordinator lookup failure
+# (connect timeout, coordinator restart) might resolve in seconds — locking
+# that out for 900s same as a confirmed-dead account would block a
+# perfectly healthy multi-host recovery for no reason.
+switch_cooldown_active() {
+    local account_num="$1"
+    local marker="$SWITCH_COOLDOWN_DIR-$account_num"
+    [[ -d "$marker" ]] || return 1
+    local ts now duration
+    ts=$(cat "$marker/ts" 2>/dev/null || echo 0)
+    [[ "$ts" =~ ^[0-9]+$ ]] || ts=0
+    duration=$(cat "$marker/duration" 2>/dev/null || echo "$SWITCH_REFUSED_COOLDOWN_S")
+    [[ "$duration" =~ ^[0-9]+$ ]] || duration=$SWITCH_REFUSED_COOLDOWN_S
+    now=$(date +%s)
+    if (( now - ts >= duration )); then
+        rm -rf "$marker" 2>/dev/null || true
+        return 1
+    fi
+    return 0
+}
+
+mark_switch_cooldown() {
+    local account_num="$1"
+    local duration="${2:-$SWITCH_REFUSED_COOLDOWN_S}"
+    local marker="$SWITCH_COOLDOWN_DIR-$account_num"
+    # Write ts to a temp file and mv into place: a concurrent
+    # switch_cooldown_active() rm -rf'ing a just-expired marker can't observe
+    # the mkdir with a not-yet-written ts (which would read as ts=0 and
+    # immediately expire the cooldown we're trying to set).
+    mkdir -p "$marker" 2>/dev/null || return 0
+    local tmp="$marker/.ts.tmp.$$"
+    date +%s > "$tmp" 2>/dev/null && mv -f "$tmp" "$marker/ts" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+    printf '%s' "$duration" > "$marker/duration" 2>/dev/null || true
+}
+
+clear_switch_cooldown() {
+    local account_num="$1"
+    rm -rf "$SWITCH_COOLDOWN_DIR-$account_num" 2>/dev/null || true
+}
+
+# mkdir-based lock guarding keepalive-backoff.json's read-modify-write.
+# Without it, two overlapping `ccs keepalive` runs (manual invocation racing
+# the timer) can both read lastBackoffS=0 and both write 900 (backoff never
+# escalates), or a run that just succeeded can rm the backoff file right
+# after a still-blocked run wrote a fresh one (undoing the backoff entirely).
+KEEPALIVE_BACKOFF_LOCK_DIR="$BACKUP_DIR/.keepalive-backoff.lock"
+acquire_keepalive_backoff_lock() {
+    local timeout_s="${1:-5}"
+    local max_iters=$(( timeout_s * 5 ))
+    local i=0
+    mkdir -p "$BACKUP_DIR" 2>/dev/null || true
+    while ! mkdir "$KEEPALIVE_BACKOFF_LOCK_DIR" 2>/dev/null; do
+        local owner=""
+        owner=$(cat "$KEEPALIVE_BACKOFF_LOCK_DIR/pid" 2>/dev/null || true)
+        if [[ -n "$owner" ]] && ! kill -0 "$owner" 2>/dev/null; then
+            rm -rf "$KEEPALIVE_BACKOFF_LOCK_DIR" 2>/dev/null || true
+            continue
+        fi
+        i=$(( i + 1 ))
+        [[ "$i" -ge "$max_iters" ]] && return 1
+        sleep 0.2
+    done
+    echo "$$" > "$KEEPALIVE_BACKOFF_LOCK_DIR/pid" 2>/dev/null || true
+    return 0
+}
+release_keepalive_backoff_lock() {
+    rm -rf "$KEEPALIVE_BACKOFF_LOCK_DIR" 2>/dev/null || true
+}
+
 mark_account_auth_invalid() {
     local account_num="$1"
     local reason="$2"
@@ -1618,6 +1713,27 @@ cmd_keepalive() {
 
     local now_epoch
     now_epoch=$(date +%s)
+
+    # Global backoff gate: a 429 on ANY account in a prior run means the whole
+    # bucket (client_id/IP-shared, per observed rotation across accounts
+    # 13/16/17/12) is blocked, not just that one token. Skip the entire run
+    # until next_allowed_epoch instead of burning calls into a still-blocked
+    # window every fixed 15min. Locked so an overlapping run (manual `ccs
+    # keepalive` racing the timer) can't read a stale value mid-write by
+    # another run.
+    acquire_keepalive_backoff_lock 5 || true
+    trap 'release_keepalive_backoff_lock' RETURN
+    if [[ -f "$KEEPALIVE_BACKOFF_FILE" ]]; then
+        local backoff_next
+        backoff_next=$(jq -r '.nextAllowedEpoch // 0' "$KEEPALIVE_BACKOFF_FILE" 2>/dev/null || echo 0)
+        [[ "$backoff_next" =~ ^[0-9]+$ ]] || backoff_next=0
+        if (( now_epoch < backoff_next )); then
+            echo "Skipped entire run: refresh endpoint backoff active until $(date -u -d "@$backoff_next" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "$backoff_next")"
+            return 0
+        fi
+    fi
+    release_keepalive_backoff_lock
+
     local nums
     nums=$(jq -r '.accounts | keys[]' "$SEQUENCE_FILE" 2>/dev/null)
 
@@ -1660,9 +1776,27 @@ cmd_keepalive() {
             write_json "$SEQUENCE_FILE" "$seq"
             log_credential_event "keepalive Account-$num ($email): refreshed"
             echo "Account-$num ($email): refreshed"
+            acquire_keepalive_backoff_lock 5 || true
+            rm -f "$KEEPALIVE_BACKOFF_FILE" 2>/dev/null || true
+            release_keepalive_backoff_lock
         elif [[ "$refresh_status" -eq 2 ]]; then
-            log_credential_event "keepalive Account-$num ($email): refresh endpoint rate-limited (429), retry next run"
-            echo "Account-$num ($email): refresh endpoint rate-limited (429), retry next run"
+            local prev_backoff next_backoff next_allowed
+            acquire_keepalive_backoff_lock 5 || true
+            prev_backoff=$(jq -r '.lastBackoffS // 0' "$KEEPALIVE_BACKOFF_FILE" 2>/dev/null || echo 0)
+            [[ "$prev_backoff" =~ ^[0-9]+$ ]] || prev_backoff=0
+            if (( prev_backoff <= 0 )); then
+                next_backoff=$KEEPALIVE_BACKOFF_BASE_S
+            else
+                next_backoff=$(( prev_backoff * 2 ))
+                (( next_backoff > KEEPALIVE_BACKOFF_MAX_S )) && next_backoff=$KEEPALIVE_BACKOFF_MAX_S
+            fi
+            next_allowed=$(( now_epoch + next_backoff ))
+            jq -n --argjson n "$next_allowed" --argjson b "$next_backoff" \
+                '{nextAllowedEpoch: $n, lastBackoffS: $b}' > "$KEEPALIVE_BACKOFF_FILE" 2>/dev/null || true
+            release_keepalive_backoff_lock
+            log_credential_event "keepalive Account-$num ($email): refresh endpoint rate-limited (429), backing off ${next_backoff}s, aborting run"
+            echo "Account-$num ($email): refresh endpoint rate-limited (429), backing off ${next_backoff}s, aborting run"
+            break
         elif [[ "$refresh_status" -eq 3 ]]; then
             log_credential_event "keepalive Account-$num ($email): refresh_token rejected (invalid_grant, likely dead)"
             echo "Account-$num ($email): refresh_token rejected (invalid_grant, likely dead)"
@@ -1717,6 +1851,14 @@ coord_publish_credential() {
 # Pull a credential from the coordinator's encrypted store. Returns the same
 # shape as read_account_credentials (a claudeAiOauth-wrapped JSON blob) so
 # callers can feed it straight into credential_is_usable/write_credentials.
+# Exit codes distinguish WHY no usable credential came back, so callers can
+# tell a transient lookup failure (worth a short cooldown / quick retry) from
+# a confirmed "no coordinator" or "coordinator has nothing" (worth the full
+# cooldown — retrying immediately can't possibly help):
+#   0 = success, credential on stdout
+#   1 = no coordinator configured/reachable-config (confirmed, not transient)
+#   2 = network/timeout talking to the coordinator (transient)
+#   3 = coordinator responded but with no usable credential (confirmed)
 coord_fetch_credential() {
     local email="$1"
     coord_http_ready || return 1
@@ -1727,12 +1869,12 @@ coord_fetch_credential() {
         --connect-timeout "${CCS_CURL_CONNECT_TIMEOUT:-$DEFAULT_CURL_CONNECT_TIMEOUT}" \
         --max-time "${CCS_CURL_MAX_TIME:-$DEFAULT_CURL_MAX_TIME}" \
         -H "Authorization: Bearer $token" \
-        "$url" 2>/dev/null) || return 1
+        "$url" 2>/dev/null) || return 2
     http_code=$(echo "$response" | tail -n1)
     payload=$(echo "$response" | sed '$d')
-    [[ "$http_code" == "200" ]] || return 1
+    [[ "$http_code" == "200" ]] || return 3
     jq -n --argjson r "$payload" \
-        '{claudeAiOauth: {accessToken: $r.accessToken, refreshToken: $r.refreshToken, expiresAt: $r.expiresAt}}' 2>/dev/null || return 1
+        '{claudeAiOauth: {accessToken: $r.accessToken, refreshToken: $r.refreshToken, expiresAt: $r.expiresAt}}' 2>/dev/null || return 3
 }
 
 # Read account credentials from backup
@@ -2963,6 +3105,16 @@ perform_switch() {
     target_email=$(jq -r --arg num "$target_account" '.accounts[$num].email' "$SEQUENCE_FILE")
     current_email=$(get_current_account)
 
+    # Auto-switch (reclaim/rate-check) retries every ~10-20s on each
+    # hook/statusline-triggered tick; a target just refused for empty/expired
+    # backup creds is skipped for a cooldown window instead of re-attempting
+    # immediately. Manual switches (`ccs to`) always bypass this — the user is
+    # explicitly acting, e.g. right after re-logging into that account.
+    if [[ "$switch_reason" == "auto" ]] && switch_cooldown_active "$target_account"; then
+        echo "Error: Account-$target_account ($target_email) in switch cooldown (recently refused, empty/expired backup)." >&2
+        exit 1
+    fi
+
     # Dry-run mode: show what would happen and return
     if [[ "$DRY_RUN" == true ]]; then
         echo "[DRY RUN] Would switch from Account-$current_account ($current_email) to Account-$target_account ($target_email)"
@@ -3066,17 +3218,33 @@ perform_switch() {
         exit 1
     fi
 
+    # Local backup is usable outright (e.g. keepalive refreshed it, or the
+    # user re-logged in and a fresh backup was written since the account was
+    # last marked in cooldown) — clear any stale marker so reclaim isn't
+    # blocked from switching back to a now-healthy account.
+    credential_is_usable "$target_creds" && clear_switch_cooldown "$target_account"
+
     if ! credential_is_usable "$target_creds"; then
         # Local backup is dead — try the coordinator before giving up; another
         # host may hold a fresher copy of this account's token.
-        local coord_creds
-        coord_creds=$(coord_fetch_credential "$target_email" 2>/dev/null || true)
+        local coord_creds coord_rc
+        coord_creds=$(coord_fetch_credential "$target_email" 2>/dev/null) && coord_rc=0 || coord_rc=$?
         if [[ -n "$coord_creds" ]] && credential_is_usable "$coord_creds"; then
             log_credential_event "recovered Account-$target_account ($target_email) backup from coordinator (caller=perform_switch)"
             target_creds="$coord_creds"
             write_account_credentials "$target_account" "$target_email" "$target_creds" >/dev/null 2>&1 || true
+            clear_switch_cooldown "$target_account"
         else
             log_credential_event "refused to switch to Account-$target_account ($target_email): backup credentials are empty/expired (caller=perform_switch)"
+            # Exit code 2 = transient coordinator lookup failure (timeout,
+            # coordinator restart) — could self-heal in seconds, so cooldown
+            # is short. 0/1/3 = confirmed no usable credential anywhere;
+            # earns the full cooldown since retrying immediately can't help.
+            if [[ "$coord_rc" -eq 2 ]]; then
+                mark_switch_cooldown "$target_account" "$SWITCH_TRANSIENT_COOLDOWN_S"
+            else
+                mark_switch_cooldown "$target_account"
+            fi
             echo "Error: Account-$target_account ($target_email) has empty/expired backup credentials. Re-login to that account first (ccs to $target_account after logging in), then retry." >&2
             rollback
             exit 1
@@ -3441,7 +3609,7 @@ cmd_rate_check() {
         if [[ -n "$starting_account" && "$starting_account" != "null" ]]; then
             reclaim_target=$(should_reclaim_to_preferred_account "$starting_account" "$active_5h" 2>/dev/null || true)
         fi
-        if [[ "$auto_switch" == true && -n "$reclaim_target" ]]; then
+        if [[ "$auto_switch" == true && -n "$reclaim_target" ]] && ! switch_cooldown_active "$reclaim_target"; then
             local reclaim_email
             reclaim_email=$(jq -r --arg num "$reclaim_target" '.accounts[$num].email // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
             log_switch_event "reclaim: Account-$starting_account -> Account-$reclaim_target ($reclaim_email) active5h=${active_5h}%"
