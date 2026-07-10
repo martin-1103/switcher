@@ -1493,7 +1493,7 @@ cmd_keepalive() {
         fi
 
         creds=$(read_account_credentials "$num" "$email")
-        if ! credential_is_usable "$creds"; then
+        if [[ -z "$(credential_access_token "$creds")" ]]; then
             log_credential_event "keepalive Account-$num ($email): skipped, no usable local credential"
             echo "Account-$num ($email): skipped, no usable local credential"
             continue
