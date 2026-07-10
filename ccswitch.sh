@@ -1399,7 +1399,16 @@ update_credential_tokens() {
 }
 
 # Call the OAuth refresh endpoint directly for one credential blob (no usage
-# API call first). Returns the updated credentials JSON on stdout, or fails.
+# API call first). Returns the updated credentials JSON on stdout on success.
+# Exit codes distinguish WHY it failed, since "no new token" alone conflates a
+# dead refresh_token with the endpoint's own rate limit:
+#   0 = success
+#   1 = no refresh_token to use (setup-token account, or malformed creds)
+#   2 = 429 from the refresh endpoint itself — transient, NOT proof the token
+#       is dead; retry on a later keepalive run
+#   3 = definitive rejection (4xx other than 429, e.g. invalid_grant) — the
+#       refresh_token is actually dead
+#   4 = network/other failure (timeout, 5xx, malformed response) — transient
 refresh_credential_tokens() {
     local creds="$1"
     local connect_timeout="${CCS_CURL_CONNECT_TIMEOUT:-$DEFAULT_CURL_CONNECT_TIMEOUT}"
@@ -1418,14 +1427,18 @@ refresh_credential_tokens() {
         --data-urlencode "grant_type=refresh_token" \
         --data-urlencode "refresh_token=$refresh_token" \
         --data-urlencode "client_id=$client_id" \
-        "https://platform.claude.com/v1/oauth/token" 2>/dev/null) || return 1
+        "https://platform.claude.com/v1/oauth/token" 2>/dev/null) || return 4
     refresh_code=$(echo "$refresh_response" | tail -n1)
     refresh_body=$(echo "$refresh_response" | sed '$d')
-    [[ "$refresh_code" == "200" ]] || return 1
+    if [[ "$refresh_code" != "200" ]]; then
+        [[ "$refresh_code" == "429" ]] && return 2
+        [[ "$refresh_code" =~ ^4[0-9][0-9]$ ]] && return 3
+        return 4
+    fi
 
     new_access=$(echo "$refresh_body" | jq -r '.access_token // empty' 2>/dev/null)
     new_refresh=$(echo "$refresh_body" | jq -r '.refresh_token // empty' 2>/dev/null)
-    [[ -n "$new_access" ]] || return 1
+    [[ -n "$new_access" ]] || return 4
 
     update_credential_tokens "$creds" "$new_access" "${new_refresh:-$refresh_token}"
 }
@@ -1468,7 +1481,7 @@ cmd_keepalive() {
     local nums
     nums=$(jq -r '.accounts | keys[]' "$SEQUENCE_FILE" 2>/dev/null)
 
-    local num email creds last_refresh updated_creds expires_at
+    local num email creds last_refresh updated_creds expires_at refresh_status
     for num in $nums; do
         email=$(jq -r --arg num "$num" '.accounts[$num].email // empty' "$SEQUENCE_FILE")
         [[ -n "$email" ]] || continue
@@ -1497,7 +1510,8 @@ cmd_keepalive() {
             continue
         fi
 
-        if updated_creds=$(refresh_credential_tokens "$creds") && credential_is_usable "$updated_creds"; then
+        updated_creds=$(refresh_credential_tokens "$creds") && refresh_status=0 || refresh_status=$?
+        if [[ "$refresh_status" -eq 0 ]] && credential_is_usable "$updated_creds"; then
             write_account_credentials "$num" "$email" "$updated_creds"
             write_account_credentials_if_active "$email" "$updated_creds"
             coord_publish_credential "$email" "$updated_creds"
@@ -1506,9 +1520,15 @@ cmd_keepalive() {
             write_json "$SEQUENCE_FILE" "$seq"
             log_credential_event "keepalive Account-$num ($email): refreshed"
             echo "Account-$num ($email): refreshed"
+        elif [[ "$refresh_status" -eq 2 ]]; then
+            log_credential_event "keepalive Account-$num ($email): refresh endpoint rate-limited (429), retry next run"
+            echo "Account-$num ($email): refresh endpoint rate-limited (429), retry next run"
+        elif [[ "$refresh_status" -eq 3 ]]; then
+            log_credential_event "keepalive Account-$num ($email): refresh_token rejected (invalid_grant, likely dead)"
+            echo "Account-$num ($email): refresh_token rejected (invalid_grant, likely dead)"
         else
-            log_credential_event "keepalive Account-$num ($email): refresh failed (refresh_token likely dead)"
-            echo "Account-$num ($email): refresh failed (refresh_token likely dead)"
+            log_credential_event "keepalive Account-$num ($email): refresh failed (network/transient error)"
+            echo "Account-$num ($email): refresh failed (network/transient error)"
         fi
     done
 }
