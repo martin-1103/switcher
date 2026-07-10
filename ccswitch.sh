@@ -2504,6 +2504,24 @@ cmd_add_account() {
         exit 1
     fi
 
+    # oauthAccount.emailAddress in the config file is refreshed asynchronously
+    # by the Claude Code CLI itself, not synchronously at login. If the
+    # credentials file (the OAuth token) is newer than the last profile
+    # fetch, the config's email/uuid can still be pointing at the PREVIOUS
+    # account, and we'd stamp the new token under the wrong account entry.
+    local creds_file="$HOME/.claude/.credentials.json"
+    if [[ -f "$creds_file" ]]; then
+        local creds_mtime profile_fetched_ms
+        creds_mtime=$(stat -c %Y "$creds_file" 2>/dev/null || echo 0)
+        profile_fetched_ms=$(jq -r '.oauthAccount.profileFetchedAt // 0' "$(get_claude_config_path)" 2>/dev/null)
+        [[ "$profile_fetched_ms" =~ ^[0-9]+$ ]] || profile_fetched_ms=0
+        if [[ "$creds_mtime" -gt 0 && $(( profile_fetched_ms / 1000 )) -lt "$creds_mtime" ]]; then
+            echo "Error: Claude Code's account profile hasn't refreshed since the last login."
+            echo "Run 'claude' once (any prompt) so it can update its profile info, then retry 'ccs add'."
+            exit 1
+        fi
+    fi
+
     local account_num is_update=0
     if account_exists "$current_email"; then
         account_num=$(resolve_account_identifier "$current_email")
