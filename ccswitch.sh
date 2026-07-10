@@ -1230,22 +1230,82 @@ wait_for_claude_close() {
     echo "Claude Code closed. Continuing..."
 }
 
-# Get current account info from .claude.json
+# Get current account's email — the email tied to whatever access token is
+# actually in credentials.json right now, not .claude.json's oauthAccount
+# (which the Claude Code CLI refreshes asynchronously and can lag well
+# behind a fresh login/switch, see git log "live OAuth profile endpoint").
+#
+# Cached by token hash: sha256(access_token) -> {email, ts}. A token change
+# (new login/switch) is an instant cache miss regardless of TTL; the same
+# token always hits cache, so a hot path like the PreToolUse hook or
+# statusline (called on every tool call / every few seconds) does zero
+# network calls between logins. On miss, resolves via the live
+# /api/oauth/profile endpoint once and persists the result.
+readonly EMAIL_CACHE_FILE="$BACKUP_DIR/token-email-cache.json"
+readonly EMAIL_CACHE_LOCK="$BACKUP_DIR/.email-cache.lock"
+readonly EMAIL_CACHE_MAX_ENTRIES=20
+readonly EMAIL_CACHE_MAX_AGE_S=$((30 * 86400))
+readonly EMAIL_CACHE_NEGATIVE_TTL_S=60
+
 # ===== ACCOUNT RESOLUTION / CREDENTIALS =====
 get_current_account() {
-    if [[ ! -f "$(get_claude_config_path)" ]]; then
+    local creds token token_hash
+    creds=$(read_credentials)
+    token=$(credential_access_token "$creds")
+    if [[ -z "$token" ]]; then
         echo "none"
         return
     fi
+    token_hash=$(printf '%s' "$token" | sha256sum | cut -d' ' -f1)
 
-    if ! validate_json "$(get_claude_config_path)"; then
-        echo "none"
-        return
+    local cached_email cached_ts now
+    now=$(date +%s)
+    if [[ -f "$EMAIL_CACHE_FILE" ]]; then
+        cached_email=$(jq -r --arg h "$token_hash" '.[$h].email // empty' "$EMAIL_CACHE_FILE" 2>/dev/null)
+        cached_ts=$(jq -r --arg h "$token_hash" '.[$h].ts // empty' "$EMAIL_CACHE_FILE" 2>/dev/null)
+        if [[ -n "$cached_email" && "$cached_email" != "error" ]]; then
+            echo "$cached_email"
+            return
+        fi
+        # Negative cache entry (a prior fetch failure) — only skip re-fetching
+        # within its short TTL, so a real outage doesn't hammer the endpoint
+        # on every tool call, but a transient blip clears itself quickly.
+        if [[ "$cached_email" == "error" && -n "$cached_ts" && $(( now - cached_ts )) -lt "$EMAIL_CACHE_NEGATIVE_TTL_S" ]]; then
+            echo "none"
+            return
+        fi
     fi
 
-    local email
-    email=$(jq -r '.oauthAccount.emailAddress // empty' "$(get_claude_config_path)" 2>/dev/null)
-    echo "${email:-none}"
+    # Cache miss (new token or expired negative entry): resolve live, once.
+    # Single-flight via a short-timeout lock — under a thundering herd (hook +
+    # statusline + multiple sessions missing at once) only the lock holder
+    # hits the network; everyone else falls back to whatever's cached/none
+    # rather than piling on parallel requests to the same endpoint.
+    local resolved_email="none"
+    if mkdir "$EMAIL_CACHE_LOCK" 2>/dev/null; then
+        # Guard against `set -e` aborting mid-function on a nonzero-returning
+        # command substitution (fetch fails on a bad/expired token) — that
+        # would skip the rmdir below and leave the lock stuck forever, which
+        # is exactly what a first draft of this function did.
+        trap 'rmdir "$EMAIL_CACHE_LOCK" 2>/dev/null' RETURN
+        resolved_email=$(fetch_oauth_profile_email "$token") || resolved_email=""
+        local entry_email="${resolved_email:-error}"
+        [[ -f "$EMAIL_CACHE_FILE" ]] && validate_json "$EMAIL_CACHE_FILE" || echo '{}' > "$EMAIL_CACHE_FILE"
+        local tmp="$EMAIL_CACHE_FILE.tmp.$$"
+        jq --arg h "$token_hash" --arg email "$entry_email" --argjson ts "$now" \
+           --argjson maxage "$EMAIL_CACHE_MAX_AGE_S" --argjson maxn "$EMAIL_CACHE_MAX_ENTRIES" '
+            . + {($h): {email: $email, ts: $ts}}
+            | to_entries
+            | map(select(.value.ts > ($ts - $maxage)))
+            | sort_by(-.value.ts)
+            | .[0:$maxn]
+            | from_entries
+        ' "$EMAIL_CACHE_FILE" > "$tmp" 2>/dev/null \
+            && mv "$tmp" "$EMAIL_CACHE_FILE" 2>/dev/null
+        rm -f "$tmp" 2>/dev/null
+        [[ -n "$resolved_email" ]] && { echo "$resolved_email"; return; }
+    fi
+    echo "${resolved_email:-none}"
 }
 
 # Usage cache keyed per-account-email so a stale/wrong-scope fetch for one
@@ -2545,31 +2605,15 @@ cmd_add_account() {
     setup_directories
     init_sequence_file
 
+    # get_current_account() resolves against the live OAuth profile endpoint
+    # on a token-hash cache miss (e.g. right after a fresh login/switch), so
+    # this is never .claude.json's stale oauthAccount.emailAddress.
     local current_email
     current_email=$(get_current_account)
 
     if [[ "$current_email" == "none" ]]; then
         echo "Error: No active Claude account found. Please log in first."
         exit 1
-    fi
-
-    # oauthAccount.emailAddress in the config file is refreshed asynchronously
-    # by the Claude Code CLI itself, not synchronously at login — it can lag
-    # well behind a fresh login and still name the PREVIOUS account. Confirm
-    # against the live OAuth profile endpoint (always current for the token
-    # actually in credentials.json) before trusting it.
-    local live_creds live_token live_email
-    live_creds=$(read_credentials)
-    live_token=$(credential_access_token "$live_creds")
-    live_email=$(fetch_oauth_profile_email "$live_token")
-    if [[ -z "$live_email" ]]; then
-        echo "Error: Could not verify current account via Anthropic's OAuth profile endpoint."
-        echo "Check network connectivity and retry 'ccs add'."
-        exit 1
-    fi
-    if [[ "$live_email" != "$current_email" ]]; then
-        echo "Note: local config's email ($current_email) is stale; using live profile ($live_email)."
-        current_email="$live_email"
     fi
 
     local account_num is_update=0
@@ -2599,10 +2643,10 @@ cmd_add_account() {
         exit 1
     fi
 
-    # Get account UUID from the same live endpoint used for the email above,
-    # for the same reason: oauthAccount.accountUuid in the config can be stale.
+    # Get account UUID from the live endpoint (oauthAccount.accountUuid in
+    # the config can be stale for the same reason the email can be).
     local account_uuid
-    account_uuid=$(fetch_oauth_profile_uuid "$live_token")
+    account_uuid=$(fetch_oauth_profile_uuid "$(credential_access_token "$current_creds")")
     [[ -n "$account_uuid" ]] || account_uuid=$(jq -r '.oauthAccount.accountUuid' "$(get_claude_config_path)")
 
     # Store backups
