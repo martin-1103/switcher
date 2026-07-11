@@ -461,11 +461,36 @@ coord_pull_accounts() {
     emails=$(echo "$leases_json" | jq -r '.leases[]?.email // empty' 2>/dev/null) || return 0
     [[ -n "$emails" ]] || return 0
 
-    local imported=0
-    local email creds account_num
+    local imported=0 backfilled=0
+    local email creds account_num existing_num existing_creds
     while IFS= read -r email; do
         [[ -n "$email" ]] || continue
-        account_exists "$email" && continue
+
+        if account_exists "$email"; then
+            # Mapping already exists locally — but a prior buggy import could
+            # have written the number/email pair without ever writing the
+            # credential file (coord_pull_accounts used to do exactly this).
+            # read_account_credentials returns empty for a missing file, so
+            # credential_is_usable correctly reports it as unusable; back it
+            # fill from the coordinator instead of leaving it permanently
+            # dead, but never touch the number/mapping itself.
+            existing_num=$(resolve_account_identifier "$email")
+            existing_creds=$(read_account_credentials "$existing_num" "$email")
+            credential_is_usable "$existing_creds" && continue
+
+            creds=$(coord_fetch_credential "$email" 2>/dev/null) || continue
+            [[ -n "$creds" ]] || continue
+            credential_is_usable "$creds" || continue
+
+            if ! acquire_switch_lock 2; then
+                continue
+            fi
+            write_account_credentials "$existing_num" "$email" "$creds"
+            release_switch_lock
+            backfilled=$((backfilled + 1))
+            echo "  Backfilled credential for Account $existing_num: $email (from coordinator)"
+            continue
+        fi
 
         creds=$(coord_fetch_credential "$email" 2>/dev/null) || continue
         [[ -n "$creds" ]] || continue
@@ -488,7 +513,7 @@ coord_pull_accounts() {
         echo "  Imported Account $account_num: $email (from coordinator)"
     done <<< "$emails"
 
-    [[ "$imported" -gt 0 ]] && echo "coord_pull_accounts: imported=$imported"
+    [[ "$imported" -gt 0 || "$backfilled" -gt 0 ]] && echo "coord_pull_accounts: imported=$imported backfilled=$backfilled"
     return 0
 }
 
