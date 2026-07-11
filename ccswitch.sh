@@ -3028,12 +3028,19 @@ cmd_list() {
 
     while IFS='|' read -r num email profile account_type; do
         [[ -z "$num" ]] && continue
-        local prof="" type="" active="" usage_line reset_line
+        local prof="" type="" active="" usage_line reset_line status_tag creds
         [[ -n "$profile" ]] && prof=" [$profile]"
         [[ -n "$account_type" ]] && type=" {$account_type}"
         [[ "$num" == "$active_account_num" ]] && active=" (active)"
 
-        echo "  ${num}: ${email}${prof}${type}${active}"
+        creds=$(read_account_credentials "$num" "$email")
+        if credential_is_usable "$creds"; then
+            status_tag="[OK]     "
+        else
+            status_tag="[EXPIRED]"
+        fi
+
+        echo "  ${status_tag} ${num}: ${email}${prof}${type}${active}"
 
         usage_line=$(format_usage_snapshot "$num" "$email")
         reset_line=$(format_usage_resets_snapshot "$num")
