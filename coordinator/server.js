@@ -304,6 +304,7 @@ const server = http.createServer(async (req, res) => {
       const accessToken = String(body.accessToken || '');
       const refreshToken = String(body.refreshToken || '');
       const expiresAt = Number(body.expiresAt || 0);
+      const scopes = Array.isArray(body.scopes) ? body.scopes : [];
       if (!email || !accessToken || !refreshToken) {
         return send(res, 400, { error: 'email, accessToken, refreshToken required' });
       }
@@ -320,7 +321,7 @@ const server = http.createServer(async (req, res) => {
           return send(res, 200, { ok: true, accepted: false, reason: 'existing credential is fresher or equal' });
         }
       }
-      fresh.credentials[email] = encryptCredential({ accessToken, refreshToken, expiresAt, updatedAt: now });
+      fresh.credentials[email] = encryptCredential({ accessToken, refreshToken, expiresAt, scopes, updatedAt: now });
       saveState(fresh);
       return send(res, 200, { ok: true, accepted: true });
     }

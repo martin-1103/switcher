@@ -1917,14 +1917,15 @@ coord_publish_credential() {
     local email="$1"
     local creds="$2"
     coord_http_ready || return 0
-    local access_token refresh_token expires_at
+    local access_token refresh_token expires_at scopes
     access_token=$(credential_access_token "$creds")
     refresh_token=$(credential_refresh_token "$creds")
     expires_at=$(echo "$creds" | jq -r '.expires_at // .claudeAiOauth.expiresAt // 0' 2>/dev/null || echo 0)
+    scopes=$(echo "$creds" | jq -c '.scopes // .claudeAiOauth.scopes // []' 2>/dev/null || echo '[]')
     [[ -n "$access_token" && -n "$refresh_token" ]] || return 0
     local payload
-    payload=$(jq -n --arg email "$email" --arg at "$access_token" --arg rt "$refresh_token" --argjson exp "${expires_at:-0}" \
-        '{email: $email, accessToken: $at, refreshToken: $rt, expiresAt: $exp}')
+    payload=$(jq -n --arg email "$email" --arg at "$access_token" --arg rt "$refresh_token" --argjson exp "${expires_at:-0}" --argjson sc "$scopes" \
+        '{email: $email, accessToken: $at, refreshToken: $rt, expiresAt: $exp, scopes: $sc}')
     coord_http_request POST "/v1/credentials/publish" "$payload" >/dev/null 2>&1 || true
 }
 
@@ -1954,7 +1955,7 @@ coord_fetch_credential() {
     payload=$(echo "$response" | sed '$d')
     [[ "$http_code" == "200" ]] || return 3
     jq -n --argjson r "$payload" \
-        '{claudeAiOauth: {accessToken: $r.accessToken, refreshToken: $r.refreshToken, expiresAt: $r.expiresAt}}' 2>/dev/null || return 3
+        '{claudeAiOauth: {accessToken: $r.accessToken, refreshToken: $r.refreshToken, expiresAt: $r.expiresAt, scopes: ($r.scopes // [])}}' 2>/dev/null || return 3
 }
 
 # Pull the active account's credential from the coordinator into the LIVE
