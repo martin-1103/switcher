@@ -453,7 +453,10 @@ coord_pull_accounts() {
 
     local pairs
     pairs=$(echo "$leases_json" | jq -r '
-        [.leases[]? | .email as $email | .holders[]? | select(.accountNumber != null) | {email: $email, num: .accountNumber}]
+        [.leases[]? | .email as $email | (
+            (.holders[]? | select(.accountNumber != null) | {email: $email, num: .accountNumber}),
+            (select(.latestSnapshot.accountNumber != null) | {email: $email, num: .latestSnapshot.accountNumber})
+        )]
         | unique_by(.num, .email) | .[] | "\(.num)\t\(.email)"
     ' 2>/dev/null) || return 0
     [[ -n "$pairs" ]] || return 0
@@ -462,6 +465,13 @@ coord_pull_accounts() {
     local num email local_email
     while IFS=$'\t' read -r num email; do
         [[ -n "$num" && -n "$email" ]] || continue
+
+        # Email already mapped to SOME local number (possibly a different one
+        # than the coordinator's) — importing under a second number would
+        # duplicate the account locally. Skip; existing local numbering wins.
+        if account_exists "$email"; then
+            continue
+        fi
 
         local_email=$(jq -r --arg num "$num" '.accounts[$num].email // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
 

@@ -193,6 +193,8 @@ function flattenLease(email, lease, usageSnapshot) {
     leaseExpiresAt: holders.length ? Math.max(...holders.map(h => Number(h.leaseExpiresAt || 0)), 0) : 0,
     updatedAt: Number(source.updatedAt || 0),
     latestSnapshot: {
+      accountNumber: Number(source.accountNumber || 0) || null,
+      serverId: source.serverId || null,
       activeLimit: Number(source.activeLimit || 0),
       fiveHour: Number(source.fiveHour || 0),
       sevenDay: Number(source.sevenDay || 0),
