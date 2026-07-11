@@ -437,6 +437,58 @@ REPLACE INTO account_leases (
 " >/dev/null 2>&1 || true
 }
 
+# Import account-number/email mappings from the coordinator's lease list into
+# this host's sequence.json. Fills only empty local slots; a slot already
+# mapped to a DIFFERENT email is left untouched and reported as a conflict —
+# account numbers are assigned locally with no cross-host awareness
+# (get_next_account_number), so two hosts can independently pick the same
+# number for different accounts. This makes existing hosts converge without
+# silently overwriting one side.
+coord_pull_accounts() {
+    coord_http_ready || return 0
+
+    local leases_json
+    leases_json=$(coord_http_request GET "/v1/leases" 2>/dev/null) || return 0
+    [[ -n "$leases_json" ]] || return 0
+
+    local pairs
+    pairs=$(echo "$leases_json" | jq -r '
+        [.leases[]? | .email as $email | .holders[]? | select(.accountNumber != null) | {email: $email, num: .accountNumber}]
+        | unique_by(.num, .email) | .[] | "\(.num)\t\(.email)"
+    ' 2>/dev/null) || return 0
+    [[ -n "$pairs" ]] || return 0
+
+    local imported=0 conflicts=0
+    local num email local_email
+    while IFS=$'\t' read -r num email; do
+        [[ -n "$num" && -n "$email" ]] || continue
+
+        local_email=$(jq -r --arg num "$num" '.accounts[$num].email // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
+
+        if [[ -z "$local_email" ]]; then
+            if ! acquire_switch_lock 2; then
+                continue
+            fi
+            local updated
+            updated=$(jq --arg num "$num" --arg email "$email" --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+                .accounts[$num] = (.accounts[$num] // {}) + {email: $email, added: $now, importedFromCoordinator: true} |
+                .sequence = ((.sequence // []) + [$num | tonumber] | unique) |
+                .lastUpdated = $now
+            ' "$SEQUENCE_FILE")
+            write_json "$SEQUENCE_FILE" "$updated"
+            release_switch_lock
+            imported=$((imported + 1))
+            echo "  Imported Account $num: $email (from coordinator)"
+        elif [[ "$local_email" != "$email" ]]; then
+            conflicts=$((conflicts + 1))
+            echo "  Conflict: Account $num is '$local_email' locally but '$email' on coordinator — skipped, resolve manually"
+        fi
+    done <<< "$pairs"
+
+    [[ "$imported" -gt 0 || "$conflicts" -gt 0 ]] && echo "coord_pull_accounts: imported=$imported conflicts=$conflicts"
+    return 0
+}
+
 # Try to atomically claim an account before switching to it, so two servers can
 # never converge on the same account (closes the TOCTOU race between reading
 # lease state and switching). Talks to the coordinator directly instead of
@@ -1877,6 +1929,58 @@ coord_fetch_credential() {
         '{claudeAiOauth: {accessToken: $r.accessToken, refreshToken: $r.refreshToken, expiresAt: $r.expiresAt}}' 2>/dev/null || return 3
 }
 
+# Pull the active account's credential from the coordinator into the LIVE
+# session (~/.claude/.credentials.json) when the coordinator's copy is
+# strictly fresher than what's running locally. This is the mirror of
+# sync_active_credentials_to_backup (which pushes local->coordinator).
+#
+# Why this matters: Anthropic's OAuth refresh_token is single-use/rotating —
+# whichever host refreshes an account first invalidates every other host's
+# copy of that refresh_token. We can't gate Claude Code's own silent refresh
+# (it's the `claude` binary's internal logic, not ours), so the only lever we
+# have is shrinking how long a losing host keeps using its now-dead
+# refresh_token. Piggybacked on cmd_rate_check same as the push direction —
+# already polled every ~10s via statusline/hook, no new timer.
+pull_coordinator_credentials_if_fresher() {
+    local active_num active_email live_creds live_expires coord_creds coord_expires
+    active_num=$(jq -r '.activeAccountNumber // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
+    [[ -n "$active_num" && "$active_num" != "null" ]] || return 0
+    active_email=$(jq -r --arg num "$active_num" '.accounts[$num].email // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
+    [[ -n "$active_email" ]] || return 0
+
+    # Guard against a stale/mismatched activeAccountNumber, same as the push
+    # direction: only pull if the live credentials really do belong to this
+    # account.
+    [[ "$(get_current_account)" == "$active_email" ]] || return 0
+
+    coord_creds=$(coord_fetch_credential "$active_email" 2>/dev/null) || return 0
+    [[ -n "$coord_creds" ]] || return 0
+    credential_is_usable "$coord_creds" || return 0
+
+    live_creds=$(read_credentials)
+    live_expires=$(credential_expires_epoch "$live_creds")
+    coord_expires=$(credential_expires_epoch "$coord_creds")
+
+    # Strictly fresher only — never pull an equal-or-older copy. Guards the
+    # symmetric case: a host that just refreshed locally must not have its
+    # own just-published token immediately overwritten by its own stale read.
+    (( coord_expires > live_expires )) || return 0
+
+    if ! acquire_switch_lock 2; then
+        return 0
+    fi
+    write_credentials "$coord_creds"
+    write_account_credentials "$active_num" "$active_email" "$coord_creds"
+    release_switch_lock
+
+    local live_token coord_token old_hash new_hash
+    live_token=$(credential_access_token "$live_creds")
+    coord_token=$(credential_access_token "$coord_creds")
+    old_hash=$(printf '%s' "$live_token" | sha256sum | cut -c1-8)
+    new_hash=$(printf '%s' "$coord_token" | sha256sum | cut -c1-8)
+    log_credential_event "pulled fresher credentials from coordinator for Account-$active_num ($active_email): token ${old_hash}->${new_hash} (caller=pull_coordinator_credentials_if_fresher)"
+}
+
 # Read account credentials from backup
 read_account_credentials() {
     local account_num="$1"
@@ -2219,6 +2323,7 @@ cmd_coord_client_setup() {
     cmd_coord_setup --mode http --api-url "$api_url" --api-token "$api_token" --server-id "$server_id" --lease-ttl "$lease_ttl"
     cmd_rate_setup --threshold "$threshold"
     cmd_statusline_setup
+    coord_pull_accounts
 
     echo "Client setup complete."
     echo "  Coordinator: $api_url"
@@ -2893,6 +2998,7 @@ cmd_add_account() {
     write_json "$SEQUENCE_FILE" "$updated_sequence"
 
     coord_publish_credential "$current_email" "$current_creds"
+    coord_publish_account_state "$account_num" "$current_email"
 
     if [[ "$is_update" -eq 1 ]]; then
         echo "Updated Account $account_num: $current_email"
@@ -3535,6 +3641,7 @@ cmd_rate_check() {
     trap 'release_switch_lock; unset CCS_LOCK_HELD' RETURN EXIT
 
     sync_active_credentials_to_backup
+    pull_coordinator_credentials_if_fresher
 
     local auto_switch=false
     local hook_mode=false
