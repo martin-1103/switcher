@@ -1934,6 +1934,11 @@ sync_active_credentials_to_backup() {
     fi
     write_account_credentials "$active_num" "$active_email" "$live_creds"
     release_switch_lock
+    # Publish to the coordinator too — without this, other hosts sharing this
+    # account only learn of the refresh at the next explicit switch (perform_switch
+    # publishes there), which no longer happens proactively now that keepalive is
+    # dead. Fail-open: coord_publish_credential already no-ops on any error.
+    coord_publish_credential "$active_email" "$live_creds"
     local old_hash new_hash
     old_hash=$(printf '%s' "$backup_token" | sha256sum | cut -c1-8)
     new_hash=$(printf '%s' "$live_token" | sha256sum | cut -c1-8)
