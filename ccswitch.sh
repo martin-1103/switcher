@@ -437,13 +437,19 @@ REPLACE INTO account_leases (
 " >/dev/null 2>&1 || true
 }
 
-# Import account-number/email mappings from the coordinator's lease list into
-# this host's sequence.json. Fills only empty local slots; a slot already
-# mapped to a DIFFERENT email is left untouched and reported as a conflict —
-# account numbers are assigned locally with no cross-host awareness
-# (get_next_account_number), so two hosts can independently pick the same
-# number for different accounts. This makes existing hosts converge without
-# silently overwriting one side.
+# Import accounts the coordinator knows about but this host doesn't, keyed
+# by EMAIL only — never by the coordinator's accountNumber. Account numbers
+# are a purely local namespace (get_next_account_number reads only this
+# host's sequence.json); the coordinator stores whatever number the
+# PUBLISHING host happened to assign, so two hosts can legitimately have
+# picked the same number for two different accounts (observed: number 12 was
+# sharegass@ on one host, detho.murtandho@ on another). Importing the
+# coordinator's number as-is re-creates that collision on the importing
+# host. Instead: assign a fresh local number via get_next_account_number, and
+# only import an email that has a currently-usable credential on the
+# coordinator (skips outright, no stale-partial rows) — an email present
+# only as a leftover usage snapshot with no valid credential isn't a real
+# importable account.
 coord_pull_accounts() {
     coord_http_ready || return 0
 
@@ -451,51 +457,38 @@ coord_pull_accounts() {
     leases_json=$(coord_http_request GET "/v1/leases" 2>/dev/null) || return 0
     [[ -n "$leases_json" ]] || return 0
 
-    local pairs
-    pairs=$(echo "$leases_json" | jq -r '
-        [.leases[]? | .email as $email | (
-            (.holders[]? | select(.accountNumber != null) | {email: $email, num: .accountNumber}),
-            (select(.latestSnapshot.accountNumber != null) | {email: $email, num: .latestSnapshot.accountNumber})
-        )]
-        | unique_by(.num, .email) | .[] | "\(.num)\t\(.email)"
-    ' 2>/dev/null) || return 0
-    [[ -n "$pairs" ]] || return 0
+    local emails
+    emails=$(echo "$leases_json" | jq -r '.leases[]?.email // empty' 2>/dev/null) || return 0
+    [[ -n "$emails" ]] || return 0
 
-    local imported=0 conflicts=0
-    local num email local_email
-    while IFS=$'\t' read -r num email; do
-        [[ -n "$num" && -n "$email" ]] || continue
+    local imported=0
+    local email creds account_num
+    while IFS= read -r email; do
+        [[ -n "$email" ]] || continue
+        account_exists "$email" && continue
 
-        # Email already mapped to SOME local number (possibly a different one
-        # than the coordinator's) — importing under a second number would
-        # duplicate the account locally. Skip; existing local numbering wins.
-        if account_exists "$email"; then
+        creds=$(coord_fetch_credential "$email" 2>/dev/null) || continue
+        [[ -n "$creds" ]] || continue
+        credential_is_usable "$creds" || continue
+
+        if ! acquire_switch_lock 2; then
             continue
         fi
+        account_num=$(get_next_account_number)
+        local updated
+        updated=$(jq --arg num "$account_num" --arg email "$email" --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+            .accounts[$num] = (.accounts[$num] // {}) + {email: $email, added: $now, importedFromCoordinator: true} |
+            .sequence = ((.sequence // []) + [$num | tonumber] | unique) |
+            .lastUpdated = $now
+        ' "$SEQUENCE_FILE")
+        write_json "$SEQUENCE_FILE" "$updated"
+        write_account_credentials "$account_num" "$email" "$creds"
+        release_switch_lock
+        imported=$((imported + 1))
+        echo "  Imported Account $account_num: $email (from coordinator)"
+    done <<< "$emails"
 
-        local_email=$(jq -r --arg num "$num" '.accounts[$num].email // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
-
-        if [[ -z "$local_email" ]]; then
-            if ! acquire_switch_lock 2; then
-                continue
-            fi
-            local updated
-            updated=$(jq --arg num "$num" --arg email "$email" --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
-                .accounts[$num] = (.accounts[$num] // {}) + {email: $email, added: $now, importedFromCoordinator: true} |
-                .sequence = ((.sequence // []) + [$num | tonumber] | unique) |
-                .lastUpdated = $now
-            ' "$SEQUENCE_FILE")
-            write_json "$SEQUENCE_FILE" "$updated"
-            release_switch_lock
-            imported=$((imported + 1))
-            echo "  Imported Account $num: $email (from coordinator)"
-        elif [[ "$local_email" != "$email" ]]; then
-            conflicts=$((conflicts + 1))
-            echo "  Conflict: Account $num is '$local_email' locally but '$email' on coordinator — skipped, resolve manually"
-        fi
-    done <<< "$pairs"
-
-    [[ "$imported" -gt 0 || "$conflicts" -gt 0 ]] && echo "coord_pull_accounts: imported=$imported conflicts=$conflicts"
+    [[ "$imported" -gt 0 ]] && echo "coord_pull_accounts: imported=$imported"
     return 0
 }
 
