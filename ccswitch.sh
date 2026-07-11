@@ -2379,6 +2379,73 @@ cmd_coord_token() {
     printf '%s\n' "$token"
 }
 
+cmd_coord_push() {
+    if ! coord_http_ready; then
+        echo "Coordinator not configured — nothing pushed."
+        return 0
+    fi
+
+    local push_all=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --all)
+                push_all=true
+                shift
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    local num email creds
+    if [[ "$push_all" == true ]]; then
+        local nums
+        nums=$(jq -r '.accounts | keys[]' "$SEQUENCE_FILE" 2>/dev/null || true)
+        while IFS= read -r num; do
+            [[ -n "$num" ]] || continue
+            email=$(jq -r --arg num "$num" '.accounts[$num].email // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
+            [[ -n "$email" ]] || continue
+            creds=$(read_account_credentials "$num" "$email")
+            if ! credential_is_usable "$creds"; then
+                echo "  Skipped Account $num: $email (no usable credential)"
+                continue
+            fi
+            coord_publish_credential "$email" "$creds"
+            echo "  Pushed Account $num: $email"
+        done <<< "$nums"
+        return 0
+    fi
+
+    num=$(jq -r '.activeAccountNumber // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
+    [[ -n "$num" && "$num" != "null" ]] || { echo "No active account to push."; return 0; }
+    email=$(jq -r --arg num "$num" '.accounts[$num].email // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
+    [[ -n "$email" ]] || { echo "No active account to push."; return 0; }
+    creds=$(read_account_credentials "$num" "$email")
+    if ! credential_is_usable "$creds"; then
+        echo "  Skipped Account $num: $email (no usable credential)"
+        return 0
+    fi
+    coord_publish_credential "$email" "$creds"
+    echo "  Pushed Account $num: $email"
+}
+
+cmd_coord_pull() {
+    if ! coord_http_ready; then
+        echo "Coordinator not configured — nothing to pull."
+        return 0
+    fi
+    # coord_pull_accounts prints its own imported/backfilled lines but stays
+    # silent when there's nothing new, so add a fallback line for that case.
+    local output
+    output=$(coord_pull_accounts)
+    if [[ -n "$output" ]]; then
+        printf '%s\n' "$output"
+    else
+        echo "No accounts to pull (coordinator unreachable or nothing new)."
+    fi
+}
+
 cmd_coord_client_command() {
     local api_url=""
     local server_id='$(hostname)'
@@ -4167,6 +4234,8 @@ show_usage() {
     echo "  coord-client-command             Print copy-paste command for other servers"
     echo "  coord-token                      Print coordinator API token"
     echo "  coord-sync                       Publish current active lease to coordinator"
+    echo "  coord-push [--all]               Publish active (or all) account credentials to coordinator"
+    echo "  coord-pull                       Import/backfill account credentials from coordinator"
     echo ""
     echo "Diagnostics:"
     echo "  check                            Verify backup integrity (JSON, permissions, keychain)"
@@ -4312,6 +4381,13 @@ main() {
         coord-sync)
             shift
             cmd_coord_sync "$@"
+            ;;
+        coord-push)
+            shift
+            cmd_coord_push "$@"
+            ;;
+        coord-pull)
+            cmd_coord_pull
             ;;
         check|--check)
             cmd_check
