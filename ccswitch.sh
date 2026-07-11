@@ -1899,6 +1899,47 @@ read_account_credentials() {
     esac
 }
 
+# Copy ~/.claude/.credentials.json into the active account's backup whenever
+# Claude Code itself has silently refreshed the live token (no network call
+# here — this is pure local file sync, NOT the killed keepalive refresh path).
+# Piggybacked onto cmd_rate_check (already invoked by statusline every ~10s
+# and by the hook) instead of a new timer/daemon: an extra unit to keep alive
+# forever isn't worth it when the existing polling cadence gets the backup
+# fresh within seconds, and the token stays valid for hours regardless.
+# Must run inside the switch lock (reentrant acquire_switch_lock) so this
+# can't race perform_switch's own backup write for the account being
+# switched away from/into.
+sync_active_credentials_to_backup() {
+    local active_num active_email live_creds live_token backup_creds backup_token
+    active_num=$(jq -r '.activeAccountNumber // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
+    [[ -n "$active_num" && "$active_num" != "null" ]] || return 0
+    active_email=$(jq -r --arg num "$active_num" '.accounts[$num].email // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
+    [[ -n "$active_email" ]] || return 0
+
+    # Guard against a stale/mismatched activeAccountNumber: only sync if the
+    # live credentials really do belong to this account.
+    [[ "$(get_current_account)" == "$active_email" ]] || return 0
+
+    live_creds=$(read_credentials)
+    live_token=$(credential_access_token "$live_creds")
+    [[ -n "$live_token" ]] || return 0
+
+    backup_creds=$(read_account_credentials "$active_num" "$active_email")
+    backup_token=$(credential_access_token "$backup_creds")
+
+    [[ "$live_token" != "$backup_token" ]] || return 0
+
+    if ! acquire_switch_lock 2; then
+        return 0
+    fi
+    write_account_credentials "$active_num" "$active_email" "$live_creds"
+    release_switch_lock
+    local old_hash new_hash
+    old_hash=$(printf '%s' "$backup_token" | sha256sum | cut -c1-8)
+    new_hash=$(printf '%s' "$live_token" | sha256sum | cut -c1-8)
+    log_credential_event "synced live credentials to backup for Account-$active_num ($active_email): token ${old_hash}->${new_hash} (caller=sync_active_credentials_to_backup)"
+}
+
 # Write account credentials to backup
 write_account_credentials() {
     local account_num="$1"
@@ -3480,6 +3521,8 @@ cmd_rate_check() {
     fi
     export CCS_LOCK_HELD=1
     trap 'release_switch_lock; unset CCS_LOCK_HELD' RETURN EXIT
+
+    sync_active_credentials_to_backup
 
     local auto_switch=false
     local hook_mode=false
