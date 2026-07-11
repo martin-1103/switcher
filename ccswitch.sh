@@ -478,9 +478,17 @@ coord_pull_accounts() {
             existing_creds=$(read_account_credentials "$existing_num" "$email")
             credential_is_usable "$existing_creds" && continue
 
+            log_credential_event "coord_pull_accounts: local backup unusable for Account-$existing_num ($email), trying coordinator (caller=coord_pull_accounts)"
+
             creds=$(coord_fetch_credential "$email" 2>/dev/null) || continue
-            [[ -n "$creds" ]] || continue
-            credential_is_usable "$creds" || continue
+            if [[ -z "$creds" ]]; then
+                log_credential_event "coord_pull_accounts: coordinator has no credential for Account-$existing_num ($email) either (caller=coord_pull_accounts)"
+                continue
+            fi
+            if ! credential_is_usable "$creds"; then
+                log_credential_event "coord_pull_accounts: coordinator credential for Account-$existing_num ($email) is also unusable/expired (caller=coord_pull_accounts)"
+                continue
+            fi
 
             if ! acquire_switch_lock 2; then
                 continue
@@ -1850,7 +1858,7 @@ cmd_keepalive() {
         if [[ "$refresh_status" -eq 0 ]] && credential_is_usable "$updated_creds"; then
             write_account_credentials "$num" "$email" "$updated_creds"
             write_account_credentials_if_active "$email" "$updated_creds"
-            coord_publish_credential "$email" "$updated_creds"
+            coord_publish_credential "$email" "$updated_creds" || true
             local seq
             seq=$(jq --arg num "$num" --arg now "$now_epoch" '.accounts[$num].lastKeepaliveAt = ($now | tonumber)' "$SEQUENCE_FILE")
             write_json "$SEQUENCE_FILE" "$seq"
@@ -1912,21 +1920,28 @@ write_credentials() {
 
 # Push a freshly refreshed credential to the coordinator's encrypted store, so
 # other hosts can recover it if their own backup goes stale. Best-effort: a
-# failure here must never block the caller's own (successful) local refresh.
+# failure here must never block the caller's own (successful) local refresh —
+# callers that don't care about the outcome may keep ignoring the return value.
+# Return codes: 0=accepted, 1=not configured/no usable creds, 2=network/http
+# error, 3=coordinator rejected as stale (existing credential is fresher).
 coord_publish_credential() {
     local email="$1"
     local creds="$2"
-    coord_http_ready || return 0
+    coord_http_ready || return 1
     local access_token refresh_token expires_at scopes
     access_token=$(credential_access_token "$creds")
     refresh_token=$(credential_refresh_token "$creds")
     expires_at=$(echo "$creds" | jq -r '.expires_at // .claudeAiOauth.expiresAt // 0' 2>/dev/null || echo 0)
     scopes=$(echo "$creds" | jq -c '.scopes // .claudeAiOauth.scopes // []' 2>/dev/null || echo '[]')
-    [[ -n "$access_token" && -n "$refresh_token" ]] || return 0
-    local payload
+    [[ -n "$access_token" && -n "$refresh_token" ]] || return 1
+    local payload response
     payload=$(jq -n --arg email "$email" --arg at "$access_token" --arg rt "$refresh_token" --argjson exp "${expires_at:-0}" --argjson sc "$scopes" \
         '{email: $email, accessToken: $at, refreshToken: $rt, expiresAt: $exp, scopes: $sc}')
-    coord_http_request POST "/v1/credentials/publish" "$payload" >/dev/null 2>&1 || true
+    response=$(coord_http_request POST "/v1/credentials/publish" "$payload" 2>/dev/null) || return 2
+    if [[ "$(echo "$response" | jq -r '.accepted // false' 2>/dev/null)" == "true" ]]; then
+        return 0
+    fi
+    return 3
 }
 
 # Pull a credential from the coordinator's encrypted store. Returns the same
@@ -2071,7 +2086,7 @@ sync_active_credentials_to_backup() {
     # account only learn of the refresh at the next explicit switch (perform_switch
     # publishes there), which no longer happens proactively now that keepalive is
     # dead. Fail-open: coord_publish_credential already no-ops on any error.
-    coord_publish_credential "$active_email" "$live_creds"
+    coord_publish_credential "$active_email" "$live_creds" || true
     local old_hash new_hash
     old_hash=$(printf '%s' "$backup_token" | sha256sum | cut -c1-8)
     new_hash=$(printf '%s' "$live_token" | sha256sum | cut -c1-8)
@@ -2411,8 +2426,13 @@ cmd_coord_push() {
                 echo "  Skipped Account $num: $email (no usable credential)"
                 continue
             fi
-            coord_publish_credential "$email" "$creds"
-            echo "  Pushed Account $num: $email"
+            local push_status=0
+            coord_publish_credential "$email" "$creds" || push_status=$?
+            case "$push_status" in
+                0) echo "  Pushed Account $num: $email" ;;
+                3) echo "  Rejected Account $num: $email (coordinator has fresher credential)" ;;
+                *) echo "  Failed Account $num: $email (coordinator unreachable)" ;;
+            esac
         done <<< "$nums"
         return 0
     fi
@@ -2426,8 +2446,13 @@ cmd_coord_push() {
         echo "  Skipped Account $num: $email (no usable credential)"
         return 0
     fi
-    coord_publish_credential "$email" "$creds"
-    echo "  Pushed Account $num: $email"
+    local push_status=0
+    coord_publish_credential "$email" "$creds" || push_status=$?
+    case "$push_status" in
+        0) echo "  Pushed Account $num: $email" ;;
+        3) echo "  Rejected Account $num: $email (coordinator has fresher credential)" ;;
+        *) echo "  Failed Account $num: $email (coordinator unreachable)" ;;
+    esac
 }
 
 cmd_coord_pull() {
@@ -3093,7 +3118,7 @@ cmd_add_account() {
 
     write_json "$SEQUENCE_FILE" "$updated_sequence"
 
-    coord_publish_credential "$current_email" "$current_creds"
+    coord_publish_credential "$current_email" "$current_creds" || true
     coord_publish_account_state "$account_num" "$current_email"
 
     if [[ "$is_update" -eq 1 ]]; then
