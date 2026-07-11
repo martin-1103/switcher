@@ -3492,10 +3492,37 @@ perform_switch() {
     target_creds=$(read_account_credentials "$target_account" "$target_email")
     target_config=$(read_account_config "$target_account" "$target_email")
 
-    if [[ -z "$target_creds" || -z "$target_config" ]]; then
+    if [[ -z "$target_creds" ]]; then
         echo "Error: Missing backup data for Account-$target_account"
         rollback
         exit 1
+    fi
+
+    # No config snapshot yet — expected for an account only ever imported via
+    # the coordinator, never actually switched into on this host (config is
+    # only written in Step 1, for the account being switched AWAY from).
+    # Synthesize one from the live .claude.json + this account's own token
+    # profile rather than hard-failing the switch.
+    if [[ -z "$target_config" ]]; then
+        local synth_token synth_email synth_uuid synth_profile
+        synth_token=$(credential_access_token "$target_creds")
+        synth_profile=$(fetch_oauth_profile "$synth_token")
+        synth_email=$(cut -f1 <<< "$synth_profile")
+        synth_uuid=$(cut -f2 <<< "$synth_profile")
+        if [[ -z "$synth_email" || -z "$synth_uuid" ]]; then
+            echo "Error: Missing backup data for Account-$target_account (no config snapshot, and live profile lookup failed to build one)"
+            rollback
+            exit 1
+        fi
+        if ! target_config=$(jq --arg email "$synth_email" --arg uuid "$synth_uuid" \
+            '.oauthAccount = {emailAddress: $email, accountUuid: $uuid}' \
+            "$(get_claude_config_path)" 2>/dev/null); then
+            echo "Error: Failed to synthesize config for Account-$target_account"
+            rollback
+            exit 1
+        fi
+        write_account_config "$target_account" "$target_email" "$target_config"
+        log_credential_event "synthesized missing config for Account-$target_account ($target_email) from live profile (caller=perform_switch)"
     fi
 
     # Local backup is usable outright (e.g. keepalive refreshed it, or the
