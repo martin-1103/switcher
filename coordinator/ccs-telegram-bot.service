@@ -1,0 +1,20 @@
+[Unit]
+Description=CCS Telegram Bot (notify on expired accounts, drive re-login)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=HOME=/root
+# Required — set in an override or drop-in (systemctl edit ccs-telegram-bot):
+#   TELEGRAM_BOT_TOKEN=<from @BotFather>
+#   TELEGRAM_CHAT_ID=<your chat id>
+# Optional: CCS_BIN, CCS_LOGIN_BRIDGE, CCS_BOT_STATE_FILE, CCS_BOT_DETECT_INTERVAL
+EnvironmentFile=-/etc/ccs-telegram-bot.env
+WorkingDirectory=/root/cc-account-switcher
+ExecStart=/usr/bin/node /usr/local/lib/cc-account-switcher/coordinator/ccs-telegram-bot.js
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
