@@ -216,24 +216,19 @@ async function handleCommand(text, from) {
       await reply(HELP);
       return true;
     case '/status': {
-      let accounts;
-      try { accounts = await listAccounts(); }
-      catch (e) { await reply(`ccs ls failed: ${e.message}`); return true; }
+      // Forward `ccs ls` verbatim (usage/reset/tags) — no reparse — then
+      // append the bot-only pending-code list, which ccs ls doesn't know.
+      const r = await run(CCS_BIN, ['ls']);
+      if (r.code !== 0) { await reply(`ccs ls failed:\n${r.stderr.trim() || 'unknown error'}`); return true; }
+      let out = r.stdout.trim() || '(no accounts)';
       const pend = Object.keys(state.pending);
-      const nExpired = accounts.filter((a) => a.expired).length;
-      const lines = accounts
-        .slice()
-        .sort((a, b) => Number(a.num) - Number(b.num))
-        .map((a) => {
-          const tags = [];
-          if (a.expired) tags.push('EXPIRED');
-          if (state.pending[a.email]) tags.push('pending-code');
-          return `${a.num}: ${tags.length ? tags.join(',') + ' ' : 'ok '}${a.email}`;
-        });
-      await reply(
-        `${accounts.length} accounts, ${nExpired} expired, ${pend.length} awaiting code:\n\n` +
-        lines.join('\n')
-      );
+      if (pend.length) {
+        let accounts = [];
+        try { accounts = await listAccounts(); } catch { /* email-only */ }
+        out += '\n\nAwaiting code:\n' + pend.map((e) => `  ${emailToNum(accounts, e)}: ${e}`).join('\n');
+      }
+      // Telegram hard-caps messages at 4096 chars.
+      await reply(out.length > 4000 ? out.slice(0, 3990) + '\n…(truncated)' : out);
       return true;
     }
     case '/login': {
