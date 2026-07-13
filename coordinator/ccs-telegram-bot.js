@@ -41,10 +41,17 @@ if (!TOKEN || !CHAT_ID) {
 // notified: emails already announced as expired (cleared when they recover,
 //           so a later re-expiry re-notifies).
 // pending:  email -> true, awaiting a code reply.
-let state = { notified: [], pending: {} };
+// users:    authorized chat IDs (strings). Seeded once from TELEGRAM_CHAT_ID
+//           (bootstrap owner), then managed at runtime via /adduser /deluser.
+let state = { notified: [], pending: {}, users: [] };
 try {
-  state = { notified: [], pending: {}, ...JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')) };
+  state = { notified: [], pending: {}, users: [], ...JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')) };
 } catch { /* first run: defaults */ }
+
+// Bootstrap the owner from env on first run (or if the list was emptied).
+if (state.users.length === 0) {
+  state.users.push(CHAT_ID);
+}
 
 function saveState() {
   try {
@@ -81,9 +88,15 @@ function tg(method, params) {
   });
 }
 
-function send(text) {
-  return tg('sendMessage', { chat_id: CHAT_ID, text, disable_web_page_preview: true })
-    .catch((e) => console.error('send failed:', e.message));
+// send(text)        -> broadcast to every authorized user (notifs, login URL,
+//                       login result — all authorized users share the accounts)
+// send(text, chatId) -> reply to one chat (command responses, usage errors)
+function send(text, to) {
+  const targets = to ? [String(to)] : state.users;
+  return Promise.all(targets.map((chat_id) =>
+    tg('sendMessage', { chat_id, text, disable_web_page_preview: true })
+      .catch((e) => console.error(`send to ${chat_id} failed:`, e.message))
+  ));
 }
 
 // ---- bridge / ccs shell-outs ----
@@ -178,29 +191,35 @@ const HELP = [
   '/login <num> — start a re-login now (don\'t wait for expiry)',
   '/pending — logins awaiting a code',
   '/cancel <num> — abandon a pending login',
+  '/ids — list authorized users',
+  '/adduser <chat_id> — authorize another user',
+  '/deluser <chat_id> — remove an authorized user',
   '/help — this message',
   '',
   'Reply with just the code to finish a login (or "<num> <code>" if several pending).',
 ].join('\n');
 
 // Returns true if the message was a command (handled here), false otherwise.
-async function handleCommand(text) {
+// `from` is the sender's chat id: command replies go only to them, while
+// account notifications (login URL, results) broadcast to all users.
+async function handleCommand(text, from) {
   const t = text.trim();
   if (!t.startsWith('/')) return false;
   // Strip @botname suffix Telegram adds in groups.
   const [rawCmd, ...rest] = t.split(/\s+/);
   const cmd = rawCmd.replace(/@.*$/, '').toLowerCase();
   const arg = rest.join(' ').trim();
+  const reply = (text) => send(text, from); // command replies are private
 
   switch (cmd) {
     case '/help':
     case '/start':
-      await send(HELP);
+      await reply(HELP);
       return true;
     case '/status': {
       let accounts;
       try { accounts = await listAccounts(); }
-      catch (e) { await send(`ccs ls failed: ${e.message}`); return true; }
+      catch (e) { await reply(`ccs ls failed: ${e.message}`); return true; }
       const pend = Object.keys(state.pending);
       const nExpired = accounts.filter((a) => a.expired).length;
       const lines = accounts
@@ -212,51 +231,75 @@ async function handleCommand(text) {
           if (state.pending[a.email]) tags.push('pending-code');
           return `${a.num}: ${tags.length ? tags.join(',') + ' ' : 'ok '}${a.email}`;
         });
-      await send(
+      await reply(
         `${accounts.length} accounts, ${nExpired} expired, ${pend.length} awaiting code:\n\n` +
         lines.join('\n')
       );
       return true;
     }
     case '/login': {
-      if (!/^\d+$/.test(arg)) { await send('Usage: /login <num> (account number from /status)'); return true; }
+      if (!/^\d+$/.test(arg)) { await reply('Usage: /login <num> (account number from /status)'); return true; }
       const email = await numToEmail(arg);
-      if (!email) { await send(`No account numbered ${arg}. See /status.`); return true; }
-      await send(`Starting login for account ${arg} (${email})…`);
-      await startLogin(email, arg, `🔑 /login: account ${arg} (${email})`);
+      if (!email) { await reply(`No account numbered ${arg}. See /status.`); return true; }
+      await reply(`Starting login for account ${arg} (${email})…`);
+      await startLogin(email, arg, `🔑 /login: account ${arg} (${email})`); // broadcast
       return true;
     }
     case '/pending': {
       const pend = Object.keys(state.pending);
-      if (!pend.length) { await send('No pending logins.'); return true; }
+      if (!pend.length) { await reply('No pending logins.'); return true; }
       let accounts = [];
       try { accounts = await listAccounts(); } catch { /* fall back to email-only */ }
       const lines = pend.map((e) => `${emailToNum(accounts, e)}: ${e}`);
-      await send(`Awaiting code:\n${lines.join('\n')}`);
+      await reply(`Awaiting code:\n${lines.join('\n')}`);
       return true;
     }
     case '/cancel': {
-      if (!/^\d+$/.test(arg)) { await send('Usage: /cancel <num> (account number from /status)'); return true; }
+      if (!/^\d+$/.test(arg)) { await reply('Usage: /cancel <num> (account number from /status)'); return true; }
       const email = await numToEmail(arg);
-      if (!email) { await send(`No account numbered ${arg}. See /status.`); return true; }
+      if (!email) { await reply(`No account numbered ${arg}. See /status.`); return true; }
       const r = await run('bash', [BRIDGE, 'cancel', email]);
       delete state.pending[email];
       saveState();
-      await send(`Cancelled account ${arg} (${email}). ${r.stdout.trim()}`);
+      await reply(`Cancelled account ${arg} (${email}). ${r.stdout.trim()}`);
+      return true;
+    }
+    case '/ids': {
+      const lines = state.users.map((u) => `${u}${u === from ? ' (you)' : ''}`);
+      await reply(`Authorized users (${state.users.length}):\n${lines.join('\n')}`);
+      return true;
+    }
+    case '/adduser': {
+      if (!/^-?\d+$/.test(arg)) { await reply('Usage: /adduser <chat_id> (get it from /ids run by that user, or forward their message)'); return true; }
+      if (state.users.includes(arg)) { await reply(`${arg} already authorized.`); return true; }
+      state.users.push(arg);
+      saveState();
+      await reply(`Added ${arg}. Now ${state.users.length} authorized.`);
+      await send(`👋 You've been added to the ccs re-login bot. /help for commands.`, arg);
+      return true;
+    }
+    case '/deluser': {
+      if (!/^-?\d+$/.test(arg)) { await reply('Usage: /deluser <chat_id> (see /ids)'); return true; }
+      if (!state.users.includes(arg)) { await reply(`${arg} not in the list. See /ids.`); return true; }
+      if (state.users.length === 1) { await reply('Refusing to remove the last user — you would lock everyone out.'); return true; }
+      state.users = state.users.filter((u) => u !== arg);
+      saveState();
+      await reply(`Removed ${arg}. Now ${state.users.length} authorized.`);
       return true;
     }
     default:
-      await send(`Unknown command ${cmd}. /help for the list.`);
+      await reply(`Unknown command ${cmd}. /help for the list.`);
       return true;
   }
 }
 
-async function handleText(text) {
-  if (await handleCommand(text)) return; // slash command, done
+async function handleText(text, from) {
+  if (await handleCommand(text, from)) return; // slash command, done
 
   const pendingEmails = Object.keys(state.pending);
   if (pendingEmails.length === 0) return; // nothing to submit to
 
+  const reply = (t) => send(t, from); // sender-only until we have a result
   let email, code;
   // "<num> <code>" disambiguates when several logins are pending. A bare
   // reply (just the code) is only accepted when exactly one is pending.
@@ -264,7 +307,7 @@ async function handleText(text) {
   if (twoPart) {
     email = await numToEmail(twoPart[1]);
     code = twoPart[2].trim();
-    if (!email) { await send(`No account numbered ${twoPart[1]}. See /status.`); return; }
+    if (!email) { await reply(`No account numbered ${twoPart[1]}. See /status.`); return; }
   } else if (pendingEmails.length === 1) {
     email = pendingEmails[0];
     code = text.trim();
@@ -272,21 +315,21 @@ async function handleText(text) {
     let accounts = [];
     try { accounts = await listAccounts(); } catch { /* email-only fallback */ }
     const list = pendingEmails.map((e) => `${emailToNum(accounts, e)}: ${e}`).join('\n');
-    await send(`Multiple logins pending:\n${list}\n\nReply "<num> <code>".`);
+    await reply(`Multiple logins pending:\n${list}\n\nReply "<num> <code>".`);
     return;
   }
 
   if (!state.pending[email]) {
-    await send(`No pending login for ${email}. Pending: ${pendingEmails.join(', ') || 'none'}.`);
+    await reply(`No pending login for ${email}. Pending: ${pendingEmails.join(', ') || 'none'}.`);
     return;
   }
 
-  await send(`Submitting code for ${email}…`);
+  await reply(`Submitting code for ${email}…`);
   const r = await run('bash', [BRIDGE, 'submit', email, code]);
   delete state.pending[email];
   if (r.code === 0) {
     // A successful capture means it's no longer expired; let a future
-    // re-expiry re-notify.
+    // re-expiry re-notify. Broadcast: the account is shared across all users.
     state.notified = state.notified.filter((e) => e !== email);
     await send(`✅ ${email}: ${r.stdout.trim() || 'logged in'}`);
   } else {
@@ -304,8 +347,9 @@ async function poll() {
       offset = u.update_id + 1;
       const msg = u.message;
       if (!msg || !msg.text) continue;
-      if (String(msg.chat.id) !== CHAT_ID) continue; // ignore everyone else
-      await handleText(msg.text);
+      const from = String(msg.chat.id);
+      if (!state.users.includes(from)) continue; // ignore non-authorized chats
+      await handleText(msg.text, from);
     }
   } catch (e) {
     console.error('poll error:', e.message);
@@ -314,7 +358,8 @@ async function poll() {
   setImmediate(poll);
 }
 
-console.log(`ccs-telegram-bot up. detect every ${DETECT_INTERVAL_MS / 1000}s, chat ${CHAT_ID}.`);
+saveState(); // persist bootstrapped user list
+console.log(`ccs-telegram-bot up. detect every ${DETECT_INTERVAL_MS / 1000}s, ${state.users.length} authorized user(s).`);
 detect();
 setInterval(detect, DETECT_INTERVAL_MS);
 poll();
