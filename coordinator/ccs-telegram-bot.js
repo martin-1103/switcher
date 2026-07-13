@@ -213,7 +213,6 @@ async function handleCommand(text, from) {
 
   switch (cmd) {
     case '/help':
-    case '/start':
       await reply(HELP);
       return true;
     case '/status': {
@@ -348,6 +347,18 @@ async function poll() {
       const msg = u.message;
       if (!msg || !msg.text) continue;
       const from = String(msg.chat.id);
+      // /start works for anyone (even non-authorized) so a new user can learn
+      // their own chat id to hand to an owner for /adduser.
+      if (/^\/start(@\S+)?\s*$/.test(msg.text.trim())) {
+        const authed = state.users.includes(from);
+        await send(
+          `User id kamu: ${from}\n` +
+          (authed ? 'Kamu sudah authorized. /help untuk daftar command.'
+                  : 'Kamu belum authorized. Kasih id ini ke admin untuk /adduser.'),
+          from
+        );
+        continue;
+      }
       if (!state.users.includes(from)) continue; // ignore non-authorized chats
       await handleText(msg.text, from);
     }
