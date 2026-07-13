@@ -95,23 +95,47 @@ function run(cmd, args) {
   });
 }
 
-async function listExpired() {
+// Parse `ccs ls` into account records. Internal state keys on email (stable
+// identity for the bridge); the account number is a UI convenience resolved
+// on demand via numToEmail().
+async function listAccounts() {
   const { stdout } = await run(CCS_BIN, ['ls']);
-  const expired = new Set();
-  const all = new Set();
+  const accounts = []; // {num, email, expired}
   for (const line of stdout.split('\n')) {
-    const m = line.match(/^\s*(\[EXPIRED\])?.*?\d+:\s+(\S+@\S+?)(?:\s|$)/);
+    const m = line.match(/^\s*(\[EXPIRED\])?.*?(\d+):\s+(\S+@\S+?)(?:\s|$)/);
     if (!m) continue;
-    all.add(m[2]);
-    if (/\[EXPIRED\]/.test(line)) expired.add(m[2]);
+    accounts.push({ num: m[2], email: m[3], expired: /\[EXPIRED\]/.test(line) });
   }
-  return { expired, all };
+  return accounts;
+}
+
+// Convenience view for callers that only care about expired/all email sets.
+async function listExpired() {
+  const accounts = await listAccounts();
+  return {
+    accounts,
+    expired: new Set(accounts.filter((a) => a.expired).map((a) => a.email)),
+    all: new Set(accounts.map((a) => a.email)),
+  };
+}
+
+// Resolve a user-supplied account number to its email. Returns null if none.
+async function numToEmail(num) {
+  const accounts = await listAccounts();
+  const hit = accounts.find((a) => a.num === String(num));
+  return hit ? hit.email : null;
+}
+
+// Reverse: email -> account number (for display). Returns '?' if unknown.
+function emailToNum(accounts, email) {
+  const hit = accounts.find((a) => a.email === email);
+  return hit ? hit.num : '?';
 }
 
 // ---- detect loop ----
 async function detect() {
-  let expired, all;
-  try { ({ expired, all } = await listExpired()); }
+  let expired, all, accounts;
+  try { ({ expired, all, accounts } = await listExpired()); }
   catch (e) { console.error('detect: ccs ls failed:', e.message); return; }
 
   // Recovered accounts drop out of `notified` so re-expiry re-notifies.
@@ -122,17 +146,18 @@ async function detect() {
     if (state.pending[email]) continue;            // already awaiting a code
     state.notified.push(email); // mark before start so a failed start doesn't retry every interval
     saveState();
-    await startLogin(email, `🔑 Account expired: ${email}`);
+    const num = emailToNum(accounts, email);
+    await startLogin(email, num, `🔑 Account ${num} expired: ${email}`);
   }
 }
 
 // Run `bridge start <email>`, DM the URL + instructions, mark pending. Shared
 // by the detect loop and the /login command. Returns true on success.
-async function startLogin(email, header) {
+async function startLogin(email, num, header) {
   const r = await run('bash', [BRIDGE, 'start', email]);
   const url = r.stdout.trim();
   if (r.code !== 0 || !/^https:\/\//.test(url)) {
-    await send(`⚠️ couldn't start login for ${email}:\n${r.stderr.trim() || 'no URL'}`);
+    await send(`⚠️ couldn't start login for account ${num} (${email}):\n${r.stderr.trim() || 'no URL'}`);
     return false;
   }
   state.pending[email] = true;
@@ -141,7 +166,7 @@ async function startLogin(email, header) {
     `${header}\n\n` +
     `1. Open in an INCOGNITO window and sign in AS ${email}:\n${url}\n\n` +
     `2. Copy the code shown after authorizing and reply here with just the code` +
-    ` (or "${email} <code>" if multiple logins are pending).`
+    ` (or "${num} <code>" if multiple logins are pending).`
   );
   return true;
 }
@@ -150,12 +175,12 @@ async function startLogin(email, header) {
 const HELP = [
   'ccs re-login bot commands:',
   '/status — accounts + which are expired/pending',
-  '/login <email> — start a re-login now (don\'t wait for expiry)',
+  '/login <num> — start a re-login now (don\'t wait for expiry)',
   '/pending — logins awaiting a code',
-  '/cancel <email> — abandon a pending login',
+  '/cancel <num> — abandon a pending login',
   '/help — this message',
   '',
-  'Reply with just the code to finish a login (or "<email> <code>" if several pending).',
+  'Reply with just the code to finish a login (or "<num> <code>" if several pending).',
 ].join('\n');
 
 // Returns true if the message was a command (handled here), false otherwise.
@@ -173,39 +198,51 @@ async function handleCommand(text) {
       await send(HELP);
       return true;
     case '/status': {
-      let expired, all;
-      try { ({ expired, all } = await listExpired()); }
+      let accounts;
+      try { accounts = await listAccounts(); }
       catch (e) { await send(`ccs ls failed: ${e.message}`); return true; }
       const pend = Object.keys(state.pending);
-      const lines = [...all].sort().map((e) => {
-        const tags = [];
-        if (expired.has(e)) tags.push('EXPIRED');
-        if (state.pending[e]) tags.push('pending-code');
-        return `${tags.length ? tags.join(',') + ' ' : 'ok '}${e}`;
-      });
+      const nExpired = accounts.filter((a) => a.expired).length;
+      const lines = accounts
+        .slice()
+        .sort((a, b) => Number(a.num) - Number(b.num))
+        .map((a) => {
+          const tags = [];
+          if (a.expired) tags.push('EXPIRED');
+          if (state.pending[a.email]) tags.push('pending-code');
+          return `${a.num}: ${tags.length ? tags.join(',') + ' ' : 'ok '}${a.email}`;
+        });
       await send(
-        `${all.size} accounts, ${expired.size} expired, ${pend.length} awaiting code:\n\n` +
+        `${accounts.length} accounts, ${nExpired} expired, ${pend.length} awaiting code:\n\n` +
         lines.join('\n')
       );
       return true;
     }
     case '/login': {
-      if (!/\S+@\S+/.test(arg)) { await send('Usage: /login <email>'); return true; }
-      await send(`Starting login for ${arg}…`);
-      await startLogin(arg, `🔑 /login: ${arg}`);
+      if (!/^\d+$/.test(arg)) { await send('Usage: /login <num> (account number from /status)'); return true; }
+      const email = await numToEmail(arg);
+      if (!email) { await send(`No account numbered ${arg}. See /status.`); return true; }
+      await send(`Starting login for account ${arg} (${email})…`);
+      await startLogin(email, arg, `🔑 /login: account ${arg} (${email})`);
       return true;
     }
     case '/pending': {
       const pend = Object.keys(state.pending);
-      await send(pend.length ? `Awaiting code:\n${pend.join('\n')}` : 'No pending logins.');
+      if (!pend.length) { await send('No pending logins.'); return true; }
+      let accounts = [];
+      try { accounts = await listAccounts(); } catch { /* fall back to email-only */ }
+      const lines = pend.map((e) => `${emailToNum(accounts, e)}: ${e}`);
+      await send(`Awaiting code:\n${lines.join('\n')}`);
       return true;
     }
     case '/cancel': {
-      if (!/\S+@\S+/.test(arg)) { await send('Usage: /cancel <email>'); return true; }
-      const r = await run('bash', [BRIDGE, 'cancel', arg]);
-      delete state.pending[arg];
+      if (!/^\d+$/.test(arg)) { await send('Usage: /cancel <num> (account number from /status)'); return true; }
+      const email = await numToEmail(arg);
+      if (!email) { await send(`No account numbered ${arg}. See /status.`); return true; }
+      const r = await run('bash', [BRIDGE, 'cancel', email]);
+      delete state.pending[email];
       saveState();
-      await send(`Cancelled ${arg}. ${r.stdout.trim()}`);
+      await send(`Cancelled account ${arg} (${email}). ${r.stdout.trim()}`);
       return true;
     }
     default:
@@ -221,15 +258,21 @@ async function handleText(text) {
   if (pendingEmails.length === 0) return; // nothing to submit to
 
   let email, code;
-  const twoPart = text.trim().match(/^(\S+@\S+)\s+(\S.*)$/);
+  // "<num> <code>" disambiguates when several logins are pending. A bare
+  // reply (just the code) is only accepted when exactly one is pending.
+  const twoPart = text.trim().match(/^(\d+)\s+(\S.*)$/);
   if (twoPart) {
-    email = twoPart[1];
+    email = await numToEmail(twoPart[1]);
     code = twoPart[2].trim();
+    if (!email) { await send(`No account numbered ${twoPart[1]}. See /status.`); return; }
   } else if (pendingEmails.length === 1) {
     email = pendingEmails[0];
     code = text.trim();
   } else {
-    await send(`Multiple logins pending (${pendingEmails.join(', ')}). Reply "<email> <code>".`);
+    let accounts = [];
+    try { accounts = await listAccounts(); } catch { /* email-only fallback */ }
+    const list = pendingEmails.map((e) => `${emailToNum(accounts, e)}: ${e}`).join('\n');
+    await send(`Multiple logins pending:\n${list}\n\nReply "<num> <code>".`);
     return;
   }
 
