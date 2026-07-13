@@ -3128,6 +3128,78 @@ cmd_add_account() {
     fi
 }
 
+# Interactive OAuth login that runs the whole login+capture atomically under
+# the switch lock. Without the lock, the window between `claude auth login`
+# writing the new credential and `cmd_add_account` reading it is open: a
+# background rate-check/auto-switch (statusline, PreToolUse hook, coord timer)
+# can land a different account's credential in that gap, so cmd_add_account
+# then captures the WRONG account. Holding the lock for the full run blocks
+# every other switch path (they acquire the same lock) until we've captured.
+#
+# NOTE: OAuth authorization follows the BROWSER session, not --email. --email
+# only pre-fills the login form. If the browser that opens the printed URL is
+# already signed in to another account, that account gets authorized. Log in
+# with a clean/incognito browser session as the intended account.
+cmd_login() {
+    local email=""
+    local extra=(--claudeai)
+    local passthrough=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --email)
+                email="$2"
+                extra+=(--email "$2")
+                shift 2
+                ;;
+            --console)
+                # Override default: Console login instead of Claude subscription.
+                extra=(--console)
+                shift
+                ;;
+            *)
+                # Forward unknown flags (e.g. --type) to cmd_add_account.
+                passthrough+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    # Block long enough for a transient background rate-check (which holds the
+    # lock only briefly, non-blocking) to release. Human login itself happens
+    # AFTER we hold the lock, so this timeout only covers lock contention.
+    if ! acquire_switch_lock 30; then
+        echo "Error: could not acquire switch lock (another switch/login in progress). Try again." >&2
+        exit 1
+    fi
+    export CCS_LOCK_HELD=1
+    trap 'release_switch_lock; unset CCS_LOCK_HELD' RETURN EXIT
+
+    local before_email=""
+    before_email=$(claude auth status --json 2>/dev/null | jq -r '.email // empty' 2>/dev/null)
+
+    echo "Starting login${email:+ for $email}. Log in with a clean/incognito browser as the intended account." >&2
+    if ! claude auth login "${extra[@]}"; then
+        echo "Error: claude auth login failed or was cancelled. Nothing captured." >&2
+        exit 1
+    fi
+
+    local after_email=""
+    after_email=$(claude auth status --json 2>/dev/null | jq -r '.email // empty' 2>/dev/null)
+    if [[ -z "$after_email" ]]; then
+        echo "Error: not logged in after login flow (claude auth status has no email). Nothing captured." >&2
+        exit 1
+    fi
+    if [[ -n "$email" && "$after_email" != "$email" ]]; then
+        echo "Warning: requested $email but logged in as $after_email (browser session was signed in to a different account)." >&2
+        echo "Capturing $after_email anyway. Re-run in incognito if this is wrong." >&2
+    fi
+    log_credential_event "cmd_login: captured $after_email (was ${before_email:-none})"
+
+    # Still inside the lock: cmd_add_account reads the live credential we just
+    # wrote. CCS_LOCK_HELD makes its lock acquisition reentrant (no deadlock).
+    cmd_add_account "${passthrough[@]+"${passthrough[@]}"}"
+}
+
 # Remove account
 cmd_remove_account() {
     if [[ $# -eq 0 ]]; then
@@ -4259,6 +4331,7 @@ show_usage() {
     echo ""
     echo "Account Management:"
     echo "  add [--type team|max20]          Add current account to managed accounts"
+    echo "  login [--email X] [--console]    Log in (lock-held) then add, atomically"
     echo "  rm <num|email>                   Remove account by number or email"
     echo "  ls                               List all managed accounts"
     echo ""
@@ -4366,6 +4439,10 @@ main() {
         add|--add-account)
             shift
             cmd_add_account "$@"
+            ;;
+        login)
+            shift
+            cmd_login "$@"
             ;;
         rm|--remove-account)
             shift
