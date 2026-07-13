@@ -3173,6 +3173,13 @@ cmd_login() {
     fi
     export CCS_LOCK_HELD=1
     trap 'release_switch_lock; unset CCS_LOCK_HELD' RETURN EXIT
+    # tmux kill-session (used by the automation bridge on timeout/cancel) sends
+    # SIGHUP/SIGTERM, which bypass the RETURN/EXIT trap: the lock would leak and
+    # the child `claude auth login` would be orphaned, wedging every switch.
+    # rm the lock dir DIRECTLY (release_switch_lock is a no-op while
+    # CCS_LOCK_HELD=1, and dead-owner stale-reclaim is unreliable under PID
+    # reuse), then kill the whole process group (child included) and exit.
+    trap 'rm -rf "$LOCK_DIR" 2>/dev/null; kill 0 2>/dev/null; exit 130' INT TERM HUP
 
     local before_email=""
     before_email=$(claude auth status --json 2>/dev/null | jq -r '.email // empty' 2>/dev/null)

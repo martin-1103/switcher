@@ -76,9 +76,18 @@ cmd_submit() {
 
     tmux send-keys -t "$sess" "$code" Enter
 
-    local out="" i=0
+    local out="" i=0 acct_type_answered=0
     while (( i < RESULT_TIMEOUT )); do
         out=$(pane "$sess")
+        # After a successful exchange, cmd_add_account asks for an account type
+        # on the tty (the tmux pane is a tty). Answer it once with an empty line
+        # (skip) so an existing account keeps its type; a stuck prompt would
+        # otherwise time out here. Send only after we see login succeeded.
+        if (( acct_type_answered == 0 )) && grep -q 'Account type' <<< "$out" && grep -q 'Login successful' <<< "$out"; then
+            tmux send-keys -t "$sess" Enter
+            acct_type_answered=1
+            sleep 1; i=$(( i + 1 )); continue
+        fi
         if grep -qE 'Updated Account|Added Account' <<< "$out"; then
             grep -E 'Updated Account|Added Account' <<< "$out" | tail -1
             tmux kill-session -t "$sess" 2>/dev/null || true
