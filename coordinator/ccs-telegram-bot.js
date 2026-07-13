@@ -120,29 +120,103 @@ async function detect() {
   for (const email of expired) {
     if (state.notified.includes(email)) continue; // already announced
     if (state.pending[email]) continue;            // already awaiting a code
-
-    const r = await run('bash', [BRIDGE, 'start', email]);
-    const url = r.stdout.trim();
-    if (r.code !== 0 || !/^https:\/\//.test(url)) {
-      await send(`⚠️ ${email} expired but couldn't start login:\n${r.stderr.trim() || 'no URL'}`);
-      state.notified.push(email); // don't hammer a broken start every interval
-      saveState();
-      continue;
-    }
-    state.pending[email] = true;
-    state.notified.push(email);
+    state.notified.push(email); // mark before start so a failed start doesn't retry every interval
     saveState();
-    await send(
-      `🔑 Account expired: ${email}\n\n` +
-      `1. Open in an INCOGNITO window and sign in AS ${email}:\n${url}\n\n` +
-      `2. Copy the code shown after authorizing and reply here with just the code` +
-      ` (or "${email} <code>" if multiple logins are pending).`
-    );
+    await startLogin(email, `🔑 Account expired: ${email}`);
   }
 }
 
+// Run `bridge start <email>`, DM the URL + instructions, mark pending. Shared
+// by the detect loop and the /login command. Returns true on success.
+async function startLogin(email, header) {
+  const r = await run('bash', [BRIDGE, 'start', email]);
+  const url = r.stdout.trim();
+  if (r.code !== 0 || !/^https:\/\//.test(url)) {
+    await send(`⚠️ couldn't start login for ${email}:\n${r.stderr.trim() || 'no URL'}`);
+    return false;
+  }
+  state.pending[email] = true;
+  saveState();
+  await send(
+    `${header}\n\n` +
+    `1. Open in an INCOGNITO window and sign in AS ${email}:\n${url}\n\n` +
+    `2. Copy the code shown after authorizing and reply here with just the code` +
+    ` (or "${email} <code>" if multiple logins are pending).`
+  );
+  return true;
+}
+
 // ---- reply handling ----
+const HELP = [
+  'ccs re-login bot commands:',
+  '/status — accounts + which are expired/pending',
+  '/login <email> — start a re-login now (don\'t wait for expiry)',
+  '/pending — logins awaiting a code',
+  '/cancel <email> — abandon a pending login',
+  '/help — this message',
+  '',
+  'Reply with just the code to finish a login (or "<email> <code>" if several pending).',
+].join('\n');
+
+// Returns true if the message was a command (handled here), false otherwise.
+async function handleCommand(text) {
+  const t = text.trim();
+  if (!t.startsWith('/')) return false;
+  // Strip @botname suffix Telegram adds in groups.
+  const [rawCmd, ...rest] = t.split(/\s+/);
+  const cmd = rawCmd.replace(/@.*$/, '').toLowerCase();
+  const arg = rest.join(' ').trim();
+
+  switch (cmd) {
+    case '/help':
+    case '/start':
+      await send(HELP);
+      return true;
+    case '/status': {
+      let expired, all;
+      try { ({ expired, all } = await listExpired()); }
+      catch (e) { await send(`ccs ls failed: ${e.message}`); return true; }
+      const pend = Object.keys(state.pending);
+      const lines = [...all].sort().map((e) => {
+        const tags = [];
+        if (expired.has(e)) tags.push('EXPIRED');
+        if (state.pending[e]) tags.push('pending-code');
+        return `${tags.length ? tags.join(',') + ' ' : 'ok '}${e}`;
+      });
+      await send(
+        `${all.size} accounts, ${expired.size} expired, ${pend.length} awaiting code:\n\n` +
+        lines.join('\n')
+      );
+      return true;
+    }
+    case '/login': {
+      if (!/\S+@\S+/.test(arg)) { await send('Usage: /login <email>'); return true; }
+      await send(`Starting login for ${arg}…`);
+      await startLogin(arg, `🔑 /login: ${arg}`);
+      return true;
+    }
+    case '/pending': {
+      const pend = Object.keys(state.pending);
+      await send(pend.length ? `Awaiting code:\n${pend.join('\n')}` : 'No pending logins.');
+      return true;
+    }
+    case '/cancel': {
+      if (!/\S+@\S+/.test(arg)) { await send('Usage: /cancel <email>'); return true; }
+      const r = await run('bash', [BRIDGE, 'cancel', arg]);
+      delete state.pending[arg];
+      saveState();
+      await send(`Cancelled ${arg}. ${r.stdout.trim()}`);
+      return true;
+    }
+    default:
+      await send(`Unknown command ${cmd}. /help for the list.`);
+      return true;
+  }
+}
+
 async function handleText(text) {
+  if (await handleCommand(text)) return; // slash command, done
+
   const pendingEmails = Object.keys(state.pending);
   if (pendingEmails.length === 0) return; // nothing to submit to
 
