@@ -121,13 +121,34 @@ cmd_cancel() {
     tmux kill-session -t "$sess" 2>/dev/null && echo "cancelled $email" || echo "no session for $email"
 }
 
+# Kill ccslogin-* sessions older than max_age seconds (default 900). A `start`
+# whose user never replies (no submit, no cancel) would otherwise leave the
+# session — and its idle `claude auth login` child — around forever. Killing
+# the session triggers cmd_login's signal trap, so the child is reaped and the
+# lock (if somehow held) is freed. Prints the emails it reaped.
+cmd_reap() {
+    local max_age="${1:-900}"
+    local now epoch name created age
+    now=$(date +%s)
+    # session_created is epoch seconds; older tmux lacks it -> skip safely.
+    while IFS=' ' read -r name created; do
+        [[ "$name" == ccslogin-* ]] || continue
+        [[ "$created" =~ ^[0-9]+$ ]] || continue
+        age=$(( now - created ))
+        if (( age >= max_age )); then
+            tmux kill-session -t "$name" 2>/dev/null && echo "reaped $name (age ${age}s)"
+        fi
+    done < <(tmux list-sessions -F '#{session_name} #{session_created}' 2>/dev/null)
+}
+
 case "${1:-}" in
     start)  shift; cmd_start "$@" ;;
     submit) shift; cmd_submit "$@" ;;
     status) shift; cmd_status "$@" ;;
     cancel) shift; cmd_cancel "$@" ;;
+    reap)   shift; cmd_reap "$@" ;;
     *)
-        echo "usage: $0 {start <email>|submit <email> <code>|status <email>|cancel <email>}" >&2
+        echo "usage: $0 {start <email>|submit <email> <code>|status <email>|cancel <email>|reap [max_age_sec]}" >&2
         exit 2
         ;;
 esac

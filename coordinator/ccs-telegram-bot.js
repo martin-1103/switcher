@@ -146,7 +146,24 @@ function emailToNum(accounts, email) {
 }
 
 // ---- detect loop ----
+const REAP_AGE = Number(process.env.CCS_BOT_REAP_AGE || 900); // seconds
+
 async function detect() {
+  // Reap stale login sessions (user got a URL but never replied). Then drop
+  // pending entries whose session no longer exists, so a stale pending doesn't
+  // block re-notifying that account.
+  const reaped = await run('bash', [BRIDGE, 'reap', String(REAP_AGE)]);
+  if (reaped.stdout.trim()) console.log('reaped:', reaped.stdout.trim());
+  for (const email of Object.keys(state.pending)) {
+    const chk = await run('bash', [BRIDGE, 'status', email]);
+    if (chk.code !== 0) {
+      delete state.pending[email];
+      // Also un-notify so a still-expired account gets a fresh URL next cycle.
+      state.notified = state.notified.filter((e) => e !== email);
+      saveState();
+    }
+  }
+
   let expired, all, accounts;
   try { ({ expired, all, accounts } = await listExpired()); }
   catch (e) { console.error('detect: ccs ls failed:', e.message); return; }
