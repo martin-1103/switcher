@@ -189,6 +189,7 @@ const HELP = [
   'ccs re-login bot commands:',
   '/status — accounts + which are expired/pending',
   '/login <num> — start a re-login now (don\'t wait for expiry)',
+  '/switch <num> — switch active account to <num>',
   '/pending — logins awaiting a code',
   '/cancel <num> — abandon a pending login',
   '/ids — list authorized users',
@@ -256,6 +257,19 @@ async function handleCommand(text, from) {
       delete state.pending[email];
       saveState();
       await reply(`Cancelled account ${arg} (${email}). ${r.stdout.trim()}`);
+      return true;
+    }
+    case '/switch': {
+      if (!/^\d+$/.test(arg)) { await reply('Usage: /switch <num> (account number from /status)'); return true; }
+      const email = await numToEmail(arg);
+      if (!email) { await reply(`No account numbered ${arg}. See /status.`); return true; }
+      await reply(`Switching to account ${arg} (${email})…`);
+      const r = await run(CCS_BIN, ['to', arg]);
+      const out = (r.stdout.trim() + '\n' + r.stderr.trim()).trim();
+      // Broadcast: the active account is shared state across all users.
+      await send(r.code === 0
+        ? `🔀 Switched to account ${arg} (${email}):\n${out || 'done'}`
+        : `❌ Switch to ${arg} failed:\n${out || 'unknown error'}`);
       return true;
     }
     case '/ids': {
