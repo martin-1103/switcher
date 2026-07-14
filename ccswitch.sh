@@ -3164,25 +3164,17 @@ cmd_login() {
         esac
     done
 
-    # Block long enough for a transient background rate-check (which holds the
-    # lock only briefly, non-blocking) to release. Human login itself happens
-    # AFTER we hold the lock, so this timeout only covers lock contention.
-    if ! acquire_switch_lock 30; then
-        echo "Error: could not acquire switch lock (another switch/login in progress). Try again." >&2
-        exit 1
-    fi
-    export CCS_LOCK_HELD=1
-    trap 'release_switch_lock; unset CCS_LOCK_HELD' RETURN EXIT
-    # tmux kill-session (used by the automation bridge on timeout/cancel) sends
-    # SIGHUP/SIGTERM, which bypass the RETURN/EXIT trap: the lock would leak and
-    # the child `claude auth login` would be orphaned, wedging every switch.
-    # rm the lock dir DIRECTLY (release_switch_lock is a no-op while
-    # CCS_LOCK_HELD=1, and dead-owner stale-reclaim is unreliable under PID
-    # reuse), then kill the whole process group (child included) and exit.
-    trap 'rm -rf "$LOCK_DIR" 2>/dev/null; kill 0 2>/dev/null; exit 130' INT TERM HUP
-
     local before_email=""
     before_email=$(claude auth status --json 2>/dev/null | jq -r '.email // empty' 2>/dev/null)
+
+    # Human login runs WITHOUT the switch lock. It can take minutes (open phone,
+    # incognito, sign in), and holding the lock that whole time freezes every
+    # rate-check/statusline/usage refresh. The race we actually guard is the
+    # brief window where the freshly-written credential is read by add — so the
+    # lock is taken only AFTER login succeeds, around verify+capture. On a
+    # signal during login (e.g. the bridge's kill-session on timeout), no lock
+    # is held yet; just kill the child `claude auth login` and exit.
+    trap 'kill 0 2>/dev/null; exit 130' INT TERM HUP
 
     echo "Starting login${email:+ for $email}. Log in with a clean/incognito browser as the intended account." >&2
     if ! claude auth login "${extra[@]}"; then
@@ -3200,10 +3192,34 @@ cmd_login() {
         echo "Warning: requested $email but logged in as $after_email (browser session was signed in to a different account)." >&2
         echo "Capturing $after_email anyway. Re-run in incognito if this is wrong." >&2
     fi
+
+    # NOW take the lock, only for the verify+capture window. Short timeout: a
+    # background rate-check holds it only briefly.
+    if ! acquire_switch_lock 30; then
+        echo "Error: could not acquire switch lock to capture the login (another switch in progress). Re-run 'ccs add' once it clears." >&2
+        exit 1
+    fi
+    export CCS_LOCK_HELD=1
+    # Under the lock, release-on-signal must rm the dir directly
+    # (release_switch_lock is a no-op while CCS_LOCK_HELD=1, and dead-owner
+    # stale-reclaim is unreliable under PID reuse).
+    trap 'rm -rf "$LOCK_DIR" 2>/dev/null; kill 0 2>/dev/null; exit 130' INT TERM HUP
+    trap 'release_switch_lock; unset CCS_LOCK_HELD' RETURN EXIT
+
+    # Re-verify UNDER the lock: between login finishing and acquiring the lock,
+    # a background auto-switch could have swapped the live credential to another
+    # account. If the live account no longer matches what we just logged in as,
+    # cmd_add_account would capture the WRONG account (the hiro->ezwapi bug).
+    # Abort instead of capturing the wrong one.
+    local locked_email=""
+    locked_email=$(claude auth status --json 2>/dev/null | jq -r '.email // empty' 2>/dev/null)
+    if [[ "$locked_email" != "$after_email" ]]; then
+        echo "Error: active account changed from $after_email to ${locked_email:-none} before capture (a switch raced the login). Nothing captured — re-run 'ccs add' while $after_email is active." >&2
+        exit 1
+    fi
     log_credential_event "cmd_login: captured $after_email (was ${before_email:-none})"
 
-    # Still inside the lock: cmd_add_account reads the live credential we just
-    # wrote. CCS_LOCK_HELD makes its lock acquisition reentrant (no deadlock).
+    # Inside the lock; CCS_LOCK_HELD makes cmd_add_account's acquire reentrant.
     cmd_add_account "${passthrough[@]+"${passthrough[@]}"}"
 }
 
