@@ -172,12 +172,13 @@ async function detect() {
   state.notified = state.notified.filter((e) => expired.has(e));
 
   for (const email of expired) {
-    if (state.notified.includes(email)) continue; // already announced
-    if (state.pending[email]) continue;            // already awaiting a code
-    state.notified.push(email); // mark before start so a failed start doesn't retry every interval
+    if (state.notified.includes(email)) continue; // already announced this expiry
+    state.notified.push(email);
     saveState();
     const num = emailToNum(accounts, email);
-    await startLogin(email, num, `🔑 Account ${num} expired: ${email}`);
+    // Notify only — do NOT auto-start a login (an unanswered auto-URL just
+    // spawns zombie sessions). The user triggers login explicitly with /login.
+    await send(`⚠️ Account ${num} expired: ${email}\nPlease re-login: /login ${num}`);
   }
 }
 
