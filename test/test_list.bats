@@ -37,9 +37,9 @@ teardown() {
 
     run run_ccswitch --list
     [ "$status" -eq 0 ]
-    [[ "$output" == *"user1@example.com (active)"* ]]
+    [[ "$output" == *"1: user1@example.com"* ]]
     # user2 should NOT be marked active
-    [[ "$output" != *"user2@example.com (active)"* ]]
+    [[ "$output" != *"2: user2@example.com (active)"* ]]
 }
 
 @test "test_list_ordering_matches_sequence" {
@@ -61,7 +61,7 @@ teardown() {
     [ "$bravo_line" -lt "$charlie_line" ]
 }
 
-@test "list renders cached credential health without coordinator requests" {
+@test "list keeps cached health tag compact without coordinator requests" {
     setup_fake_account "user1@example.com" "uuid-1"
     add_account_to_sequence "1" "user1@example.com" "uuid-1" "true"
     local updated
@@ -74,6 +74,24 @@ EOF
     chmod +x "$MOCK_BIN/curl"
 
     run run_ccswitch ls
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"[RELOGIN_REQUIRED]"* ]]
+    [[ "$output" != *"health:"* ]]
+}
+
+@test "list --health renders cached credential health detail" {
+    setup_fake_account "user1@example.com" "uuid-1"
+    add_account_to_sequence "1" "user1@example.com" "uuid-1" "true"
+    local updated
+    updated=$(jq '.accounts["1"].authState = "invalid" | .accounts["1"].credentialHealth = {status:"invalid", sourceServer:"server-a", reason:"http_401", fingerprint:"fp", observedAt:123}' "$SEQUENCE_FILE")
+    printf '%s\n' "$updated" > "$SEQUENCE_FILE"
+    cat > "$MOCK_BIN/curl" <<'EOF'
+#!/usr/bin/env bash
+exit 99
+EOF
+    chmod +x "$MOCK_BIN/curl"
+
+    run run_ccswitch ls --health
     [ "$status" -eq 0 ]
     [[ "$output" == *"[RELOGIN_REQUIRED]"* ]]
     [[ "$output" == *"health: local=invalid remote=unknown"* ]]
