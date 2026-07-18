@@ -1,7 +1,7 @@
 # cc-account-switcher — map for AI agents
 
 Single-file bash CLI (`ccswitch.sh`, installed as `ccs`) managing multiple Claude Code
-OAuth accounts: switch, auto-switch on rate limit, keepalive refresh, usage cache.
+OAuth accounts: switch, auto-switch on rate limit, usage cache.
 
 Kept as ONE file on purpose — packaged via Homebrew Formula, npm wrapper (`bin/ccswitch`),
 and curl-install, all of which assume a single executable. Don't split it into lib/*.sh
@@ -14,7 +14,6 @@ without also updating `Formula/`, `bin/ccswitch`, and `Makefile install`.
 | Everything core (switch, cred, cache, coord) | `ccswitch.sh` | grep `# ===== ` markers below to jump to a section |
 | PreToolUse hook (per-tool-call rate check) | `hooks/ccs-rate-hook.sh` | fast-path reads cache only, never calls rate-check itself unless stale/over-threshold |
 | Statusline render | `statusline/ccs-statusline.sh` | spawns `ccs rate-check --auto-switch` in background, throttled 10s, prints from cache |
-| Keepalive timer unit | `coordinator/ccs-keepalive.timer` + `.service` | 15min interval, `ccs keepalive --min-age 300 --lead-seconds 1800` |
 | Multi-host coordination (leases, shared state) | `ccswitch.sh` `coord_*` functions | HTTP or MySQL backend, see `coord_mode()` |
 
 Installed copies live at `/usr/local/bin/ccs`, `/usr/local/bin/hooks/...`,
@@ -36,10 +35,7 @@ the file changes — use grep, don't trust these as gospel.
   synthetic "fully exhausted" cache instead of failing (see `write_limited_usage_cache`)
 - **Account resolution/credentials** (~1230-1440): `get_current_account`,
   `usage_cache_file` (per-account cache path — always call this, never hardcode
-  `/tmp/claude-usage-cache.json`), `credential_*` helpers, `refresh_credential_tokens`
-- **Keepalive** (~1439-1511): `cmd_keepalive` — the SOLE place that calls the OAuth
-  refresh endpoint (`POST /v1/oauth/token`). Gated on `credential_expires_epoch()` vs
-  `--lead-seconds`, not on last-refresh age. Nothing else refreshes reactively.
+  `/tmp/claude-usage-cache.json`), and `credential_*` helpers
 - **Credential storage** (~1511-1970): read/write per-account credential files, coord
   publish/fetch, JWT decode
 - **Process control** (~1965-2010): kill/restart Claude Code around a switch
@@ -60,11 +56,6 @@ the file changes — use grep, don't trust these as gospel.
 - **Usage API** (`GET /api/oauth/usage`) — read-only, how much quota is left. Called by
   statusline (every ~10s throttled), the hook (only when cache stale/over-threshold),
   every switch, and `cmd_warm_check`. High call volume by design; has its own 429 pool.
-- **Refresh Token API** (`POST /v1/oauth/token`) — mutates the stored access token.
-  Called ONLY by `cmd_keepalive`. If you're tempted to add a refresh-on-401 anywhere
-  else, don't — that was ripped out deliberately (see git log "sole OAuth refresh
-  path") because two refresh paths racing is what caused repeated 429s on that
-  endpoint.
 
 ## Conventions this codebase enforces
 
@@ -73,7 +64,7 @@ the file changes — use grep, don't trust these as gospel.
   (`/tmp/claude-usage-cache.json`) is a bug, not a shortcut — it lets a stale fetch for
   account A get read back as account B's usage after a switch.
 - Fail open in hooks/statusline (never block the user on our bugs); fail loud in
-  keepalive/switch (log to `credential-events.log` via `log_credential_event`).
+  switch (log to `credential-events.log` via `log_credential_event`).
 - `set -uo pipefail` in hook/statusline scripts — an unset var referenced anywhere
   after removing a variable's assignment breaks the script silently under `trap 'exit
   0' ERR`. When removing/renaming a variable, grep every remaining reference first.

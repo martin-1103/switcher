@@ -16,3 +16,6 @@ Thumbs.db
 # npm
 node_modules/
 *.tgz
+
+# Contains SSH password — never commit
+connectgass.sh

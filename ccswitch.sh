@@ -42,6 +42,7 @@ readonly SWITCH_REFUSED_COOLDOWN_S=900
 # can't self-heal by retrying sooner.
 readonly SWITCH_TRANSIENT_COOLDOWN_S=30
 readonly SWITCH_COOLDOWN_DIR="$BACKUP_DIR/.switch-cooldown"
+readonly COORD_EVENT_CURSOR_FILE="$BACKUP_DIR/coord-event-cursor"
 # Keepalive backoff state: once the OAuth refresh endpoint (POST
 # /v1/oauth/token) returns 429, back off the WHOLE keepalive run (not just
 # that account) since observed 429s rotate across different accounts on this
@@ -2047,6 +2048,74 @@ pull_coordinator_credentials_if_fresher() {
     log_credential_event "pulled fresher credentials from coordinator for Account-$active_num ($active_email): token ${old_hash}->${new_hash} (caller=pull_coordinator_credentials_if_fresher)"
 }
 
+# Reconcile one account after a coordinator credential.updated event. Events
+# carry metadata only; tokens are fetched through the authenticated API.
+coord_reconcile_credential_email() {
+    local email="$1"
+    [[ -n "$email" ]] || return 1
+
+    local coord_creds local_num local_creds local_updated coord_updated
+    coord_creds=$(coord_fetch_credential "$email" 2>/dev/null) || return 1
+    credential_is_usable "$coord_creds" || return 1
+    local_num=$(resolve_account_identifier "$email" 2>/dev/null || true)
+    [[ -n "$local_num" ]] || return 0
+    local_creds=$(read_account_credentials "$local_num" "$email")
+    local_updated=$(echo "$local_creds" | jq -r '.credentialUpdatedAt // .claudeAiOauth.credentialUpdatedAt // 0' 2>/dev/null || echo 0)
+    coord_updated=$(echo "$coord_creds" | jq -r '.credentialUpdatedAt // .claudeAiOauth.credentialUpdatedAt // 0' 2>/dev/null || echo 0)
+    [[ "$local_updated" =~ ^[0-9]+$ ]] || local_updated=0
+    [[ "$coord_updated" =~ ^[0-9]+$ ]] || coord_updated=0
+    (( coord_updated > local_updated )) || return 0
+
+    if ! acquire_switch_lock 2; then
+        return 1
+    fi
+    write_account_credentials "$local_num" "$email" "$coord_creds"
+    if [[ "$(get_current_account)" == "$email" ]]; then
+        write_credentials "$coord_creds" >/dev/null 2>&1 || true
+    fi
+    release_switch_lock
+    log_credential_event "reconciled coordinator credential for Account-$local_num ($email): version=$coord_updated (caller=coord_listen)"
+}
+
+# Long-lived metadata-only coordinator subscription. Reconnects and replays
+# from the last durable event id; rate-check remains the periodic fallback.
+cmd_coord_listen() {
+    coord_http_ready || { echo "Error: HTTP coordinator is not configured" >&2; return 1; }
+    local cursor=0 line pending_id data email event_type url token
+    cursor=$(cat "$COORD_EVENT_CURSOR_FILE" 2>/dev/null || echo 0)
+    [[ "$cursor" =~ ^[0-9]+$ ]] || cursor=0
+    while true; do
+        url="$(coord_config_value '.coordination.http.url')/v1/events?after=${cursor}"
+        token=$(coord_config_value '.coordination.http.token')
+        log_credential_event "coord_listen connecting after=$cursor"
+        pending_id=""
+        while IFS= read -r line; do
+            case "$line" in
+                id:*) pending_id="${line#id: }" ;;
+                data:*)
+                    data="${line#data: }"
+                    email=$(echo "$data" | jq -r '.email // empty' 2>/dev/null || true)
+                    event_type=$(echo "$data" | jq -r '.type // "unknown"' 2>/dev/null || echo unknown)
+                    log_credential_event "coord_listen event id=${pending_id:-unknown} type=$event_type email=${email:-unknown}"
+                    if [[ -n "$email" ]] && coord_reconcile_credential_email "$email"; then
+                        if [[ "$pending_id" =~ ^[0-9]+$ ]]; then
+                            cursor="$pending_id"
+                            printf '%s\n' "$cursor" > "$COORD_EVENT_CURSOR_FILE"
+                        fi
+                        log_credential_event "coord_listen handled id=${pending_id:-unknown} email=${email:-unknown} cursor=$cursor"
+                    else
+                        log_credential_event "coord_listen handle_failed id=${pending_id:-unknown} email=${email:-unknown}; cursor stays=$cursor"
+                    fi
+                    pending_id=""
+                    ;;
+            esac
+        done < <(curl -sS -N --connect-timeout "${CCS_CURL_CONNECT_TIMEOUT:-$DEFAULT_CURL_CONNECT_TIMEOUT}" \
+            -H "Authorization: Bearer $token" "$url" 2>/dev/null || true)
+        log_credential_event "coord_listen disconnected after=$cursor; reconnecting_in=2s"
+        sleep 2
+    done
+}
+
 # Read account credentials from backup
 read_account_credentials() {
     local account_num="$1"
@@ -3409,6 +3478,7 @@ cmd_list() {
         [[ -n "$usage_line" ]] && echo "      usage: ${usage_line}"
         [[ -n "$reset_line" ]] && echo "      reset: ${reset_line}"
     done <<< "$accounts"
+    return 0
 }
 
 # Switch to next account
@@ -4407,6 +4477,122 @@ cmd_statusline_setup() {
     echo "  Settings: $settings_file"
 }
 
+# ===== OPEN OAUTH =====
+# Open the Claude Code OAuth authorization page in Chrome and auto-click
+# the "Authorize" button using Chrome DevTools Protocol (CDP).
+# Usage: ccs open oauth [--port PORT] [--timeout SECONDS]
+cmd_open_oauth() {
+    local cdp_port=9222
+    local timeout=120
+    local email=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --port) cdp_port="$2"; shift 2 ;;
+            --timeout) timeout="$2"; shift 2 ;;
+            --email) email="$2"; shift 2 ;;
+            *) echo "Unknown option: $1"; return 1 ;;
+        esac
+    done
+
+    # Resolve path to the Node.js helper script.
+    local script_dir helper_script
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    helper_script="$script_dir/lib/oauth-autoclick.mjs"
+
+    if [[ ! -f "$helper_script" ]]; then
+        echo "Error: helper script not found at $helper_script"
+        echo "Run: npm install -g cc-account-switcher  or copy lib/oauth-autoclick.mjs"
+        return 1
+    fi
+
+    # 1. Check if Chrome is available.
+    local chrome_bin=""
+    for bin in google-chrome google-chrome-stable chromium chromium-browser; do
+        if command -v "$bin" &>/dev/null; then
+            chrome_bin="$bin"
+            break
+        fi
+    done
+    if [[ -z "$chrome_bin" ]]; then
+        echo "Error: Chrome/Chromium not found. Install it first."
+        return 1
+    fi
+
+    # 2. Check/ensure CDP endpoint is available.
+    local chrome_needs_start=false
+    if ! curl -sf "http://127.0.0.1:${cdp_port}/json/version" &>/dev/null; then
+        echo "Chrome CDP not running on port ${cdp_port}."
+        chrome_needs_start=true
+        # Check if Chrome is already running without CDP.
+        local chrome_pid
+        chrome_pid=$(pgrep -x "$(basename "$chrome_bin")" 2>/dev/null || true)
+        if [[ -n "$chrome_pid" ]]; then
+            echo "Chrome is running but without --remote-debugging-port=${cdp_port}."
+            echo "Please quit Chrome and re-launch with:"
+            echo "  ${chrome_bin} --remote-debugging-port=${cdp_port} &"
+            echo ""
+            echo -n "Or press Enter to start a new Chrome instance with CDP (separate profile)... "
+            read -r </dev/tty
+        fi
+
+        echo "Starting Chrome with remote debugging on port ${cdp_port}..."
+        # Use a separate user-data-dir so we don't interfere with existing sessions.
+        local user_data_dir="/tmp/ccs-chrome-cdp-${USER}"
+        mkdir -p "$user_data_dir"
+        "$chrome_bin" \
+            --remote-debugging-port="$cdp_port" \
+            --remote-allow-origins="*" \
+            --user-data-dir="$user_data_dir" \
+            --no-first-run \
+            --no-default-browser-check \
+            >/dev/null 2>&1 &
+        local chrome_pid=$!
+        echo "Chrome started (PID ${chrome_pid}, profile: ${user_data_dir})."
+
+        # Wait for CDP to be ready.
+        local i
+        for i in $(seq 1 20); do
+            if curl -sf "http://127.0.0.1:${cdp_port}/json/version" &>/dev/null; then
+                break
+            fi
+            sleep 1
+        done
+        if ! curl -sf "http://127.0.0.1:${cdp_port}/json/version" &>/dev/null; then
+            echo "Error: Chrome did not start CDP on port ${cdp_port}."
+            return 1
+        fi
+        echo "Chrome CDP ready."
+    fi
+
+    # 3. Build claude auth login args.
+    local login_args=("--claudeai")
+    [[ -n "$email" ]] && login_args+=("--email" "$email")
+
+    # 4. Run the auto-click helper in the background.
+    echo "Starting OAuth auto-click helper..."
+    node "$helper_script" "$cdp_port" "$timeout" &
+    local autoclick_pid=$!
+
+    # 5. Run claude auth login.
+    echo "Opening Claude Code OAuth authorization page..."
+    echo "(The CDP helper will auto-click the 'Authorize' button when the page loads.)"
+    claude auth login "${login_args[@]}"
+    local login_exit=$?
+
+    # 6. Wait for auto-click helper and cleanup.
+    wait "$autoclick_pid" 2>/dev/null || true
+
+    if [[ $login_exit -eq 0 ]]; then
+        echo "✓ Login successful."
+    else
+        echo "✗ Login failed (exit code ${login_exit})."
+        echo "  The OAuth page may have opened — check your browser."
+        echo "  Tip: if Chrome CDP auto-click didn't work, run 'claude auth login' manually."
+    fi
+
+    return $login_exit
+}
+
 # Show usage
 # ===== CLI DISPATCH =====
 show_usage() {
@@ -4445,6 +4631,12 @@ show_usage() {
     echo "  coord-sync                       Publish current active lease to coordinator"
     echo "  coord-push [--all]               Publish active (or all) account credentials to coordinator"
     echo "  coord-pull                       Import/backfill account credentials from coordinator"
+    echo "  coord-listen                    Subscribe to credential update events"
+    echo ""
+    echo "OAuth Automation:"
+    echo "  open oauth [--port PORT] [--timeout SEC] [--email X]"
+    echo "                    Run claude auth login and auto-click Authorize button"
+    echo "                    via Chrome DevTools Protocol (default port 9222)"
     echo ""
     echo "Diagnostics:"
     echo "  check                            Verify backup integrity (JSON, permissions, keychain)"
@@ -4472,6 +4664,7 @@ show_usage() {
     echo "  ccs dir ~/work 1                           # Map ~/work to account 1"
     echo "  ccs auto                                   # Switch based on current directory"
     echo "  ccs rm user@example.com                    # Remove account"
+    echo "  ccs open oauth                             # Auto-click Authorize in browser"
 }
 
 # Main script logic
@@ -4573,10 +4766,6 @@ main() {
             shift
             cmd_warm_loop "$@"
             ;;
-        keepalive)
-            shift
-            cmd_keepalive "$@"
-            ;;
         coord-setup)
             shift
             cmd_coord_setup "$@"
@@ -4601,6 +4790,22 @@ main() {
             ;;
         coord-pull)
             cmd_coord_pull
+            ;;
+        coord-listen)
+            cmd_coord_listen
+            ;;
+        open)
+            shift
+            case "${1:-}" in
+                oauth)
+                    shift
+                    cmd_open_oauth "$@"
+                    ;;
+                *)
+                    echo "Usage: ccs open oauth [--port PORT] [--timeout SECONDS] [--email X]"
+                    exit 1
+                    ;;
+            esac
             ;;
         check|--check)
             cmd_check

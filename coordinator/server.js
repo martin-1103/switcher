@@ -12,6 +12,8 @@ const TOKEN = process.env.CCS_COORD_TOKEN || '';
 const STATE_FILE = process.env.CCS_COORD_STATE_FILE || '/var/lib/ccs-coordinator/state.json';
 const LEASE_TTL = Number(process.env.CCS_COORD_LEASE_TTL || 180);
 const CRED_KEY_HEX = process.env.CCS_COORD_CRED_KEY || '';
+const EVENT_LIMIT = Number(process.env.CCS_COORD_EVENT_LIMIT || 1000);
+const sseClients = new Set();
 
 if (!TOKEN) {
   console.error('CCS_COORD_TOKEN is required');
@@ -67,9 +69,15 @@ function loadState() {
     if (!state.credentials || typeof state.credentials !== 'object') {
       state.credentials = {};
     }
+    if (!Array.isArray(state.events)) {
+      state.events = [];
+    }
+    if (!Number.isFinite(Number(state.eventSeq))) {
+      state.eventSeq = state.events.reduce((max, event) => Math.max(max, Number(event.id || 0)), 0);
+    }
     return state;
   } catch {
-    return { leases: {}, usageSnapshots: {}, credentials: {} };
+    return { leases: {}, usageSnapshots: {}, credentials: {}, events: [], eventSeq: 0 };
   }
 }
 
@@ -136,6 +144,36 @@ function unauthorized(res) {
 function authOk(req) {
   const header = req.headers.authorization || '';
   return header === `Bearer ${TOKEN}`;
+}
+
+function logEvent(message) {
+  console.log(`[coord] ${new Date().toISOString()} ${message}`);
+}
+
+function writeSse(res, event) {
+  res.write(`id: ${event.id}\n`);
+  res.write(`event: ${event.type}\n`);
+  res.write(`data: ${JSON.stringify(event)}\n\n`);
+}
+
+function emitEvent(state, type, payload) {
+  const event = {
+    id: String(Number(state.eventSeq || 0) + 1),
+    type,
+    ...payload,
+    emittedAt: Date.now(),
+  };
+  state.eventSeq = Number(event.id);
+  state.events = [...(state.events || []), event].slice(-Math.max(1, EVENT_LIMIT));
+  logEvent(`event_emit id=${event.id} type=${type} email=${event.email || '-'} version=${event.credentialUpdatedAt || 0} clients=${sseClients.size}`);
+  for (const client of sseClients) {
+    try {
+      writeSse(client, event);
+    } catch {
+      sseClients.delete(client);
+    }
+  }
+  return event;
 }
 
 function normalizeLease(input) {
@@ -231,6 +269,30 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { leases });
     }
 
+    if (req.method === 'GET' && url.pathname === '/v1/events') {
+      const after = Number(url.searchParams.get('after') || 0);
+      const replay = (state.events || []).filter(event => Number(event.id) > after);
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        Connection: 'keep-alive',
+        'X-Accel-Buffering': 'no',
+      });
+      res.write(': connected\n\n');
+      for (const event of replay) writeSse(res, event);
+      logEvent(`sse_connect after=${after} replay=${replay.length} clients=${sseClients.size + 1}`);
+      const heartbeat = setInterval(() => {
+        if (!res.destroyed) res.write(': heartbeat\n\n');
+      }, 25000);
+      sseClients.add(res);
+      req.on('close', () => {
+        clearInterval(heartbeat);
+        sseClients.delete(res);
+        logEvent(`sse_close clients=${sseClients.size}`);
+      });
+      return;
+    }
+
     if (req.method === 'GET' && url.pathname === '/v1/leases/owner') {
       const email = String(url.searchParams.get('email') || '').trim();
       const serverId = String(url.searchParams.get('serverId') || '').trim();
@@ -320,10 +382,12 @@ const server = http.createServer(async (req, res) => {
       if (existing) {
         const existingPlain = decryptCredential(existing);
         if (Number(existingPlain.credentialUpdatedAt || 0) >= credentialUpdatedAt) {
+          logEvent(`credential_reject email=${email} incoming_version=${credentialUpdatedAt} existing_version=${existingPlain.credentialUpdatedAt || 0}`);
           return send(res, 200, { ok: true, accepted: false, reason: 'existing credential is fresher or equal' });
         }
       }
       fresh.credentials[email] = encryptCredential({ accessToken, refreshToken, expiresAt, refreshTokenExpiresAt, scopes, credentialUpdatedAt, updatedAt: now });
+      emitEvent(fresh, 'credential.updated', { email, credentialUpdatedAt });
       saveState(fresh);
       return send(res, 200, { ok: true, accepted: true });
     }
