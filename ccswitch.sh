@@ -2618,7 +2618,9 @@ cmd_coord_pull() {
     output=$(coord_pull_accounts) || pull_status=$?
     if [[ "$pull_status" -ne 0 ]]; then
         return "$pull_status"
-    elif [[ -n "$output" ]]; then
+    fi
+    pull_coordinator_credentials_if_fresher
+    if [[ -n "$output" ]]; then
         printf '%s\n' "$output"
     else
         echo "No accounts to pull (no leases or no new accounts)."
