@@ -3980,11 +3980,16 @@ cmd_repair_invalid_accounts() {
 # probe_account_credential path; this command only controls bounded selection.
 cmd_health_check() {
     local check_all=false
+    local probe_delay=3
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --all)
                 check_all=true
                 shift
+                ;;
+            --delay)
+                probe_delay="$2"
+                shift 2
                 ;;
             *)
                 echo "Error: Unknown health-check option '$1'" >&2
@@ -4020,6 +4025,10 @@ cmd_health_check() {
             continue
         fi
 
+        # Space probes out — the usage endpoint 429s on bursts, and a throttled
+        # probe tells us nothing about the credential.
+        [[ "${probed_any:-false}" == true && "$probe_delay" -gt 0 ]] && sleep "$probe_delay"
+        local probed_any=true
         local probe_rc=0
         probe_account_credential "$num" "$creds" "$source_server" || probe_rc=$?
         local result_status="unknown"
@@ -5307,7 +5316,7 @@ show_usage() {
     echo "  login [--email X] [--console]    Log in (lock-held) then add, atomically"
     echo "  rm <num|email>                   Remove account by number or email"
     echo "  ls [--health] [--repair]         List accounts; repair local invalid from coordinator"
-    echo "  health-check [--all]             Probe local credentials once; never switch"
+    echo "  health-check [--all] [--delay N] Probe local credentials once (N s between probes, default 3); never switch"
     echo ""
     echo "Switching:"
     echo "  sw                               Rotate to next account in sequence"
