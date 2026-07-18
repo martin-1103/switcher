@@ -3808,6 +3808,11 @@ first_run_setup() {
 
 # List accounts
 cmd_list() {
+    local show_health=false
+    if [[ "${1:-}" == "--health" ]]; then
+        show_health=true
+    fi
+
     if [[ ! -f "$SEQUENCE_FILE" ]]; then
         echo "No accounts are managed yet."
         first_run_setup
@@ -3871,8 +3876,75 @@ cmd_list() {
         [[ -n "$usage_line" ]] && echo "      usage: ${usage_line}"
         [[ -n "$reset_line" ]] && echo "      reset: ${reset_line}"
 
-        echo "      health: local=${local_health} remote=${remote_health_line:-unknown} source=${health_source:-unknown} reason=${health_reason:-unknown} observed=${health_observed:-0} fingerprint=${health_fingerprint:-none}"
+        if [[ "$show_health" == true ]]; then
+            echo "      health: local=${local_health} remote=${remote_health_line:-unknown} source=${health_source:-unknown} reason=${health_reason:-unknown} observed=${health_observed:-0} fingerprint=${health_fingerprint:-none}"
+        fi
     done <<< "$accounts"
+    return 0
+}
+
+# Probe local account credentials once per invocation without selecting or
+# switching an account. Health results are persisted/reported by the existing
+# probe_account_credential path; this command only controls bounded selection.
+cmd_health_check() {
+    local check_all=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --all)
+                check_all=true
+                shift
+                ;;
+            *)
+                echo "Error: Unknown health-check option '$1'" >&2
+                return 1
+                ;;
+        esac
+    done
+
+    [[ -f "$SEQUENCE_FILE" ]] || { echo "No accounts are managed yet."; return 0; }
+
+    if ! acquire_switch_lock 10; then
+        echo "Error: another account switch is in progress (could not acquire lock)." >&2
+        return 1
+    fi
+    local lock_owned=true
+    trap 'if [[ "${lock_owned:-false}" == true ]]; then release_switch_lock; fi' RETURN
+
+    local source_server num email creds cached_health
+    source_server=$(coord_server_id 2>/dev/null || echo "local")
+    while IFS= read -r num; do
+        [[ -n "$num" ]] || continue
+        email=$(jq -r --arg num "$num" '.accounts[$num].email // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
+        [[ -n "$email" ]] || { echo "SKIP account=$num status=skipped source=$source_server reason=expired_or_missing"; continue; }
+        creds=$(read_account_credentials "$num" "$email")
+        if ! credential_is_usable "$creds"; then
+            echo "SKIP account=$num email=$email status=skipped source=$source_server reason=expired_or_missing"
+            continue
+        fi
+
+        cached_health=$(jq -r --arg num "$num" '.accounts[$num].credentialHealth.status // "unknown"' "$SEQUENCE_FILE" 2>/dev/null || echo unknown)
+        if [[ "$check_all" != true && "$cached_health" != unknown ]]; then
+            echo "SKIP account=$num email=$email status=$cached_health source=$source_server reason=not_unknown"
+            continue
+        fi
+
+        local probe_rc=0
+        probe_account_credential "$num" "$creds" "$source_server" || probe_rc=$?
+        local result_status="unknown"
+        case "${SWITCH_PROBE_RESULT:-}" in
+            healthy) result_status=healthy ;;
+            invalid) result_status=invalid ;;
+            transient)
+                [[ "${SWITCH_PROBE_STATUS:-}" == 429 ]] && result_status=throttled
+                ;;
+        esac
+        [[ "$result_status" == unknown && "$probe_rc" -eq 1 ]] && result_status=invalid
+        echo "CHECK account=$num email=$email status=$result_status source=$source_server reason=${SWITCH_PROBE_REASON:-unknown}"
+    done < <(jq -r '.sequence[]' "$SEQUENCE_FILE" 2>/dev/null)
+
+    lock_owned=false
+    release_switch_lock
+    trap - RETURN
     return 0
 }
 
@@ -5142,7 +5214,8 @@ show_usage() {
     echo "  add [--type team|max20]          Add current account to managed accounts"
     echo "  login [--email X] [--console]    Log in (lock-held) then add, atomically"
     echo "  rm <num|email>                   Remove account by number or email"
-    echo "  ls                               List all managed accounts"
+    echo "  ls [--health]                    List all managed accounts"
+    echo "  health-check [--all]             Probe local credentials once; never switch"
     echo ""
     echo "Switching:"
     echo "  sw                               Rotate to next account in sequence"
@@ -5265,7 +5338,12 @@ main() {
             cmd_remove_account "$@"
             ;;
         ls|--list)
-            cmd_list
+            shift
+            cmd_list "$@"
+            ;;
+        health-check)
+            shift
+            cmd_health_check "$@"
             ;;
         sw|--switch)
             cmd_switch
