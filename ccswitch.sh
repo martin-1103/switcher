@@ -2904,6 +2904,7 @@ cmd_coord_push() {
 
     local push_all=false
     local baseline=false
+    local force=false
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --all)
@@ -2915,13 +2916,22 @@ cmd_coord_push() {
                 baseline=true
                 shift
                 ;;
+            --force)
+                force=true
+                shift
+                ;;
             *)
                 shift
                 ;;
         esac
     done
 
-    local num email creds
+    if [[ "$force" == true && "$push_all" != true ]]; then
+        echo "Error: --force requires --all." >&2
+        return 1
+    fi
+
+    local num email creds accepted_count=0 rejected_count=0 failed_count=0
     if [[ "$push_all" == true ]]; then
         [[ "$baseline" == true ]] && echo "Credential baseline push: usable local credentials only; coordinator healthy sources are protected."
         local nums
@@ -2936,13 +2946,29 @@ cmd_coord_push() {
                 continue
             fi
             local push_status=0
-            coord_publish_credential "$email" "$creds" || push_status=$?
+            if [[ "$force" == true ]]; then
+                coord_publish_credential "$email" "$creds" manual_login true || push_status=$?
+            else
+                coord_publish_credential "$email" "$creds" || push_status=$?
+            fi
             case "$push_status" in
-                0) echo "  Pushed Account $num: $email" ;;
-                3) echo "  Rejected Account $num: $email (coordinator has fresher credential)" ;;
-                *) echo "  Failed Account $num: $email (coordinator unreachable)" ;;
+                0)
+                    accepted_count=$((accepted_count + 1))
+                    echo "  Pushed Account $num: $email"
+                    ;;
+                3)
+                    rejected_count=$((rejected_count + 1))
+                    echo "  Rejected Account $num: $email (coordinator has fresher credential)"
+                    ;;
+                *)
+                    failed_count=$((failed_count + 1))
+                    echo "  Failed Account $num: $email (coordinator unreachable)"
+                    ;;
             esac
         done <<< "$nums"
+        if [[ "$force" == true ]]; then
+            echo "Force push totals: accepted=$accepted_count rejected=$rejected_count failed=$failed_count"
+        fi
         return 0
     fi
 
@@ -5375,7 +5401,7 @@ show_usage() {
     echo "  coord-client-command             Print copy-paste command for other servers"
     echo "  coord-token                      Print coordinator API token"
     echo "  coord-sync                       Publish current active lease to coordinator"
-    echo "  coord-push [--all]               Publish active (or all) account credentials to coordinator"
+    echo "  coord-push [--all] [--force]     Publish active (or all) account credentials to coordinator"
     echo "  coord-pull                       Import/backfill account credentials from coordinator"
     echo "  coord-listen                    Subscribe to credential update events"
     echo ""

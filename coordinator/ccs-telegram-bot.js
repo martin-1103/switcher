@@ -335,7 +335,7 @@ async function handleCommand(text, from) {
       run('bash', [OPEN_OAUTH, '--auto-click', email], 300000).then(async (r) => {
         autologinRunning = null;
         const out = (r.stdout.trim() + '\n' + r.stderr.trim()).trim();
-        if (r.code === 0 && out.includes('Account added successfully')) {
+        if (parseCcsAddResult(out, email).localAdded) {
           const publish = await verifyCoordinatorPublish(out, email);
           if (publish.localAdded && publish.coordinator === 'accepted') {
             delete state.pending[email];
@@ -454,7 +454,7 @@ async function handleText(text, from) {
   const r = await run('bash', [BRIDGE, 'submit', email, code]);
   delete state.pending[email];
   const bridgeOutput = `${r.stdout}\n${r.stderr}`;
-  if (r.code === 0 && parseCcsAddResult(bridgeOutput, email).localAdded) {
+  if (parseCcsAddResult(bridgeOutput, email).localAdded) {
     const publish = await verifyCoordinatorPublish(bridgeOutput, email);
     if (publish.localAdded && publish.coordinator === 'accepted') {
       // A successful capture means it's no longer expired; let a future
