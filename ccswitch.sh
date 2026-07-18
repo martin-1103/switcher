@@ -3680,27 +3680,101 @@ cmd_switch() {
 
     # wait_for_claude_close
 
-    local active_account next_account
-    active_account=$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")
-    next_account=$(jq -r --argjson active "$active_account" '
-        . as $root |
-        .sequence as $seq |
-        ($seq | index($active) // 0) as $idx |
-        [range(1; ($seq | length) + 1) as $offset |
-            $seq[($idx + $offset) % ($seq | length)] |
-            select((. as $n |
-                ($root.accounts["\($n)"].authState // "") != "invalid" and
-                (($root.accounts["\($n)"].quarantineUntil // 0) <= now)
-            ))
-        ][0] // empty
-    ' "$SEQUENCE_FILE")
-
-    if [[ -z "$next_account" ]]; then
-        echo "Error: no usable account found (all other accounts are invalid, quarantined, or unavailable)"
+    if ! acquire_switch_lock 10; then
+        echo "Error: another account switch is in progress (could not acquire lock)."
         exit 1
     fi
+    export CCS_LOCK_HELD=1
+    trap 'if [[ "$(cat "$LOCK_DIR/pid" 2>/dev/null || true)" == "$$" ]]; then rm -rf "$LOCK_DIR" 2>/dev/null || true; fi; unset CCS_LOCK_HELD' EXIT
 
-    CCS_SWITCH_REASON=manual perform_switch "$next_account"
+    local active_account next_account
+    active_account=$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")
+    local max_attempts attempts=0
+    max_attempts=$(jq '.sequence | length' "$SEQUENCE_FILE" 2>/dev/null || echo 0)
+    local candidate_accounts
+    candidate_accounts=$(jq -r --argjson active "$active_account" '
+        .sequence as $seq |
+        ($seq | index($active) // 0) as $idx |
+        range(1; ($seq | length) + 1) as $offset |
+        $seq[($idx + $offset) % ($seq | length)]
+    ' "$SEQUENCE_FILE" 2>/dev/null || true)
+
+    while IFS= read -r next_account; do
+        [[ -z "$next_account" ]] && continue
+        attempts=$((attempts + 1))
+        (( attempts <= max_attempts )) || break
+
+        if [[ "$max_attempts" -eq 1 && "$next_account" == "$active_account" ]]; then
+            local active_email
+            active_email=$(jq -r --arg num "$active_account" '.accounts[$num].email // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
+            echo "Already on Account-$active_account ($active_email)."
+            return 0
+        fi
+        [[ "$next_account" == "$active_account" ]] && continue
+
+        local next_email auth_state
+        next_email=$(jq -r --arg num "$next_account" '.accounts[$num].email // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
+        [[ -n "$next_email" ]] || continue
+        auth_state=$(jq -r --arg num "$next_account" '.accounts[$num].authState // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
+        [[ "$auth_state" == "invalid" ]] && continue
+        account_quarantine_active "$next_account" && continue
+
+        # Reconcile the candidate with the coordinator before probing. The
+        # coordinator may hold a newer rotated credential than this host's
+        # backup; probe exactly the credential perform_switch will consume.
+        local next_creds coord_creds next_updated coord_updated
+        next_creds=$(read_account_credentials "$next_account" "$next_email")
+        coord_creds=$(coord_fetch_credential "$next_email" 2>/dev/null || true)
+        if [[ -n "$coord_creds" ]] && credential_is_usable "$coord_creds"; then
+            next_updated=$(echo "$next_creds" | jq -r '.credentialUpdatedAt // .claudeAiOauth.credentialUpdatedAt // 0' 2>/dev/null || echo 0)
+            coord_updated=$(echo "$coord_creds" | jq -r '.credentialUpdatedAt // .claudeAiOauth.credentialUpdatedAt // 0' 2>/dev/null || echo 0)
+            [[ "$next_updated" =~ ^[0-9]+$ ]] || next_updated=0
+            [[ "$coord_updated" =~ ^[0-9]+$ ]] || coord_updated=0
+            if [[ -z "$next_creds" ]] || ! credential_is_usable "$next_creds" || (( coord_updated > next_updated )); then
+                next_creds="$coord_creds"
+                write_account_credentials "$next_account" "$next_email" "$next_creds" >/dev/null 2>&1 || true
+                log_credential_event "selected coordinator credential for Account-$next_account ($next_email): version=$coord_updated (caller=cmd_switch)"
+            fi
+        fi
+        if ! credential_is_usable "$next_creds"; then
+            if [[ -n "$coord_creds" ]] && credential_is_usable "$coord_creds"; then
+                next_creds="$coord_creds"
+                write_account_credentials "$next_account" "$next_email" "$next_creds" >/dev/null 2>&1 || true
+            else
+                log_switch_event "candidate Account-$next_account ($next_email) skipped: backup credentials empty/expired"
+                continue
+            fi
+        fi
+
+        local probe_rc=0
+        probe_account_credential "$next_account" "$next_creds" || probe_rc=$?
+        if [[ "$probe_rc" -ne 0 ]]; then
+            record_probe_failure "$next_account" "$SWITCH_PROBE_RESULT" "$SWITCH_PROBE_STATUS" "$SWITCH_PROBE_REASON"
+            log_switch_event "candidate Account-$next_account ($next_email) skipped by manual switch probe"
+            continue
+        fi
+        clear_account_quarantine "$next_account"
+
+        # The candidate was already probed above. Keep perform_switch's lock,
+        # rollback, and activation path, but avoid issuing the same probe again.
+        CCS_SWITCH_REASON=manual
+        CCS_SILENT=1
+        CCS_SKIP_ACCOUNT_PROBE=1
+        if ! perform_switch "$next_account"; then
+            unset CCS_SILENT
+            unset CCS_SKIP_ACCOUNT_PROBE
+            echo "Error: Failed to switch to Account-$next_account ($next_email)" >&2
+            exit 2
+        fi
+        unset CCS_SILENT
+        unset CCS_SKIP_ACCOUNT_PROBE
+        echo "Switched to Account-$next_account ($next_email)"
+        handle_restart_after_switch
+        return 0
+    done <<< "$candidate_accounts"
+
+    echo "Error: no usable account found after probing all subsequent sequence accounts" >&2
+    exit 1
 }
 
 # Switch to specific account
@@ -4190,7 +4264,7 @@ cmd_rate_check() {
         return 0
     fi
     export CCS_LOCK_HELD=1
-    trap 'release_switch_lock; unset CCS_LOCK_HELD' RETURN EXIT
+    trap 'if [[ "$(cat "$LOCK_DIR/pid" 2>/dev/null || true)" == "$$" ]]; then rm -rf "$LOCK_DIR" 2>/dev/null || true; fi; unset CCS_LOCK_HELD' RETURN EXIT
 
     sync_active_credentials_to_backup
     pull_coordinator_credentials_if_fresher
