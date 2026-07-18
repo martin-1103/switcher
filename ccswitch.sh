@@ -1513,6 +1513,7 @@ invalidate_credential_caches() {
     # usage invalidation still happened and the token-email entry expires
     # naturally rather than risking lock interference.
     mkdir "$EMAIL_CACHE_LOCK" 2>/dev/null || return 0
+    printf '%s\n' "$$" > "$EMAIL_CACHE_LOCK/pid" 2>/dev/null || true
     tmp="$EMAIL_CACHE_FILE.tmp.$$"
     jq --arg old "$old_hash" --arg new "$new_hash" 'del(.[$old], .[$new])' \
         "$EMAIL_CACHE_FILE" > "$tmp" 2>/dev/null && mv "$tmp" "$EMAIL_CACHE_FILE" 2>/dev/null
