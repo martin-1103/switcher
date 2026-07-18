@@ -28,6 +28,8 @@ const CHAT_ID = String(process.env.TELEGRAM_CHAT_ID || '');
 const CCS_BIN = process.env.CCS_BIN || 'ccs';
 const BRIDGE = process.env.CCS_LOGIN_BRIDGE ||
   '/usr/local/lib/cc-account-switcher/coordinator/ccs-login-bridge.sh';
+const OPEN_OAUTH = process.env.CCS_OPEN_OAUTH ||
+  '/root/cc-account-switcher/ccs-open-oauth.sh';
 const STATE_FILE = process.env.CCS_BOT_STATE_FILE ||
   '/var/lib/ccs-coordinator/telegram-bot-state.json';
 const DETECT_INTERVAL_MS = Number(process.env.CCS_BOT_DETECT_INTERVAL || 300) * 1000;
@@ -52,6 +54,10 @@ try {
 if (state.users.length === 0) {
   state.users.push(CHAT_ID);
 }
+
+// Email of an in-flight /autologin, or null. One at a time: the flow owns the
+// single remote Chrome/CDP port, two runs would stomp each other's tabs.
+let autologinRunning = null;
 
 function saveState() {
   try {
@@ -100,9 +106,9 @@ function send(text, to) {
 }
 
 // ---- bridge / ccs shell-outs ----
-function run(cmd, args) {
+function run(cmd, args, timeoutMs = 60000) {
   return new Promise((resolve) => {
-    execFile(cmd, args, { timeout: 60000 }, (err, stdout, stderr) => {
+    execFile(cmd, args, { timeout: timeoutMs }, (err, stdout, stderr) => {
       resolve({ code: err ? (err.code || 1) : 0, stdout: stdout || '', stderr: stderr || '' });
     });
   });
@@ -209,6 +215,7 @@ const HELP = [
   'ccs re-login bot commands:',
   '/status — accounts + which are expired/pending',
   '/login <num|email> — re-login an account, or add a NEW account by email',
+  '/autologin <num> — fully automated re-login (remote Chrome + auto-click)',
   '/switch <num> — switch active account to <num>',
   '/pending — logins awaiting a code',
   '/cancel <num> — abandon a pending login',
@@ -273,6 +280,34 @@ async function handleCommand(text, from) {
       const label = num === '?' ? `NEW account (${email})` : `account ${num} (${email})`;
       await reply(`Starting login for ${label}…`);
       await startLogin(email, num, `🔑 /login: ${label}`); // broadcast
+      return true;
+    }
+    case '/autologin': {
+      // Fully automated re-login: ccs-open-oauth --auto-click opens Chrome on
+      // the gass server (chrome-service), clicks Authorize via CDP, captures
+      // the code, submits it to the bridge, and closes Chrome. Takes ~1-2 min.
+      if (!/^\d+$/.test(arg)) { await reply('Usage: /autologin <num> (account number from /status)'); return true; }
+      const email = await numToEmail(arg);
+      if (!email) { await reply(`No account numbered ${arg}. See /status.`); return true; }
+      if (autologinRunning) { await reply(`Autologin already running for ${autologinRunning} — wait for it to finish.`); return true; }
+      autologinRunning = email;
+      await send(`🤖 Autologin started for account ${arg} (${email})… (~1-2 min)`);
+      // Async: don't block the reply loop while the flow runs.
+      run('bash', [OPEN_OAUTH, '--auto-click', email], 300000).then(async (r) => {
+        autologinRunning = null;
+        const out = (r.stdout.trim() + '\n' + r.stderr.trim()).trim();
+        const tail = out.split('\n').slice(-12).join('\n'); // last lines carry the verdict
+        if (r.code === 0 && out.includes('Account added successfully')) {
+          delete state.pending[email];
+          saveState();
+          await send(`✅ Autologin OK: account ${arg} (${email}) re-logged in.`);
+        } else {
+          await send(`❌ Autologin failed for account ${arg} (${email}):\n${tail}\nFallback: /login ${arg}`);
+        }
+      }).catch(async (e) => {
+        autologinRunning = null;
+        await send(`❌ Autologin crashed for account ${arg} (${email}): ${e.message}\nFallback: /login ${arg}`);
+      });
       return true;
     }
     case '/pending': {

@@ -1,0 +1,13 @@
+[Unit]
+Description=ccs chrome open/close HTTP service (port 9334)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/python3 /usr/local/lib/ccs-chrome-service.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
