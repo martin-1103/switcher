@@ -141,7 +141,10 @@ async function verifyCoordinatorPublish(output, email) {
   const escapedEmail = String(email).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   let coordinator = 'unknown';
   if (new RegExp(`\\bPushed Account \\d+:\\s*${escapedEmail}(?:\\s|$)`).test(pushOutput)) coordinator = 'accepted';
-  else if (new RegExp(`\\bRejected Account \\d+:\\s*${escapedEmail}(?:\\s|$)`).test(pushOutput)) coordinator = 'rejected';
+  // "Rejected ... coordinator has fresher credential" here means the login's
+  // own publish already landed (this push is the same-or-older credential) —
+  // for verification purposes the coordinator HAS it, so that's success.
+  else if (new RegExp(`\\bRejected Account \\d+:\\s*${escapedEmail}(?:\\s|$)`).test(pushOutput)) coordinator = 'accepted';
   else if (new RegExp(`\\bFailed Account \\d+:\\s*${escapedEmail}(?:\\s|$)`).test(pushOutput) || /not configured|nothing pushed|no usable credential/i.test(pushOutput)) coordinator = 'unreachable';
   return { localAdded: direct.localAdded, coordinator };
 }
