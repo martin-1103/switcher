@@ -2479,7 +2479,8 @@ coord_reconcile_credential_email() {
         return 0
     fi
     local_creds=$(read_account_credentials "$local_num" "$email")
-    local local_usable=0 local_auth_state local_health_status
+    local local_usable=0 local_auth_state local_health_status previous_access_token
+    previous_access_token=$(credential_access_token "$local_creds")
     if credential_is_usable "$local_creds"; then
         local_auth_state=$(jq -r --arg num "$local_num" '.accounts[$num].authState // ""' "$SEQUENCE_FILE" 2>/dev/null || true)
         local_health_status=$(jq -r --arg num "$local_num" '.accounts[$num].credentialHealth.status // ""' "$SEQUENCE_FILE" 2>/dev/null || true)
@@ -2500,7 +2501,9 @@ coord_reconcile_credential_email() {
     fi
     write_account_credentials "$local_num" "$email" "$coord_creds"
     clear_account_credential_health "$local_num"
-    [[ "$coord_health_status" == "healthy" ]] && clear_account_auth_invalid "$local_num"
+    if [[ "$previous_access_token" != "$(credential_access_token "$coord_creds")" ]]; then
+        clear_account_auth_invalid "$local_num"
+    fi
     if [[ "$(get_current_account)" == "$email" ]]; then
         write_credentials "$coord_creds" >/dev/null 2>&1 || true
     fi

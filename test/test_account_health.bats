@@ -189,9 +189,22 @@ EOF
     jq '.accounts["1"].authState = "invalid"' "$SEQUENCE_FILE" > "$SEQUENCE_FILE.tmp"
     mv "$SEQUENCE_FILE.tmp" "$SEQUENCE_FILE"
     coord_fetch_credential() {
-        printf '%s\n' '{"sourceServer":"server-a","credentialHealth":{"status":"unknown"},"claudeAiOauth":{"accessToken":"at-known-new","refreshToken":"rt-known-new","credentialUpdatedAt":2}}'
+        printf '%s\n' '{"sourceServer":"server-a","credentialHealth":{"status":"unknown"},"claudeAiOauth":{"accessToken":"at-known@example.com","refreshToken":"rt-known-new","credentialUpdatedAt":2}}'
     }
 
     coord_reconcile_credential_email "known@example.com" "server-a"
     [ "$(jq -r '.accounts["1"].authState' "$SEQUENCE_FILE")" = "invalid" ]
+}
+
+@test "fresh credential replacement with unknown health clears invalid auth state" {
+    source_ccswitch_functions
+    add_account_to_sequence "1" "fresh@example.com" "uuid-fresh" "false"
+    jq '.accounts["1"].authState = "invalid"' "$SEQUENCE_FILE" > "$SEQUENCE_FILE.tmp"
+    mv "$SEQUENCE_FILE.tmp" "$SEQUENCE_FILE"
+    coord_fetch_credential() {
+        printf '%s\n' '{"sourceServer":"server-a","credentialHealth":{"status":"unknown"},"claudeAiOauth":{"accessToken":"at-fresh-new","refreshToken":"rt-fresh-new","credentialUpdatedAt":2}}'
+    }
+
+    coord_reconcile_credential_email "fresh@example.com" "server-a"
+    [ "$(jq -r '.accounts["1"].authState // empty' "$SEQUENCE_FILE")" = "" ]
 }
