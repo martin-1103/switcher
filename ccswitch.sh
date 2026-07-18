@@ -1825,8 +1825,25 @@ cmd_keepalive() {
     local nums
     nums=$(jq -r '.accounts | keys[]' "$SEQUENCE_FILE" 2>/dev/null)
 
+    # Order candidates: still-alive tokens first (soonest expiry first),
+    # already-expired ones last. A dead account whose refresh 429s aborts the
+    # whole run (shared bucket, see above), so zombies must not burn the run
+    # before healthy tokens get their refresh in.
+    # ponytail: re-reads each credential file once for ordering; cache it in the loop if account count ever hurts.
+    local order_num order_email order_creds order_exp order_flag ordered
+    ordered=$(for order_num in $nums; do
+        order_email=$(jq -r --arg num "$order_num" '.accounts[$num].email // empty' "$SEQUENCE_FILE")
+        [[ -n "$order_email" ]] || continue
+        order_creds=$(read_account_credentials "$order_num" "$order_email")
+        order_exp=$(credential_expires_epoch "$order_creds")
+        [[ "$order_exp" =~ ^[0-9]+$ ]] || order_exp=0
+        order_flag=0
+        (( order_exp != 0 && order_exp < now_epoch )) && order_flag=1
+        printf '%s %020d %s\n' "$order_flag" "$order_exp" "$order_num"
+    done | sort | awk '{print $3}')
+
     local num email creds last_refresh updated_creds expires_at refresh_status
-    for num in $nums; do
+    for num in $ordered; do
         email=$(jq -r --arg num "$num" '.accounts[$num].email // empty' "$SEQUENCE_FILE")
         [[ -n "$email" ]] || continue
 

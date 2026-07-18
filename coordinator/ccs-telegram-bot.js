@@ -158,9 +158,11 @@ async function detect() {
     const chk = await run('bash', [BRIDGE, 'status', email]);
     if (chk.code !== 0) {
       delete state.pending[email];
-      // Also un-notify so a still-expired account gets a fresh URL next cycle.
-      state.notified = state.notified.filter((e) => e !== email);
       saveState();
+      // Keep the account in `notified` — un-notifying here made every
+      // abandoned /login re-trigger the expired broadcast each cycle.
+      // One timeout notice instead; the user retries with /login when ready.
+      await send(`⌛ Login for ${email} timed out (no code received). /login again when ready.`);
     }
   }
 
@@ -197,7 +199,7 @@ async function startLogin(email, num, header) {
     `${header}\n\n` +
     `1. Open in an INCOGNITO window and sign in AS ${email}:\n${url}\n\n` +
     `2. Copy the code shown after authorizing and reply here with just the code` +
-    ` (or "${num} <code>" if multiple logins are pending).`
+    ` (or "${num === '?' ? email : num} <code>" if multiple logins are pending).`
   );
   return true;
 }
@@ -206,7 +208,7 @@ async function startLogin(email, num, header) {
 const HELP = [
   'ccs re-login bot commands:',
   '/status — accounts + which are expired/pending',
-  '/login <num> — start a re-login now (don\'t wait for expiry)',
+  '/login <num|email> — re-login an account, or add a NEW account by email',
   '/switch <num> — switch active account to <num>',
   '/pending — logins awaiting a code',
   '/cancel <num> — abandon a pending login',
@@ -251,11 +253,26 @@ async function handleCommand(text, from) {
       return true;
     }
     case '/login': {
-      if (!/^\d+$/.test(arg)) { await reply('Usage: /login <num> (account number from /status)'); return true; }
-      const email = await numToEmail(arg);
-      if (!email) { await reply(`No account numbered ${arg}. See /status.`); return true; }
-      await reply(`Starting login for account ${arg} (${email})…`);
-      await startLogin(email, arg, `🔑 /login: account ${arg} (${email})`); // broadcast
+      // Accepts an existing account number OR an email. An email not yet in
+      // `ccs ls` starts a NEW-account login: the bridge runs `ccs login
+      // --email X` and cmd_add_account registers it on code capture.
+      let email, num;
+      if (/^\d+$/.test(arg)) {
+        email = await numToEmail(arg);
+        if (!email) { await reply(`No account numbered ${arg}. See /status.`); return true; }
+        num = arg;
+      } else if (/^\S+@\S+\.\S+$/.test(arg)) {
+        email = arg.toLowerCase();
+        let accounts = [];
+        try { accounts = await listAccounts(); } catch { /* new-email path */ }
+        num = emailToNum(accounts, email); // '?' when not yet registered
+      } else {
+        await reply('Usage: /login <num|email> (number from /status, or an email to add a new account)');
+        return true;
+      }
+      const label = num === '?' ? `NEW account (${email})` : `account ${num} (${email})`;
+      await reply(`Starting login for ${label}…`);
+      await startLogin(email, num, `🔑 /login: ${label}`); // broadcast
       return true;
     }
     case '/pending': {
@@ -327,13 +344,18 @@ async function handleText(text, from) {
 
   const reply = (t) => send(t, from); // sender-only until we have a result
   let email, code;
-  // "<num> <code>" disambiguates when several logins are pending. A bare
-  // reply (just the code) is only accepted when exactly one is pending.
+  // "<num> <code>" or "<email> <code>" disambiguates when several logins are
+  // pending (email form is the only handle for a new, unnumbered account). A
+  // bare reply (just the code) is only accepted when exactly one is pending.
   const twoPart = text.trim().match(/^(\d+)\s+(\S.*)$/);
+  const emailPart = text.trim().match(/^(\S+@\S+\.\S+)\s+(\S.*)$/);
   if (twoPart) {
     email = await numToEmail(twoPart[1]);
     code = twoPart[2].trim();
     if (!email) { await reply(`No account numbered ${twoPart[1]}. See /status.`); return; }
+  } else if (emailPart) {
+    email = emailPart[1].toLowerCase();
+    code = emailPart[2].trim();
   } else if (pendingEmails.length === 1) {
     email = pendingEmails[0];
     code = text.trim();
