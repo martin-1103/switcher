@@ -23,9 +23,9 @@ teardown() {
     cat > "$MOCK_BIN/curl" <<EOF
 #!/usr/bin/env bash
 body=""
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --data) body="$2"; shift 2 ;;
+while [[ \$# -gt 0 ]]; do
+    case "\$1" in
+        --data) body="\$2"; shift 2 ;;
         *) shift ;;
     esac
 done

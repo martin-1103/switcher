@@ -144,6 +144,45 @@ EOF
     [ "$(read_account_credentials 1 known@example.com | jq -r '.claudeAiOauth.accessToken')" = "local-good" ]
 }
 
+@test "credential replacement removes usage cache and old credential health" {
+    source_ccswitch_functions
+    add_account_to_sequence "1" "replace@example.com" "uuid-replace" "false"
+    security add-generic-password -U -s "Claude Code-Account-1-replace@example.com" -a "$USER" \
+        -w '{"claudeAiOauth":{"accessToken":"old-token","refreshToken":"old-refresh","expiresAt":4102444800,"credentialUpdatedAt":20}}'
+    jq '.accounts["1"].authState = "invalid" | .accounts["1"].credentialHealth = {status:"invalid",fingerprint:"old-health"}' \
+        "$SEQUENCE_FILE" > "$SEQUENCE_FILE.tmp"
+    mv "$SEQUENCE_FILE.tmp" "$SEQUENCE_FILE"
+
+    usage_file=$(usage_cache_file "replace@example.com")
+    printf '%s\n' '{"five_hour":{"utilization":99}}' > "$usage_file"
+    old_hash=$(printf '%s' 'old-token' | sha256sum | cut -d' ' -f1)
+    printf '%s\n' "{\"$old_hash\":{\"email\":\"replace@example.com\",\"ts\":$(date +%s)}}" > "$EMAIL_CACHE_FILE"
+
+    coord_fetch_credential() {
+        printf '%s\n' '{"sourceServer":"server-a","credentialHealth":{"status":"healthy"},"claudeAiOauth":{"accessToken":"new-token","refreshToken":"new-refresh","expiresAt":4102444800,"credentialUpdatedAt":10}}'
+    }
+
+    coord_reconcile_credential_email "replace@example.com" "server-a"
+    [ ! -e "$usage_file" ]
+    [ "$(read_account_credentials 1 replace@example.com | jq -r '.claudeAiOauth.accessToken')" = "new-token" ]
+    [ "$(jq -r '.accounts["1"].authState // empty' "$SEQUENCE_FILE")" = "" ]
+    jq -e '.accounts["1"].credentialHealth == null' "$SEQUENCE_FILE" >/dev/null
+    ! jq -e --arg hash "$old_hash" '.[$hash]' "$EMAIL_CACHE_FILE" >/dev/null
+}
+
+@test "ordinary backup refresh preserves valid credential health" {
+    source_ccswitch_functions
+    add_account_to_sequence "1" "refresh@example.com" "uuid-refresh" "false"
+    jq '.accounts["1"].credentialHealth = {status:"healthy",fingerprint:"known-health"}' \
+        "$SEQUENCE_FILE" > "$SEQUENCE_FILE.tmp"
+    mv "$SEQUENCE_FILE.tmp" "$SEQUENCE_FILE"
+
+    write_account_credentials 1 "refresh@example.com" \
+        '{"claudeAiOauth":{"accessToken":"refreshed-token","refreshToken":"refreshed-refresh","expiresAt":4102444800}}'
+    [ "$(jq -r '.accounts["1"].credentialHealth.status' "$SEQUENCE_FILE")" = "healthy" ]
+    [ "$(jq -r '.accounts["1"].credentialHealth.fingerprint' "$SEQUENCE_FILE")" = "known-health" ]
+}
+
 @test "unknown coordinator baseline does not clear invalid auth state" {
     source_ccswitch_functions
     add_account_to_sequence "1" "known@example.com" "uuid-known" "false"

@@ -1494,6 +1494,32 @@ usage_cache_file() {
     echo "/tmp/claude-usage-cache-${safe}.json"
 }
 
+# Invalidate data derived from a credential replacement without ever logging
+# either token. Token-email cache keys are SHA-256 hashes, so removing the old
+# and new keys is safe even when the replacement races a profile lookup.
+invalidate_credential_caches() {
+    local email="$1" old_credentials="${2:-}" new_credentials="${3:-}"
+    local usage_file old_hash new_hash tmp
+
+    usage_file=$(usage_cache_file "$email")
+    rm -f "$usage_file" 2>/dev/null || true
+
+    [[ -f "$EMAIL_CACHE_FILE" ]] || return 0
+    old_hash=$(credential_fingerprint "$old_credentials")
+    new_hash=$(credential_fingerprint "$new_credentials")
+    [[ -n "$old_hash" || -n "$new_hash" ]] || return 0
+
+    # Best effort: get_current_account uses the same lock. If it is busy,
+    # usage invalidation still happened and the token-email entry expires
+    # naturally rather than risking lock interference.
+    mkdir "$EMAIL_CACHE_LOCK" 2>/dev/null || return 0
+    tmp="$EMAIL_CACHE_FILE.tmp.$$"
+    jq --arg old "$old_hash" --arg new "$new_hash" 'del(.[$old], .[$new])' \
+        "$EMAIL_CACHE_FILE" > "$tmp" 2>/dev/null && mv "$tmp" "$EMAIL_CACHE_FILE" 2>/dev/null
+    rm -f "$tmp" 2>/dev/null || true
+    rm -rf "$EMAIL_CACHE_LOCK" 2>/dev/null || true
+}
+
 # Read credentials based on platform
 read_credentials() {
     local platform
@@ -1900,6 +1926,14 @@ clear_account_auth_invalid() {
         del(.accounts[$num].lastAuthError) |
         del(.accounts[$num].lastAuthErrorAt)
     ' "$SEQUENCE_FILE" 2>/dev/null) || return 0
+    write_json "$SEQUENCE_FILE" "$updated" >/dev/null 2>&1 || true
+}
+
+clear_account_credential_health() {
+    local account_num="$1"
+    local updated
+    [[ -f "$SEQUENCE_FILE" ]] || return 0
+    updated=$(jq --arg num "$account_num" 'del(.accounts[$num].credentialHealth)' "$SEQUENCE_FILE" 2>/dev/null) || return 0
     write_json "$SEQUENCE_FILE" "$updated" >/dev/null 2>&1 || true
 }
 
@@ -2436,6 +2470,7 @@ coord_reconcile_credential_email() {
                 write_json "$SEQUENCE_FILE" "$updated"
                 write_account_credentials "$local_num" "$email" "$coord_creds"
                 write_account_config "$local_num" "$email" "$target_config"
+                clear_account_credential_health "$local_num"
                 [[ "$coord_health_status" == "healthy" ]] && clear_account_auth_invalid "$local_num"
             fi
         fi
@@ -2463,6 +2498,7 @@ coord_reconcile_credential_email() {
         return 1
     fi
     write_account_credentials "$local_num" "$email" "$coord_creds"
+    clear_account_credential_health "$local_num"
     [[ "$coord_health_status" == "healthy" ]] && clear_account_auth_invalid "$local_num"
     if [[ "$(get_current_account)" == "$email" ]]; then
         write_credentials "$coord_creds" >/dev/null 2>&1 || true
@@ -2600,10 +2636,9 @@ write_account_credentials() {
     local account_num="$1"
     local email="$2"
     local credentials="$3"
-    local platform
+    local platform existing
 
     if ! credential_is_usable "$credentials"; then
-        local existing
         existing=$(read_account_credentials "$account_num" "$email")
         if credential_is_usable "$existing"; then
             log_credential_event "refused to overwrite valid backup for Account-$account_num ($email) with empty/expired credentials (caller=${FUNCNAME[1]:-unknown})"
@@ -2611,6 +2646,10 @@ write_account_credentials() {
             return 0
         fi
         log_credential_event "writing EMPTY/EXPIRED credentials for Account-$account_num ($email) — existing backup was already unusable (caller=${FUNCNAME[1]:-unknown})"
+    fi
+
+    if [[ -z "${existing+x}" ]]; then
+        existing=$(read_account_credentials "$account_num" "$email")
     fi
 
     platform=$(detect_platform)
@@ -2625,6 +2664,10 @@ write_account_credentials() {
             chmod 600 "$cred_file"
             ;;
     esac
+
+    if [[ "$(credential_access_token "$existing")" != "$(credential_access_token "$credentials")" ]]; then
+        invalidate_credential_caches "$email" "$existing" "$credentials"
+    fi
 }
 
 # Read account config from backup
