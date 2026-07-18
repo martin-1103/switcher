@@ -34,7 +34,7 @@ const STATE_FILE = process.env.CCS_BOT_STATE_FILE ||
   '/var/lib/ccs-coordinator/telegram-bot-state.json';
 const DETECT_INTERVAL_MS = Number(process.env.CCS_BOT_DETECT_INTERVAL || 300) * 1000;
 
-if (!TOKEN || !CHAT_ID) {
+if (require.main === module && (!TOKEN || !CHAT_ID)) {
   console.error('TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are required');
   process.exit(1);
 }
@@ -112,6 +112,45 @@ function run(cmd, args, timeoutMs = 60000) {
       resolve({ code: err ? (err.code || 1) : 0, stdout: stdout || '', stderr: stderr || '' });
     });
   });
+}
+
+function parseCcsAddResult(output, email) {
+  const escapedEmail = String(email).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const localAdded = new RegExp(`(?:Account added successfully for|(?:Added|Updated) Account \\d+:)\\s*${escapedEmail}(?:\\s|$)`).test(output);
+  if (!localAdded) return { localAdded: false, coordinator: 'unknown' };
+  if (new RegExp(`Coordinator publish accepted for ${escapedEmail}(?:\\s|$)`).test(output)) {
+    return { localAdded: true, coordinator: 'accepted' };
+  }
+  if (new RegExp(`Coordinator publish rejected for ${escapedEmail}(?:\\s|$)`).test(output)) {
+    return { localAdded: true, coordinator: 'rejected' };
+  }
+  if (new RegExp(`Coordinator publish (?:failed|skipped) for ${escapedEmail}(?:\\s|$)`).test(output)) {
+    return { localAdded: true, coordinator: 'unreachable' };
+  }
+  return { localAdded: true, coordinator: 'unknown' };
+}
+
+async function verifyCoordinatorPublish(output, email) {
+  const direct = parseCcsAddResult(output, email);
+  if (direct.coordinator !== 'unknown') return direct;
+
+  // `coord-push` emits token-free Pushed/Rejected/Failed status. Its exit code
+  // is intentionally not trusted: command stays zero for per-account errors.
+  const r = await run(CCS_BIN, ['coord-push']);
+  const pushOutput = `${r.stdout}\n${r.stderr}`;
+  const escapedEmail = String(email).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  let coordinator = 'unknown';
+  if (new RegExp(`\\bPushed Account \\d+:\\s*${escapedEmail}(?:\\s|$)`).test(pushOutput)) coordinator = 'accepted';
+  else if (new RegExp(`\\bRejected Account \\d+:\\s*${escapedEmail}(?:\\s|$)`).test(pushOutput)) coordinator = 'rejected';
+  else if (new RegExp(`\\bFailed Account \\d+:\\s*${escapedEmail}(?:\\s|$)`).test(pushOutput) || /not configured|nothing pushed|no usable credential/i.test(pushOutput)) coordinator = 'unreachable';
+  return { localAdded: direct.localAdded, coordinator };
+}
+
+function coordinatorFailureMessage(email, retryCommand, coordinator) {
+  const reason = coordinator === 'rejected'
+    ? 'coordinator publish rejected'
+    : 'coordinator publish unreachable or not configured';
+  return `⚠️ ${email}: local login succeeded, but ${reason}. Retry with ${retryCommand}.`;
 }
 
 // Parse `ccs ls` into account records. Internal state keys on email (stable
@@ -296,17 +335,21 @@ async function handleCommand(text, from) {
       run('bash', [OPEN_OAUTH, '--auto-click', email], 300000).then(async (r) => {
         autologinRunning = null;
         const out = (r.stdout.trim() + '\n' + r.stderr.trim()).trim();
-        const tail = out.split('\n').slice(-12).join('\n'); // last lines carry the verdict
         if (r.code === 0 && out.includes('Account added successfully')) {
-          delete state.pending[email];
-          saveState();
-          await send(`✅ Autologin OK: account ${arg} (${email}) re-logged in.`);
+          const publish = await verifyCoordinatorPublish(out, email);
+          if (publish.localAdded && publish.coordinator === 'accepted') {
+            delete state.pending[email];
+            saveState();
+            await send(`✅ Autologin OK: account ${arg} (${email}) re-logged in and published.`);
+          } else {
+            await send(coordinatorFailureMessage(email, `/autologin ${arg}`, publish.coordinator));
+          }
         } else {
-          await send(`❌ Autologin failed for account ${arg} (${email}):\n${tail}\nFallback: /login ${arg}`);
+          await send(`❌ Autologin failed for account ${arg} (${email}). Retry: /autologin ${arg} or /login ${arg}`);
         }
       }).catch(async (e) => {
         autologinRunning = null;
-        await send(`❌ Autologin crashed for account ${arg} (${email}): ${e.message}\nFallback: /login ${arg}`);
+        await send(`❌ Autologin crashed for account ${arg} (${email}). Fallback: /login ${arg}`);
       });
       return true;
     }
@@ -410,13 +453,19 @@ async function handleText(text, from) {
   await reply(`Submitting code for ${email}…`);
   const r = await run('bash', [BRIDGE, 'submit', email, code]);
   delete state.pending[email];
-  if (r.code === 0) {
-    // A successful capture means it's no longer expired; let a future
-    // re-expiry re-notify. Broadcast: the account is shared across all users.
-    state.notified = state.notified.filter((e) => e !== email);
-    await send(`✅ ${email}: ${r.stdout.trim() || 'logged in'}`);
+  const bridgeOutput = `${r.stdout}\n${r.stderr}`;
+  if (r.code === 0 && parseCcsAddResult(bridgeOutput, email).localAdded) {
+    const publish = await verifyCoordinatorPublish(bridgeOutput, email);
+    if (publish.localAdded && publish.coordinator === 'accepted') {
+      // A successful capture means it's no longer expired; let a future
+      // re-expiry re-notify. Broadcast: the account is shared across all users.
+      state.notified = state.notified.filter((e) => e !== email);
+      await send(`✅ ${email}: logged in and published.`);
+    } else {
+      await send(coordinatorFailureMessage(email, `/login ${email}`, publish.coordinator));
+    }
   } else {
-    await send(`❌ ${email} login failed:\n${r.stderr.trim() || 'unknown error'}\nRun the login again to retry.`);
+    await send(`❌ ${email} login failed. Run /login ${email} again to retry.`);
   }
   saveState();
 }
@@ -453,8 +502,12 @@ async function poll() {
   setImmediate(poll);
 }
 
-saveState(); // persist bootstrapped user list
-console.log(`ccs-telegram-bot up. detect every ${DETECT_INTERVAL_MS / 1000}s, ${state.users.length} authorized user(s).`);
-detect();
-setInterval(detect, DETECT_INTERVAL_MS);
-poll();
+if (require.main === module) {
+  saveState(); // persist bootstrapped user list
+  console.log(`ccs-telegram-bot up. detect every ${DETECT_INTERVAL_MS / 1000}s, ${state.users.length} authorized user(s).`);
+  detect();
+  setInterval(detect, DETECT_INTERVAL_MS);
+  poll();
+}
+
+module.exports = { parseCcsAddResult, coordinatorFailureMessage };

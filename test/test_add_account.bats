@@ -51,6 +51,37 @@ teardown() {
     [[ "$output" == *"already managed"* ]]
 }
 
+@test "manual login publishes fresh timestamp with reason and force replace" {
+    setup_fake_account "user1@example.com" "uuid-1"
+    run run_ccswitch --add-account
+    [ "$status" -eq 0 ]
+
+    jq '.coordination = {mode:"http", serverId:"local", http:{url:"http://coord.test", token:"test-token"}}' \
+        "$SEQUENCE_FILE" > "$SEQUENCE_FILE.tmp"
+    mv "$SEQUENCE_FILE.tmp" "$SEQUENCE_FILE"
+    cat > "$MOCK_BIN/curl" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$HOME/publish-calls"
+case "$*" in
+    *"api/oauth/profile"*)
+        printf '%s\n200\n' '{"account":{"email":"user1@example.com","uuid":"uuid-1"}}'
+        exit 0
+        ;;
+esac
+printf '%s\n200\n' '{"accepted":true,"reason":"manual_login_accepted"}'
+EOF
+    chmod +x "$MOCK_BIN/curl"
+
+    run run_ccswitch --add-account
+    [ "$status" -eq 0 ]
+    grep -q '"publishReason": "manual_login"' "$HOME/publish-calls"
+    grep -q '"forceReplace": true' "$HOME/publish-calls"
+    local updated
+    updated=$(security find-generic-password -s "Claude Code-Account-1-user1@example.com" -w | jq -r '.credentialUpdatedAt // .claudeAiOauth.credentialUpdatedAt // 0')
+    [ "$updated" -gt 0 ]
+    [[ "$output" == *"Coordinator publish accepted"* ]]
+}
+
 @test "test_add_account_with_no_active_login_shows_error" {
     # No config file created = no active login
     run run_ccswitch --add-account

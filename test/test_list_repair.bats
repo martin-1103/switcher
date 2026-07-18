@@ -79,7 +79,7 @@ configure_coord() {
     [ ! -e "$HOME/coord-calls" ] || [ "$(grep -c '^fetch$' "$HOME/coord-calls")" -eq 0 ]
 }
 
-@test "ls --repair skips expired invalid account" {
+@test "ls --repair repairs expired invalid account from healthy remote source" {
     setup_fake_account "one@example.com" "uuid-1"
     add_account_to_sequence "1" "one@example.com" "uuid-1" "false"
     configure_coord
@@ -91,8 +91,30 @@ configure_coord() {
 
     run run_ccswitch ls --repair
     [ "$status" -eq 0 ]
-    [[ "$output" == *"SKIP account=1 email=one@example.com reason=expired_or_missing"* ]]
-    [ ! -e "$HOME/coord-calls" ]
+    [[ "$output" == *"REPAIRED account=1 email=one@example.com source=remote"* ]]
+    [ "$(grep -c '^health$' "$HOME/coord-calls")" -eq 1 ]
+    [ "$(grep -c '^fetch$' "$HOME/coord-calls")" -eq 1 ]
+    [ "$(grep -c '^probe$' "$HOME/coord-calls")" -eq 1 ]
+    [[ "$(security find-generic-password -s "Claude Code-Account-1-one@example.com" -w)" == *"remote-at"* ]]
+}
+
+@test "ls --repair repairs missing local credentials from healthy remote once without switching" {
+    setup_fake_account "one@example.com" "uuid-1"
+    add_account_to_sequence "1" "one@example.com" "uuid-1" "true"
+    configure_coord
+    security delete-generic-password -s "Claude Code-Account-1-one@example.com"
+    jq '.accounts["1"].authState = "invalid" | .accounts["1"].credentialHealth = {status:"invalid"}' \
+        "$SEQUENCE_FILE" > "$SEQUENCE_FILE.tmp"
+    mv "$SEQUENCE_FILE.tmp" "$SEQUENCE_FILE"
+
+    run run_ccswitch ls --repair
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"REPAIRED account=1 email=one@example.com source=remote"* ]]
+    [ "$(grep -c '^health$' "$HOME/coord-calls")" -eq 1 ]
+    [ "$(grep -c '^fetch$' "$HOME/coord-calls")" -eq 1 ]
+    [ "$(grep -c '^probe$' "$HOME/coord-calls")" -eq 1 ]
+    [ "$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")" -eq 1 ]
+    [[ "$(security find-generic-password -s "Claude Code-Account-1-one@example.com" -w)" == *"remote-at"* ]]
 }
 
 @test "default ls does not request coordinator" {

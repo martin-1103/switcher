@@ -2159,6 +2159,9 @@ write_credentials() {
 coord_publish_credential() {
     local email="$1"
     local creds="$2"
+    local publish_reason="${3:-}" force_replace="${4:-false}"
+    COORD_PUBLISH_REASON=""
+    COORD_PUBLISH_ACCEPTED="false"
     coord_http_ready || return 1
     local access_token refresh_token expires_at refresh_expires_at scopes updated_at source_server health_status
     access_token=$(credential_access_token "$creds")
@@ -2176,14 +2179,38 @@ coord_publish_credential() {
     ' "$SEQUENCE_FILE" 2>/dev/null | head -n1 || echo unknown)
     [[ -n "$health_status" ]] || health_status=unknown
     [[ -n "$access_token" && -n "$refresh_token" ]] || return 1
-    local payload response
-    payload=$(jq -n --arg email "$email" --arg at "$access_token" --arg rt "$refresh_token" --arg source "$source_server" --arg health "$health_status" --argjson exp "${expires_at:-0}" --argjson refreshExp "${refresh_expires_at:-0}" --argjson sc "$scopes" --argjson updated "${updated_at:-0}" \
-        '{email: $email, sourceServer: $source, accessToken: $at, refreshToken: $rt, expiresAt: $exp, refreshTokenExpiresAt: $refreshExp, scopes: $sc, credentialUpdatedAt: $updated, healthStatus: $health}')
-    response=$(coord_http_request POST "/v1/credentials/publish" "$payload" 2>/dev/null) || return 2
-    if [[ "$(echo "$response" | jq -r '.accepted // false' 2>/dev/null)" == "true" ]]; then
+    [[ "$force_replace" == true ]] || force_replace=false
+    local payload response accepted reason safe_reason
+    payload=$(jq -n --arg email "$email" --arg at "$access_token" --arg rt "$refresh_token" --arg source "$source_server" --arg health "$health_status" --arg publishReason "$publish_reason" --argjson forceReplace "$force_replace" --argjson exp "${expires_at:-0}" --argjson refreshExp "${refresh_expires_at:-0}" --argjson sc "$scopes" --argjson updated "${updated_at:-0}" \
+        '{email: $email, sourceServer: $source, accessToken: $at, refreshToken: $rt, expiresAt: $exp, refreshTokenExpiresAt: $refreshExp, scopes: $sc, credentialUpdatedAt: $updated, healthStatus: $health, publishReason: $publishReason, forceReplace: $forceReplace}')
+    response=$(coord_http_request POST "/v1/credentials/publish" "$payload" 2>/dev/null) || {
+        COORD_PUBLISH_REASON="network_or_http_error"
+        return 2
+    }
+    accepted=$(echo "$response" | jq -r '.accepted // false' 2>/dev/null || echo false)
+    reason=$(echo "$response" | jq -r '.reason // .error // empty' 2>/dev/null || true)
+    [[ -n "$reason" ]] || reason="unknown"
+    # Coordinator response is untrusted; keep the user-facing diagnostic
+    # bounded and free of control characters. Never log response/tokens.
+    safe_reason=$(printf '%s' "$reason" | tr -cd '[:alnum:]_.:-' | cut -c1-120)
+    COORD_PUBLISH_REASON="${safe_reason:-unknown}"
+    if [[ "$accepted" == "true" ]]; then
+        COORD_PUBLISH_ACCEPTED="true"
         return 0
     fi
     return 3
+}
+
+stamp_credential_capture() {
+    local creds="$1" updated_at
+    updated_at=$(( $(date +%s) * 1000 ))
+    jq --argjson updated "$updated_at" '
+        if has("claudeAiOauth") then
+            .claudeAiOauth.credentialUpdatedAt = $updated
+        else
+            .credentialUpdatedAt = $updated
+        end
+    ' <<< "$creds" 2>/dev/null
 }
 
 coord_cache_remote_health() {
@@ -3551,6 +3578,10 @@ cmd_add_account() {
     fi
 
     local access_token profile current_email account_uuid
+    current_creds=$(stamp_credential_capture "$current_creds") || {
+        echo "Error: Could not stamp captured credentials"
+        exit 1
+    }
     access_token=$(credential_access_token "$current_creds")
     profile=$(fetch_oauth_profile "$access_token" || true)
     current_email=$(cut -f1 <<< "$profile")
@@ -3609,7 +3640,14 @@ cmd_add_account() {
 
     write_json "$SEQUENCE_FILE" "$updated_sequence"
 
-    coord_publish_credential "$current_email" "$current_creds" || true
+    local publish_status=0
+    coord_publish_credential "$current_email" "$current_creds" manual_login true || publish_status=$?
+    case "$publish_status" in
+        0) echo "Coordinator publish accepted for $current_email (reason=${COORD_PUBLISH_REASON})" ;;
+        1) echo "Coordinator publish skipped for $current_email (reason=not_configured_or_unusable)" ;;
+        3) echo "Coordinator publish rejected for $current_email (reason=${COORD_PUBLISH_REASON})" >&2 ;;
+        *) echo "Coordinator publish failed for $current_email (reason=${COORD_PUBLISH_REASON:-network_or_http_error})" >&2 ;;
+    esac
     coord_publish_account_state "$account_num" "$current_email"
 
     if [[ "$is_update" -eq 1 ]]; then
@@ -3908,9 +3946,9 @@ cmd_list() {
     return 0
 }
 
-# Repair only locally invalid, non-expired accounts from one explicitly healthy
-# remote coordinator source. One health lookup, one source fetch, and one API
-# probe per account; no switching and no retry loop.
+# Repair locally invalid, expired, or missing accounts from one explicitly
+# healthy remote coordinator source. One health lookup, one source fetch, and
+# one API probe per account; no switching and no retry loop.
 cmd_repair_invalid_accounts() {
     if ! acquire_switch_lock 10; then
         echo "Error: another account switch is in progress (could not acquire lock)." >&2
@@ -3926,14 +3964,9 @@ cmd_repair_invalid_accounts() {
         email=$(jq -r --arg num "$num" '.accounts[$num].email // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
         [[ -n "$email" ]] || { echo "SKIP account=$num reason=missing"; continue; }
         creds=$(read_account_credentials "$num" "$email")
-        if ! credential_is_usable "$creds"; then
-            echo "SKIP account=$num email=$email reason=expired_or_missing"
-            continue
-        fi
-
         auth_state=$(jq -r --arg num "$num" '.accounts[$num].authState // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
         cached_health=$(jq -r --arg num "$num" '.accounts[$num].credentialHealth.status // "unknown"' "$SEQUENCE_FILE" 2>/dev/null || echo unknown)
-        if [[ "$auth_state" != invalid && "$cached_health" != invalid ]]; then
+        if credential_is_usable "$creds" && [[ "$auth_state" != invalid && "$cached_health" != invalid ]]; then
             echo "SKIP account=$num email=$email reason=not_invalid"
             continue
         fi

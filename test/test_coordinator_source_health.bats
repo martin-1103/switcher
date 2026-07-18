@@ -30,6 +30,13 @@ publish() {
         "http://127.0.0.1:$PORT/v1/credentials/publish"
 }
 
+publish_manual() {
+    local source="$1" version="$2" reason="$3" health="${4:-unknown}"
+    curl -sf -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+        -d "{\"email\":\"user@example.com\",\"sourceServer\":\"$source\",\"accessToken\":\"manual-at-$source-$version\",\"refreshToken\":\"manual-rt-$source-$version\",\"credentialUpdatedAt\":$version,\"publishReason\":\"$reason\",\"healthStatus\":\"$health\"}" \
+        "http://127.0.0.1:$PORT/v1/credentials/publish"
+}
+
 @test "credentials are retained by source and newer rotations reset health" {
     [ "$(publish server-a 1 | jq -r '.event')" = "credential.add" ]
     [ "$(publish server-b 2 | jq -r '.event')" = "credential.add" ]
@@ -62,4 +69,41 @@ publish() {
     [ "$(coord "http://127.0.0.1:$PORT/v1/credentials/fetch?email=user%40example.com" | jq -r '.sourceServer')" = "server-b" ]
     [ "$(coord "http://127.0.0.1:$PORT/v1/credentials/health?email=user%40example.com" | jq -r '.sources[] | select(.sourceServer == "server-a") | .status')" = "invalid" ]
     [ "$(coord "http://127.0.0.1:$PORT/v1/credentials/health?email=user%40example.com" | jq -r '.sources[] | select(.sourceServer == "server-b") | .fingerprint')" = "fp-b" ]
+}
+
+@test "manual login replaces stale source, resets health, and always emits updated" {
+    publish server-a 10 healthy >/dev/null
+    rejected=$(publish server-a 9)
+    [ "$(jq -r '.accepted' <<<"$rejected")" = "false" ]
+    [ "$(jq -r '.reason' <<<"$rejected")" = "existing credential is fresher or equal" ]
+    [ "$(publish_manual server-a 9 manual_login | jq -r '.accepted')" = "true" ]
+    [ "$(coord "http://127.0.0.1:$PORT/v1/credentials/health?email=user%40example.com" | jq -r '.sources[] | select(.sourceServer == "server-a") | .status')" = "unknown" ]
+    [ "$(coord "http://127.0.0.1:$PORT/v1/credentials/fetch?email=user%40example.com&sourceServer=server-a" | jq -r '.accessToken')" = "manual-at-server-a-9" ]
+
+    [ "$(publish_manual server-a 9 manual_login | jq -r '.event')" = "credential.updated" ]
+    [ "$(jq '[.events[] | select(.type == "credential.updated" and .sourceServer == "server-a")] | length' "$STATE_FILE")" = "2" ]
+}
+
+@test "force replace is accepted only with authentication and emits updated for a new source" {
+    unauthorized=$(curl -s -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' \
+        -d '{"email":"user@example.com","sourceServer":"server-c","accessToken":"at","refreshToken":"rt","credentialUpdatedAt":1,"forceReplace":true}' \
+        "http://127.0.0.1:$PORT/v1/credentials/publish")
+    [ "$unauthorized" = "401" ]
+
+    response=$(curl -sf -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+        -d '{"email":"user@example.com","sourceServer":"server-c","accessToken":"at-c","refreshToken":"rt-c","credentialUpdatedAt":1,"forceReplace":true,"healthStatus":"healthy"}' \
+        "http://127.0.0.1:$PORT/v1/credentials/publish")
+    [ "$(jq -r '.accepted' <<<"$response")" = "true" ]
+    [ "$(jq -r '.event' <<<"$response")" = "credential.updated" ]
+    [ "$(coord "http://127.0.0.1:$PORT/v1/credentials/health?email=user%40example.com" | jq -r '.sources[] | select(.sourceServer == "server-c") | .status')" = "healthy" ]
+}
+
+@test "force replace preserves the normal freshness guard" {
+    publish server-a 10 >/dev/null
+    response=$(curl -sf -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+        -d '{"email":"user@example.com","sourceServer":"server-a","accessToken":"at-old","refreshToken":"rt-old","credentialUpdatedAt":9,"forceReplace":true}' \
+        "http://127.0.0.1:$PORT/v1/credentials/publish")
+    [ "$(jq -r '.accepted' <<<"$response")" = "false" ]
+    [ "$(jq -r '.reason' <<<"$response")" = "existing credential is fresher or equal" ]
+    [ "$(coord "http://127.0.0.1:$PORT/v1/credentials/fetch?email=user%40example.com&sourceServer=server-a" | jq -r '.accessToken')" = "at-server-a-10" ]
 }

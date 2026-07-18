@@ -434,6 +434,8 @@ const server = http.createServer(async (req, res) => {
       const credentialUpdatedAt = Number(body.credentialUpdatedAt || 0);
       const sourceServer = String(body.sourceServer || body.serverId || 'legacy').trim() || 'legacy';
       const scopes = Array.isArray(body.scopes) ? body.scopes : [];
+      const manualLogin = body.publishReason === 'manual_login';
+      const forceReplace = body.forceReplace === true;
       if (!email || !accessToken || !refreshToken) {
         return send(res, 400, { error: 'email, accessToken, refreshToken required' });
       }
@@ -445,7 +447,7 @@ const server = http.createServer(async (req, res) => {
       // Freshness is the client-observed refresh event, not OAuth expiry.
       // OAuth tokens can be revoked before expiresAt, and expiry is not a
       // reliable ordering signal for rotated refresh tokens.
-      if (existing) {
+      if (existing && !manualLogin) {
         const existingPlain = decryptCredential(existing);
         if (Number(existingPlain.credentialUpdatedAt || 0) >= credentialUpdatedAt) {
           return send(res, 200, { ok: true, accepted: false, sourceServer, reason: 'existing credential is fresher or equal' });
@@ -465,8 +467,8 @@ const server = http.createServer(async (req, res) => {
         observedAt: now,
         updatedAt: now,
       };
-      const eventType = existing ? 'credential.updated' : 'credential.add';
-      if (!eventAlreadyEmitted(fresh, eventType, email, sourceServer, credentialUpdatedAt)) {
+      const eventType = existing || manualLogin || forceReplace ? 'credential.updated' : 'credential.add';
+      if (manualLogin || forceReplace || !eventAlreadyEmitted(fresh, eventType, email, sourceServer, credentialUpdatedAt)) {
         emitEvent(fresh, eventType, { email, sourceServer, credentialUpdatedAt });
       }
       saveState(fresh);
