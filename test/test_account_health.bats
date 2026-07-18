@@ -117,3 +117,16 @@ EOF
     coord_reconcile_credential_email "known@example.com" "server-a"
     [ "$(cat "$source_capture")" = "server-a" ]
 }
+
+@test "unknown coordinator baseline does not clear invalid auth state" {
+    source_ccswitch_functions
+    add_account_to_sequence "1" "known@example.com" "uuid-known" "false"
+    jq '.accounts["1"].authState = "invalid"' "$SEQUENCE_FILE" > "$SEQUENCE_FILE.tmp"
+    mv "$SEQUENCE_FILE.tmp" "$SEQUENCE_FILE"
+    coord_fetch_credential() {
+        printf '%s\n' '{"sourceServer":"server-a","credentialHealth":{"status":"unknown"},"claudeAiOauth":{"accessToken":"at-known-new","refreshToken":"rt-known-new","credentialUpdatedAt":2}}'
+    }
+
+    coord_reconcile_credential_email "known@example.com" "server-a"
+    [ "$(jq -r '.accounts["1"].authState' "$SEQUENCE_FILE")" = "invalid" ]
+}

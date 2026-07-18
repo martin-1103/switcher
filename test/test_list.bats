@@ -78,3 +78,19 @@ EOF
     [[ "$output" == *"[RELOGIN_REQUIRED]"* ]]
     [[ "$output" == *"health: local=invalid remote=unknown"* ]]
 }
+
+@test "list renders cached healthy throttled and unknown statuses" {
+    add_account_to_sequence "1" "healthy@example.com" "uuid-1" "false"
+    add_account_to_sequence "2" "throttled@example.com" "uuid-2" "false"
+    add_account_to_sequence "3" "unknown@example.com" "uuid-3" "false"
+    jq '.accounts["1"].credentialHealth.status = "healthy" |
+        .accounts["2"].credentialHealth.status = "throttled" |
+        .accounts["3"].credentialHealth.status = "unknown"' "$SEQUENCE_FILE" > "$SEQUENCE_FILE.tmp"
+    mv "$SEQUENCE_FILE.tmp" "$SEQUENCE_FILE"
+
+    run run_ccswitch ls
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"[OK]"*healthy@example.com* ]]
+    [[ "$output" == *"[THROTTLED]"*throttled@example.com* ]]
+    [[ "$output" == *"[UNKNOWN]"*unknown@example.com* ]]
+}

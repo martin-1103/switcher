@@ -2238,7 +2238,7 @@ coord_fetch_credential() {
     health_observed=$(jq -r '.health.observedAt // 0' <<< "$payload" 2>/dev/null || echo 0)
     coord_cache_remote_health "$email" "$source_server" "$health_status" "$health_reason" "$health_fingerprint" "$health_observed"
     jq -n --argjson r "$payload" \
-        '{sourceServer: ($r.sourceServer // "legacy"), claudeAiOauth: {accessToken: $r.accessToken, refreshToken: $r.refreshToken, expiresAt: $r.expiresAt, refreshTokenExpiresAt: ($r.refreshTokenExpiresAt // 0), scopes: ($r.scopes // []), credentialUpdatedAt: ($r.credentialUpdatedAt // $r.updatedAt // 0)}}' 2>/dev/null || return 3
+        '{sourceServer: ($r.sourceServer // "legacy"), credentialHealth: ($r.health // {status: "unknown"}), claudeAiOauth: {accessToken: $r.accessToken, refreshToken: $r.refreshToken, expiresAt: $r.expiresAt, refreshTokenExpiresAt: ($r.refreshTokenExpiresAt // 0), scopes: ($r.scopes // []), credentialUpdatedAt: ($r.credentialUpdatedAt // $r.updatedAt // 0)}}' 2>/dev/null || return 3
 }
 
 coord_report_credential_health() {
@@ -2342,7 +2342,7 @@ pull_coordinator_credentials_if_fresher() {
     fi
     if [[ "$candidate_source" == coordinator ]]; then
         write_account_credentials "$active_num" "$active_email" "$candidate_creds"
-        clear_account_auth_invalid "$active_num"
+        [[ "$(jq -r '.credentialHealth.status // "unknown"' <<< "$candidate_creds" 2>/dev/null || echo unknown)" == "healthy" ]] && clear_account_auth_invalid "$active_num"
     fi
     release_switch_lock
 
@@ -2377,6 +2377,8 @@ coord_reconcile_credential_email() {
         coord_creds=$(coord_fetch_credential "$email" 2>/dev/null) || return 1
     fi
     credential_is_usable "$coord_creds" || return 1
+    local coord_health_status
+    coord_health_status=$(jq -r '.credentialHealth.status // "unknown"' <<< "$coord_creds" 2>/dev/null || echo unknown)
     local_num=$(resolve_account_identifier "$email" 2>/dev/null || true)
     if [[ -z "$local_num" ]]; then
         local synth_token synth_profile synth_email synth_uuid current_config target_config
@@ -2407,7 +2409,7 @@ coord_reconcile_credential_email() {
                 write_json "$SEQUENCE_FILE" "$updated"
                 write_account_credentials "$local_num" "$email" "$coord_creds"
                 write_account_config "$local_num" "$email" "$target_config"
-                clear_account_auth_invalid "$local_num"
+                [[ "$coord_health_status" == "healthy" ]] && clear_account_auth_invalid "$local_num"
             fi
         fi
         release_switch_lock
@@ -2424,7 +2426,7 @@ coord_reconcile_credential_email() {
         return 1
     fi
     write_account_credentials "$local_num" "$email" "$coord_creds"
-    clear_account_auth_invalid "$local_num"
+    [[ "$coord_health_status" == "healthy" ]] && clear_account_auth_invalid "$local_num"
     if [[ "$(get_current_account)" == "$email" ]]; then
         write_credentials "$coord_creds" >/dev/null 2>&1 || true
     fi
@@ -3829,22 +3831,29 @@ cmd_list() {
 
     while IFS='|' read -r num email profile account_type; do
         [[ -z "$num" ]] && continue
-        local prof="" type="" active_tag="" usage_line reset_line status_tag creds auth_state local_health health_reason health_source health_fingerprint health_observed remote_health_line
+        local prof="" type="" active_tag="" usage_line reset_line status_tag creds auth_state cached_health local_health health_reason health_source health_fingerprint health_observed remote_health_line
         [[ -n "$profile" ]] && prof=" [$profile]"
         [[ -n "$account_type" ]] && type=" {$account_type}"
         [[ "$num" == "$active_account_num" ]] && active_tag="[ACTIVE] "
 
         creds=$(read_account_credentials "$num" "$email")
+        cached_health=$(jq -r --arg num "$num" '.accounts[$num].credentialHealth.status // "unknown"' "$SEQUENCE_FILE" 2>/dev/null || echo unknown)
         auth_state=$(jq -r --arg num "$num" '.accounts[$num].authState // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
-        if [[ "$auth_state" == "invalid" ]]; then
+        if ! credential_is_usable "$creds"; then
+            status_tag="[EXPIRED]"
+            local_health="expired"
+        elif [[ "$auth_state" == "invalid" || "$cached_health" == "invalid" ]]; then
             status_tag="[RELOGIN_REQUIRED]"
             local_health="invalid"
-        elif credential_is_usable "$creds"; then
+        elif [[ "$cached_health" == "healthy" ]]; then
             status_tag="[OK]     "
             local_health="healthy"
+        elif [[ "$cached_health" == "throttled" ]]; then
+            status_tag="[THROTTLED]"
+            local_health="throttled"
         else
-            status_tag="[EXPIRED]"
             local_health="unknown"
+            status_tag="[UNKNOWN] "
         fi
         health_reason=$(jq -r --arg num "$num" '.accounts[$num].credentialHealth.reason // ""' "$SEQUENCE_FILE" 2>/dev/null || true)
         health_source=$(jq -r --arg num "$num" '.accounts[$num].credentialHealth.sourceServer // ""' "$SEQUENCE_FILE" 2>/dev/null || true)
@@ -4233,7 +4242,6 @@ perform_switch() {
             log_credential_event "recovered Account-$target_account ($target_email) backup from coordinator (caller=perform_switch)"
             target_creds="$coord_creds"
             write_account_credentials "$target_account" "$target_email" "$target_creds" >/dev/null 2>&1 || true
-            clear_account_auth_invalid "$target_account"
             clear_switch_cooldown "$target_account"
         else
             log_credential_event "refused to switch to Account-$target_account ($target_email): backup credentials are empty/expired (caller=perform_switch)"
