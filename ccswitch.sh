@@ -455,14 +455,23 @@ coord_pull_accounts() {
     coord_http_ready || return 0
 
     local leases_json
-    leases_json=$(coord_http_request GET "/v1/leases" 2>/dev/null) || return 0
-    [[ -n "$leases_json" ]] || return 0
+    if ! leases_json=$(coord_http_request GET "/v1/leases" 2>/dev/null); then
+        echo "Error: coordinator leases request failed (HTTP/network failure)" >&2
+        return 2
+    fi
+    if [[ -z "$leases_json" ]]; then
+        echo "Error: coordinator returned an empty leases response" >&2
+        return 2
+    fi
 
     local emails
-    emails=$(echo "$leases_json" | jq -r '.leases[]?.email // empty' 2>/dev/null) || return 0
+    if ! emails=$(echo "$leases_json" | jq -r '.leases[]?.email // empty' 2>/dev/null); then
+        echo "Error: coordinator returned an invalid leases response" >&2
+        return 2
+    fi
     [[ -n "$emails" ]] || return 0
 
-    local imported=0 backfilled=0
+    local imported=0 backfilled=0 coordinator_failure=0
     local email creds account_num existing_num existing_creds
     while IFS= read -r email; do
         [[ -n "$email" ]] || continue
@@ -481,7 +490,14 @@ coord_pull_accounts() {
 
             log_credential_event "coord_pull_accounts: local backup unusable for Account-$existing_num ($email), trying coordinator (caller=coord_pull_accounts)"
 
-            creds=$(coord_fetch_credential "$email" 2>/dev/null) || continue
+            local fetch_status=0
+            if creds=$(coord_fetch_credential "$email" 2>/dev/null); then
+                :
+            else
+                fetch_status=$?
+                [[ "$fetch_status" -eq 2 ]] && coordinator_failure=1
+                continue
+            fi
             if [[ -z "$creds" ]]; then
                 log_credential_event "coord_pull_accounts: coordinator has no credential for Account-$existing_num ($email) either (caller=coord_pull_accounts)"
                 continue
@@ -501,7 +517,14 @@ coord_pull_accounts() {
             continue
         fi
 
-        creds=$(coord_fetch_credential "$email" 2>/dev/null) || continue
+        local fetch_status=0
+        if creds=$(coord_fetch_credential "$email" 2>/dev/null); then
+            :
+        else
+            fetch_status=$?
+            [[ "$fetch_status" -eq 2 ]] && coordinator_failure=1
+            continue
+        fi
         [[ -n "$creds" ]] || continue
         credential_is_usable "$creds" || continue
 
@@ -522,6 +545,10 @@ coord_pull_accounts() {
         echo "  Imported Account $account_num: $email (from coordinator)"
     done <<< "$emails"
 
+    if [[ "$coordinator_failure" -eq 1 ]]; then
+        echo "Error: coordinator credential request failed (HTTP/network failure)" >&2
+        return 2
+    fi
     [[ "$imported" -gt 0 || "$backfilled" -gt 0 ]] && echo "coord_pull_accounts: imported=$imported backfilled=$backfilled"
     return 0
 }
@@ -1996,12 +2023,12 @@ coord_fetch_credential() {
     payload=$(echo "$response" | sed '$d')
     [[ "$http_code" == "200" ]] || return 3
     jq -n --argjson r "$payload" \
-        '{claudeAiOauth: {accessToken: $r.accessToken, refreshToken: $r.refreshToken, expiresAt: $r.expiresAt, refreshTokenExpiresAt: ($r.refreshTokenExpiresAt // 0), scopes: ($r.scopes // []), credentialUpdatedAt: ($r.credentialUpdatedAt // 0)}}' 2>/dev/null || return 3
+        '{claudeAiOauth: {accessToken: $r.accessToken, refreshToken: $r.refreshToken, expiresAt: $r.expiresAt, refreshTokenExpiresAt: ($r.refreshTokenExpiresAt // 0), scopes: ($r.scopes // []), credentialUpdatedAt: ($r.credentialUpdatedAt // $r.updatedAt // 0)}}' 2>/dev/null || return 3
 }
 
 # Pull the active account's credential from the coordinator into the LIVE
-# session (~/.claude/.credentials.json) when the coordinator's copy is
-# strictly fresher than what's running locally. This is the mirror of
+# session (~/.claude/.credentials.json) when a usable backup or coordinator
+# copy is newer than what's running locally. This is the mirror of
 # sync_active_credentials_to_backup (which pushes local->coordinator).
 #
 # Why this matters: Anthropic's OAuth refresh_token is single-use/rotating —
@@ -2012,40 +2039,61 @@ coord_fetch_credential() {
 # refresh_token. Piggybacked on cmd_rate_check same as the push direction —
 # already polled every ~10s via statusline/hook, no new timer.
 pull_coordinator_credentials_if_fresher() {
-    local active_num active_email live_creds live_updated coord_creds coord_updated
+    local active_num active_email live_creds live_updated backup_creds backup_updated
+    local coord_creds coord_updated candidate_creds candidate_updated candidate_source
     active_num=$(jq -r '.activeAccountNumber // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
     [[ -n "$active_num" && "$active_num" != "null" ]] || return 0
     active_email=$(jq -r --arg num "$active_num" '.accounts[$num].email // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
     [[ -n "$active_email" ]] || return 0
 
-    coord_creds=$(coord_fetch_credential "$active_email" 2>/dev/null) || return 0
-    [[ -n "$coord_creds" ]] || return 0
-    credential_is_usable "$coord_creds" || return 0
+    backup_creds=$(read_account_credentials "$active_num" "$active_email")
+    backup_updated=$(echo "$backup_creds" | jq -r '.credentialUpdatedAt // .claudeAiOauth.credentialUpdatedAt // 0' 2>/dev/null || echo 0)
+    [[ "$backup_updated" =~ ^[0-9]+$ ]] || backup_updated=0
+    candidate_creds="$backup_creds"
+    candidate_updated="$backup_updated"
+    candidate_source=backup
 
-    live_creds=$(read_credentials)
-    live_updated=$(echo "$live_creds" | jq -r '.credentialUpdatedAt // .claudeAiOauth.credentialUpdatedAt // 0' 2>/dev/null || echo 0)
-    coord_updated=$(echo "$coord_creds" | jq -r '.credentialUpdatedAt // .claudeAiOauth.credentialUpdatedAt // 0' 2>/dev/null || echo 0)
-    [[ "$live_updated" =~ ^[0-9]+$ ]] || live_updated=0
-    [[ "$coord_updated" =~ ^[0-9]+$ ]] || coord_updated=0
-
-    # Strictly fresher only — freshness is the refresh event version, never
-    # OAuth expiry. A token may be revoked server-side while its expiresAt is
-    # still in the future.
-    (( coord_updated > live_updated )) || return 0
+    coord_creds=$(coord_fetch_credential "$active_email" 2>/dev/null || true)
+    if [[ -n "$coord_creds" ]] && credential_is_usable "$coord_creds"; then
+        coord_updated=$(echo "$coord_creds" | jq -r '.credentialUpdatedAt // .claudeAiOauth.credentialUpdatedAt // 0' 2>/dev/null || echo 0)
+        [[ "$coord_updated" =~ ^[0-9]+$ ]] || coord_updated=0
+        if ! credential_is_usable "$candidate_creds" || (( coord_updated > candidate_updated )); then
+            candidate_creds="$coord_creds"
+            candidate_updated="$coord_updated"
+            candidate_source=coordinator
+        fi
+    fi
+    credential_is_usable "$candidate_creds" || return 0
 
     if ! acquire_switch_lock 2; then
         return 0
     fi
-    write_credentials "$coord_creds"
-    write_account_credentials "$active_num" "$active_email" "$coord_creds"
+
+    # Re-read under the lock. A newer local credential must win even if it
+    # appeared after the initial comparison above.
+    live_creds=$(read_credentials)
+    live_updated=$(echo "$live_creds" | jq -r '.credentialUpdatedAt // .claudeAiOauth.credentialUpdatedAt // 0' 2>/dev/null || echo 0)
+    [[ "$live_updated" =~ ^[0-9]+$ ]] || live_updated=0
+    if credential_is_usable "$live_creds" && (( live_updated >= candidate_updated )); then
+        release_switch_lock
+        return 0
+    fi
+
+    if ! write_credentials "$candidate_creds"; then
+        release_switch_lock
+        return 0
+    fi
+    if [[ "$candidate_source" == coordinator ]]; then
+        write_account_credentials "$active_num" "$active_email" "$candidate_creds"
+    fi
     release_switch_lock
 
     local live_token coord_token old_hash new_hash
     live_token=$(credential_access_token "$live_creds")
-    coord_token=$(credential_access_token "$coord_creds")
+    coord_token=$(credential_access_token "$candidate_creds")
     old_hash=$(printf '%s' "$live_token" | sha256sum | cut -c1-8)
     new_hash=$(printf '%s' "$coord_token" | sha256sum | cut -c1-8)
-    log_credential_event "pulled fresher credentials from coordinator for Account-$active_num ($active_email): token ${old_hash}->${new_hash} (caller=pull_coordinator_credentials_if_fresher)"
+    log_credential_event "restored $candidate_source credentials for Account-$active_num ($active_email): token ${old_hash}->${new_hash} (caller=pull_coordinator_credentials_if_fresher)"
 }
 
 # Reconcile one account after a coordinator credential.updated event. Events
@@ -2561,17 +2609,19 @@ cmd_coord_push() {
 
 cmd_coord_pull() {
     if ! coord_http_ready; then
-        echo "Coordinator not configured — nothing to pull."
-        return 0
+        echo "Error: coordinator is not configured (cannot pull accounts)." >&2
+        return 1
     fi
     # coord_pull_accounts prints its own imported/backfilled lines but stays
     # silent when there's nothing new, so add a fallback line for that case.
-    local output
-    output=$(coord_pull_accounts)
-    if [[ -n "$output" ]]; then
+    local output pull_status=0
+    output=$(coord_pull_accounts) || pull_status=$?
+    if [[ "$pull_status" -ne 0 ]]; then
+        return "$pull_status"
+    elif [[ -n "$output" ]]; then
         printf '%s\n' "$output"
     else
-        echo "No accounts to pull (coordinator unreachable or nothing new)."
+        echo "No accounts to pull (no leases or no new accounts)."
     fi
 }
 

@@ -404,7 +404,8 @@ const server = http.createServer(async (req, res) => {
       if (!record) {
         return send(res, 404, { error: 'not found' });
       }
-      return send(res, 200, decryptCredential(record));
+      const credential = decryptCredential(record);
+      return send(res, 200, { ...credential, updatedAt: Number(credential.updatedAt || 0) });
     }
 
     if (req.method === 'POST' && url.pathname === '/v1/leases/release') {
