@@ -1,0 +1,81 @@
+#!/usr/bin/env bats
+
+load test_helper
+
+setup() {
+    setup_test_env
+    cat > "$MOCK_BIN/curl" <<'EOF'
+#!/usr/bin/env bash
+case "${MOCK_CURL_RESULT:-200}" in
+    network) exit 28 ;;
+    401) printf '%s\n401\n' '{"error":"invalid token"}' ;;
+    429) printf '%s\n429\n' '{"error":"rate limited"}' ;;
+    500) printf '%s\n500\n' '{"error":"server error"}' ;;
+    *) printf '%s\n200\n' '{"five_hour":{}}' ;;
+esac
+EOF
+    chmod +x "$MOCK_BIN/curl"
+}
+
+teardown() {
+    teardown_test_env
+}
+
+@test "auth probe quarantines invalid credentials without storing the token" {
+    source_ccswitch_functions
+    mkdir -p "$BACKUP_DIR"
+    cat > "$SEQUENCE_FILE" <<'EOF'
+{"activeAccountNumber":1,"sequence":[1],"accounts":{"1":{"email":"one@example.com","expiresAt":"keep","credential":"do-not-touch"}}}
+EOF
+    export MOCK_CURL_RESULT=401
+
+    set +e
+    probe_account_credential 1 '{"access_token":"secret-token"}'
+    probe_status=$?
+    set -e
+    [ "$probe_status" -eq 1 ]
+    [ "$SWITCH_PROBE_RESULT" = "invalid" ]
+    [ "$SWITCH_PROBE_STATUS" = "401" ]
+    record_probe_failure 1 "$SWITCH_PROBE_RESULT" "$SWITCH_PROBE_STATUS" "$SWITCH_PROBE_REASON"
+
+    [ "$(jq -r '.accounts["1"].quarantineReason' "$SEQUENCE_FILE")" = "http_401" ]
+    [ "$(jq -r '.accounts["1"].expiresAt' "$SEQUENCE_FILE")" = "keep" ]
+    [ "$(jq -r '.accounts["1"].credential' "$SEQUENCE_FILE")" = "do-not-touch" ]
+    ! grep -q 'secret-token' "$BACKUP_DIR/autoswitch.log"
+}
+
+@test "transient probe is short cooldown and healthy probe clears quarantine" {
+    source_ccswitch_functions
+    mkdir -p "$BACKUP_DIR"
+    cat > "$SEQUENCE_FILE" <<'EOF'
+{"activeAccountNumber":1,"sequence":[1],"accounts":{"1":{}}}
+EOF
+    export MOCK_CURL_RESULT=429
+
+    set +e
+    probe_account_credential 1 '{"access_token":"secret-token"}'
+    probe_status=$?
+    set -e
+    [ "$probe_status" -eq 2 ]
+    record_probe_failure 1 "$SWITCH_PROBE_RESULT" "$SWITCH_PROBE_STATUS" "$SWITCH_PROBE_REASON"
+    [ "$(jq -r '.accounts["1"].quarantineReason' "$SEQUENCE_FILE")" = "http_429" ]
+    [ "$(jq -r '(.accounts["1"].quarantineUntil - now) | floor' "$SEQUENCE_FILE")" -le 31 ]
+
+    export MOCK_CURL_RESULT=200
+    probe_account_credential 1 '{"access_token":"secret-token"}'
+    clear_account_quarantine 1
+    [ "$(jq -r '.accounts["1"].quarantineUntil // empty' "$SEQUENCE_FILE")" = "" ]
+}
+
+@test "automatic candidate selection skips active quarantine" {
+    source_ccswitch_functions
+    add_account_to_sequence 1 one@example.com uuid-1 true
+    add_account_to_sequence 2 two@example.com uuid-2 false
+    add_account_to_sequence 3 three@example.com uuid-3 false
+    set_account_quarantine 2 3600 auth_failure
+
+    run auto_switch_candidates 1
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"2"* ]]
+    [[ "$output" == *"3"* ]]
+}

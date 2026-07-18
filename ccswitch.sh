@@ -41,6 +41,7 @@ readonly SWITCH_REFUSED_COOLDOWN_S=900
 # coordinator restart) — distinct from a confirmed-dead credential, which
 # can't self-heal by retrying sooner.
 readonly SWITCH_TRANSIENT_COOLDOWN_S=30
+readonly SWITCH_INVALID_QUARANTINE_S=86400
 readonly SWITCH_COOLDOWN_DIR="$BACKUP_DIR/.switch-cooldown"
 readonly COORD_EVENT_CURSOR_FILE="$BACKUP_DIR/coord-event-cursor"
 # Keepalive backoff state: once the OAuth refresh endpoint (POST
@@ -55,6 +56,9 @@ readonly KEEPALIVE_BACKOFF_MAX_S=14400
 # Global flags (set during argument parsing)
 DRY_RUN=false
 RESTART_FLAG=""  # "", "restart", or "no-restart"
+SWITCH_PROBE_RESULT=""
+SWITCH_PROBE_STATUS=""
+SWITCH_PROBE_REASON=""
 # Allow running as root. Defaults from CCSWITCH_ALLOW_ROOT (1/true to enable),
 # can also be set with the --allow-root flag.
 if [[ "${CCSWITCH_ALLOW_ROOT:-}" == "1" || "${CCSWITCH_ALLOW_ROOT:-}" == "true" ]]; then
@@ -1254,6 +1258,7 @@ collect_switch_candidates() {
     while IFS= read -r num; do
         [[ -n "$num" ]] || continue
         [[ "$num" == "$active_account" ]] && continue
+        account_quarantine_active "$num" && continue
         email=$(jq -r --arg num "$num" '.accounts[$num].email // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
         five=$(account_five_hour "$num")
         seven=$(account_seven_day "$num")
@@ -1615,6 +1620,120 @@ credential_is_usable() {
     expires=$(credential_expires_epoch "$creds")
     now=$(date +%s)
     [[ "$expires" -eq 0 || "$expires" -gt "$now" ]]
+}
+
+account_quarantine_active() {
+    local account_num="$1"
+    local until now
+    until=$(jq -r --arg num "$account_num" '.accounts[$num].quarantineUntil // 0' "$SEQUENCE_FILE" 2>/dev/null || echo 0)
+    [[ "$until" =~ ^[0-9]+$ ]] || until=0
+    now=$(date +%s)
+    (( until > now ))
+}
+
+set_account_quarantine() {
+    local account_num="$1"
+    local duration="$2"
+    local reason="$3"
+    local until updated
+    [[ -f "$SEQUENCE_FILE" ]] || return 0
+    until=$(( $(date +%s) + duration ))
+    updated=$(jq \
+        --arg num "$account_num" \
+        --argjson until "$until" \
+        --arg reason "$reason" \
+        '.accounts[$num].quarantineUntil = $until |
+         .accounts[$num].quarantineReason = $reason
+        ' "$SEQUENCE_FILE" 2>/dev/null) || return 0
+    write_json "$SEQUENCE_FILE" "$updated" >/dev/null 2>&1 || true
+}
+
+clear_account_quarantine() {
+    local account_num="$1"
+    local updated
+    [[ -f "$SEQUENCE_FILE" ]] || return 0
+    updated=$(jq --arg num "$account_num" '
+        del(.accounts[$num].quarantineUntil) |
+        del(.accounts[$num].quarantineReason)
+    ' "$SEQUENCE_FILE" 2>/dev/null) || return 0
+    write_json "$SEQUENCE_FILE" "$updated" >/dev/null 2>&1 || true
+}
+
+# Probe the same OAuth usage endpoint used by fetch_usage_data. Returns:
+# 0=healthy, 1=invalid credential, 2=transient failure. No response body or
+# credential is logged; callers only receive a safe status/reason pair.
+probe_account_credential() {
+    local account_num="$1"
+    local credentials="$2"
+    local access_token response http_code body lower_body
+    SWITCH_PROBE_RESULT=""
+    SWITCH_PROBE_STATUS=""
+    SWITCH_PROBE_REASON=""
+
+    access_token=$(credential_access_token "$credentials")
+    if [[ -z "$access_token" ]]; then
+        SWITCH_PROBE_RESULT=invalid
+        SWITCH_PROBE_STATUS=none
+        SWITCH_PROBE_REASON=missing_access_token
+        return 1
+    fi
+
+    response=$(curl -sS -w "\n%{http_code}" \
+        --connect-timeout "${CCS_CURL_CONNECT_TIMEOUT:-$DEFAULT_CURL_CONNECT_TIMEOUT}" \
+        --max-time "${CCS_CURL_MAX_TIME:-$DEFAULT_CURL_MAX_TIME}" \
+        -H "Authorization: Bearer $access_token" \
+        -H "anthropic-beta: oauth-2025-04-20" \
+        "https://api.anthropic.com/api/oauth/usage" 2>/dev/null) || {
+        SWITCH_PROBE_RESULT=transient
+        SWITCH_PROBE_STATUS=network
+        SWITCH_PROBE_REASON=network_or_timeout
+        return 2
+    }
+
+    http_code=$(printf '%s' "$response" | tail -n1)
+    body=$(printf '%s' "$response" | sed '$d')
+    SWITCH_PROBE_STATUS="$http_code"
+    case "$http_code" in
+        200)
+            if echo "$body" | jq . >/dev/null 2>&1; then
+                SWITCH_PROBE_RESULT=healthy
+                SWITCH_PROBE_REASON=ok
+                return 0
+            fi
+            SWITCH_PROBE_RESULT=transient
+            SWITCH_PROBE_REASON=invalid_response
+            return 2
+            ;;
+        401|403)
+            SWITCH_PROBE_RESULT=invalid
+            SWITCH_PROBE_REASON="http_$http_code"
+            return 1
+            ;;
+    esac
+
+    lower_body=$(printf '%s' "$body" | tr '[:upper:]' '[:lower:]')
+    if [[ "$lower_body" == *"unauthorized"* || "$lower_body" == *"authentication"* || "$lower_body" == *"invalid token"* || "$lower_body" == *"invalid access token"* ]]; then
+        SWITCH_PROBE_RESULT=invalid
+        SWITCH_PROBE_REASON=explicit_auth_failure
+        return 1
+    fi
+
+    SWITCH_PROBE_RESULT=transient
+    SWITCH_PROBE_REASON="http_${http_code:-network}"
+    return 2
+}
+
+record_probe_failure() {
+    local account_num="$1"
+    local result="$2"
+    local status="$3"
+    local reason="$4"
+    if [[ "$result" == invalid ]]; then
+        set_account_quarantine "$account_num" "$SWITCH_INVALID_QUARANTINE_S" "$reason"
+    else
+        set_account_quarantine "$account_num" "$SWITCH_TRANSIENT_COOLDOWN_S" "$reason"
+    fi
+    log_switch_event "probe Account-$account_num result=$result status=$status reason=$reason"
 }
 
 # mkdir-based marker (atomic, same pattern as the switch lock) recording that
@@ -3569,12 +3688,15 @@ cmd_switch() {
         ($seq | index($active) // 0) as $idx |
         [range(1; ($seq | length) + 1) as $offset |
             $seq[($idx + $offset) % ($seq | length)] |
-            select((. as $n | ($root.accounts["\($n)"].authState // "") != "invalid"))
+            select((. as $n |
+                ($root.accounts["\($n)"].authState // "") != "invalid" and
+                (($root.accounts["\($n)"].quarantineUntil // 0) <= now)
+            ))
         ][0] // empty
     ' "$SEQUENCE_FILE")
 
     if [[ -z "$next_account" ]]; then
-        echo "Error: no usable account found (all other accounts are marked authState=invalid)"
+        echo "Error: no usable account found (all other accounts are invalid, quarantined, or unavailable)"
         exit 1
     fi
 
@@ -3823,6 +3945,22 @@ perform_switch() {
             exit 1
         fi
     fi
+
+    # Probe the exact credential that would be committed. This closes the gap
+    # between local expiry checks and server-side revocation. Invalid auth is
+    # quarantined long-term; rate limits, 5xx, network, and timeout failures
+    # receive only the short transient quarantine.
+    if [[ "${CCS_SKIP_ACCOUNT_PROBE:-0}" != "1" ]]; then
+        local probe_rc=0
+        probe_account_credential "$target_account" "$target_creds" || probe_rc=$?
+        if [[ "$probe_rc" -ne 0 ]]; then
+            rollback
+            record_probe_failure "$target_account" "$SWITCH_PROBE_RESULT" "$SWITCH_PROBE_STATUS" "$SWITCH_PROBE_REASON"
+            echo "Error: Account-$target_account credential probe failed (status=$SWITCH_PROBE_STATUS reason=$SWITCH_PROBE_REASON)" >&2
+            return 1
+        fi
+    fi
+    clear_account_quarantine "$target_account"
 
     # Step 3: Activate target account
     if ! write_credentials "$target_creds"; then
@@ -4233,8 +4371,16 @@ cmd_rate_check() {
     local accept_max=$(( RL_CAP_5H - RL_MOVE_STEP ))
     (( forced == 1 )) && accept_max=$(( RL_CAP_5H - 1 ))
 
+    local max_attempts attempts=0
+    max_attempts=$(jq '.sequence | length' "$SEQUENCE_FILE" 2>/dev/null || echo 0)
+    declare -A visited_accounts=()
+
     while IFS= read -r next_account; do
         [[ -z "$next_account" ]] && continue
+        [[ -n "${visited_accounts[$next_account]:-}" ]] && continue
+        visited_accounts[$next_account]=1
+        attempts=$((attempts + 1))
+        (( attempts <= max_attempts )) || break
         local next_email next_5h
         next_email=$(jq -r --arg num "$next_account" '.accounts[$num].email' "$SEQUENCE_FILE")
         next_5h=$(account_five_hour "$next_account")
@@ -4272,6 +4418,15 @@ cmd_rate_check() {
             fi
         fi
 
+        local probe_rc=0
+        probe_account_credential "$next_account" "$next_creds" || probe_rc=$?
+        if [[ "$probe_rc" -ne 0 ]]; then
+            record_probe_failure "$next_account" "$SWITCH_PROBE_RESULT" "$SWITCH_PROBE_STATUS" "$SWITCH_PROBE_REASON"
+            log_switch_event "candidate Account-$next_account skipped by probe"
+            continue
+        fi
+        clear_account_quarantine "$next_account"
+
         # Claim atomically before switching. 409 conflict (return 2) = another
         # server grabbed it first, skip. Coordinator-unavailable (return 1) =
         # fail open and switch anyway (degrade to autonomous, don't block).
@@ -4287,12 +4442,23 @@ cmd_rate_check() {
         fi
 
         log_switch_event "attempting switch: Account-$starting_account -> Account-$next_account ($next_email) 5h=${next_5h}%"
-        if ! (CCS_SWITCH_REASON=auto CCS_SILENT=1 CCS_SKIP_POST_SWITCH_USAGE_FETCH=1 perform_switch "$next_account"); then
+        CCS_SWITCH_REASON=auto
+        CCS_SILENT=1
+        CCS_SKIP_POST_SWITCH_USAGE_FETCH=1
+        CCS_SKIP_ACCOUNT_PROBE=1
+        if ! perform_switch "$next_account"; then
+            unset CCS_SKIP_ACCOUNT_PROBE
+            if [[ "$SWITCH_PROBE_RESULT" == invalid || "$SWITCH_PROBE_RESULT" == transient ]]; then
+                record_probe_failure "$next_account" "$SWITCH_PROBE_RESULT" "$SWITCH_PROBE_STATUS" "$SWITCH_PROBE_REASON"
+                log_switch_event "candidate Account-$next_account skipped after probe race"
+                continue
+            fi
             log_switch_event "switch FAILED: Account-$starting_account -> Account-$next_account ($next_email)"
             [[ "$hook_mode" == true ]] && exit 0   # fail open
             echo "Error: Failed to switch to Account-$next_account ($next_email)" >&2
             exit 2
         fi
+        unset CCS_SKIP_ACCOUNT_PROBE
 
         log_switch_event "switch OK: Account-$starting_account -> Account-$next_account ($next_email)"
         if [[ "$hook_mode" == true ]]; then
