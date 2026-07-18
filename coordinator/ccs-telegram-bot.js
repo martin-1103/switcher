@@ -167,6 +167,24 @@ async function listAccounts() {
   return accounts;
 }
 
+function formatTelegramAccountList(stdout) {
+  const icons = {
+    OK: '✅',
+    RELOGIN_REQUIRED: '🔐',
+    EXPIRED: '🔐',
+    UNKNOWN: '⚠️',
+    THROTTLED: '🟡',
+  };
+  const lines = [];
+  for (const line of String(stdout).split('\n')) {
+    const match = line.match(/^\s*(?:\[[A-Z_]+\]\s+)?\[([A-Z_]+)\]\s+\d+:\s+(\S+@\S+?)(?:\s|$)/);
+    if (!match) continue;
+    const [, status, email] = match;
+    lines.push(`${icons[status] || '⚠️'} ${email}`);
+  }
+  return lines.join('\n') || '(no accounts)';
+}
+
 // Convenience view for callers that only care about expired/all email sets.
 async function listExpired() {
   const accounts = await listAccounts();
@@ -283,17 +301,10 @@ async function handleCommand(text, from) {
       await reply(HELP);
       return true;
     case '/status': {
-      // Forward `ccs ls` verbatim (usage/reset/tags) — no reparse — then
-      // append the bot-only pending-code list, which ccs ls doesn't know.
+      // Telegram needs only central's local account list, not ccs ls details.
       const r = await run(CCS_BIN, ['ls']);
       if (r.code !== 0) { await reply(`ccs ls failed:\n${r.stderr.trim() || 'unknown error'}`); return true; }
-      let out = r.stdout.trim() || '(no accounts)';
-      const pend = Object.keys(state.pending);
-      if (pend.length) {
-        let accounts = [];
-        try { accounts = await listAccounts(); } catch { /* email-only */ }
-        out += '\n\nAwaiting code:\n' + pend.map((e) => `  ${emailToNum(accounts, e)}: ${e}`).join('\n');
-      }
+      const out = formatTelegramAccountList(r.stdout);
       // Telegram hard-caps messages at 4096 chars.
       await reply(out.length > 4000 ? out.slice(0, 3990) + '\n…(truncated)' : out);
       return true;
