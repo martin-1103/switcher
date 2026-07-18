@@ -3723,6 +3723,15 @@ cmd_add_account() {
     esac
     coord_publish_account_state "$account_num" "$current_email"
 
+    # Probe only newly captured account once. The probe records local health
+    # and publishes it to coordinator; transient/429 results must not fail add.
+    local source_server="${CCS_SERVER_ID:-}"
+    if [[ -z "$source_server" ]] && coord_enabled; then
+        source_server=$(coord_server_id 2>/dev/null || true)
+    fi
+    [[ -n "$source_server" ]] || source_server=legacy
+    probe_account_credential "$account_num" "$current_creds" "$source_server" >/dev/null 2>&1 || true
+
     if [[ "$is_update" -eq 1 ]]; then
         echo "Updated Account $account_num: $current_email"
     else

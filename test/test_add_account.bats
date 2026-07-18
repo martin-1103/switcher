@@ -82,6 +82,38 @@ EOF
     [[ "$output" == *"Coordinator publish accepted"* ]]
 }
 
+@test "add account probes fresh credentials once without failing on transient result" {
+    setup_fake_account "user1@example.com" "uuid-1"
+    source_ccswitch_functions
+
+    export PROBE_CALLS_FILE="$TEST_HOME/probe-calls"
+    probe_account_credential() {
+        printf '%s %s\n' "$1" "$3" >> "$PROBE_CALLS_FILE"
+        printf '%s' "$2" > "$TEST_HOME/probe-creds"
+        return 2
+    }
+    coord_publish_credential() {
+        COORD_PUBLISH_REASON=mock
+        return 0
+    }
+    coord_publish_account_state() { :; }
+    fetch_oauth_profile() {
+        printf 'user1@example.com\tuuid-1\n'
+    }
+
+    local cmd_output="$TEST_HOME/add-output"
+    set +e
+    cmd_add_account >"$cmd_output" 2>&1
+    local status=$?
+    set -e
+    [ "$status" -eq 0 ]
+    [ "$(wc -l < "$PROBE_CALLS_FILE")" -eq 1 ]
+    read -r probe_num probe_source < "$PROBE_CALLS_FILE"
+    [ "$probe_num" = "1" ]
+    grep -q 'at-user1@example.com' "$TEST_HOME/probe-creds"
+    [ "$probe_source" = "legacy" ]
+}
+
 @test "test_add_account_with_no_active_login_shows_error" {
     # No config file created = no active login
     run run_ccswitch --add-account
