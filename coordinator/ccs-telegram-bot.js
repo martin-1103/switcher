@@ -177,10 +177,10 @@ function formatTelegramAccountList(stdout) {
   };
   const lines = [];
   for (const line of String(stdout).split('\n')) {
-    const match = line.match(/^\s*(?:\[[A-Z_]+\]\s+)?\[([A-Z_]+)\]\s+\d+:\s+(\S+@\S+?)(?:\s|$)/);
+    const match = line.match(/^\s*(?:\[[A-Z_]+\]\s+)?\[([A-Z_]+)\]\s+(\d+):\s+(\S+@\S+?)(?:\s|$)/);
     if (!match) continue;
-    const [, status, email] = match;
-    lines.push(`${icons[status] || '⚠️'} ${email}`);
+    const [, status, num, email] = match;
+    lines.push(`${icons[status] || '⚠️'} ${num}: ${email}`);
   }
   return lines.join('\n') || '(no accounts)';
 }
