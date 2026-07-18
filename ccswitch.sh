@@ -1708,15 +1708,21 @@ update_credential_tokens() {
     local access_token="$2"
     local refresh_token="$3"
 
+    local refreshed_at
+    refreshed_at=$(( $(date +%s) * 1000 ))
+
     echo "$creds" | jq \
         --arg at "$access_token" \
-        --arg rt "$refresh_token" '
+        --arg rt "$refresh_token" \
+        --argjson refreshedAt "$refreshed_at" '
         if has("claudeAiOauth") then
             .claudeAiOauth.accessToken = $at |
-            .claudeAiOauth.refreshToken = $rt
+            .claudeAiOauth.refreshToken = $rt |
+            .claudeAiOauth.credentialUpdatedAt = $refreshedAt
         else
             .access_token = $at |
-            .refresh_token = $rt
+            .refresh_token = $rt |
+            .credentialUpdatedAt = $refreshedAt
         end
     ' 2>/dev/null
 }
@@ -1945,15 +1951,17 @@ coord_publish_credential() {
     local email="$1"
     local creds="$2"
     coord_http_ready || return 1
-    local access_token refresh_token expires_at scopes
+    local access_token refresh_token expires_at refresh_expires_at scopes updated_at
     access_token=$(credential_access_token "$creds")
     refresh_token=$(credential_refresh_token "$creds")
     expires_at=$(echo "$creds" | jq -r '.expires_at // .claudeAiOauth.expiresAt // 0' 2>/dev/null || echo 0)
+    refresh_expires_at=$(echo "$creds" | jq -r '.refreshTokenExpiresAt // .claudeAiOauth.refreshTokenExpiresAt // 0' 2>/dev/null || echo 0)
     scopes=$(echo "$creds" | jq -c '.scopes // .claudeAiOauth.scopes // []' 2>/dev/null || echo '[]')
+    updated_at=$(echo "$creds" | jq -r '.credentialUpdatedAt // .claudeAiOauth.credentialUpdatedAt // 0' 2>/dev/null || echo 0)
     [[ -n "$access_token" && -n "$refresh_token" ]] || return 1
     local payload response
-    payload=$(jq -n --arg email "$email" --arg at "$access_token" --arg rt "$refresh_token" --argjson exp "${expires_at:-0}" --argjson sc "$scopes" \
-        '{email: $email, accessToken: $at, refreshToken: $rt, expiresAt: $exp, scopes: $sc}')
+    payload=$(jq -n --arg email "$email" --arg at "$access_token" --arg rt "$refresh_token" --argjson exp "${expires_at:-0}" --argjson refreshExp "${refresh_expires_at:-0}" --argjson sc "$scopes" --argjson updated "${updated_at:-0}" \
+        '{email: $email, accessToken: $at, refreshToken: $rt, expiresAt: $exp, refreshTokenExpiresAt: $refreshExp, scopes: $sc, credentialUpdatedAt: $updated}')
     response=$(coord_http_request POST "/v1/credentials/publish" "$payload" 2>/dev/null) || return 2
     if [[ "$(echo "$response" | jq -r '.accepted // false' 2>/dev/null)" == "true" ]]; then
         return 0
@@ -1987,7 +1995,7 @@ coord_fetch_credential() {
     payload=$(echo "$response" | sed '$d')
     [[ "$http_code" == "200" ]] || return 3
     jq -n --argjson r "$payload" \
-        '{claudeAiOauth: {accessToken: $r.accessToken, refreshToken: $r.refreshToken, expiresAt: $r.expiresAt, scopes: ($r.scopes // [])}}' 2>/dev/null || return 3
+        '{claudeAiOauth: {accessToken: $r.accessToken, refreshToken: $r.refreshToken, expiresAt: $r.expiresAt, refreshTokenExpiresAt: ($r.refreshTokenExpiresAt // 0), scopes: ($r.scopes // []), credentialUpdatedAt: ($r.credentialUpdatedAt // 0)}}' 2>/dev/null || return 3
 }
 
 # Pull the active account's credential from the coordinator into the LIVE
@@ -2003,29 +2011,26 @@ coord_fetch_credential() {
 # refresh_token. Piggybacked on cmd_rate_check same as the push direction —
 # already polled every ~10s via statusline/hook, no new timer.
 pull_coordinator_credentials_if_fresher() {
-    local active_num active_email live_creds live_expires coord_creds coord_expires
+    local active_num active_email live_creds live_updated coord_creds coord_updated
     active_num=$(jq -r '.activeAccountNumber // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
     [[ -n "$active_num" && "$active_num" != "null" ]] || return 0
     active_email=$(jq -r --arg num "$active_num" '.accounts[$num].email // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
     [[ -n "$active_email" ]] || return 0
-
-    # Guard against a stale/mismatched activeAccountNumber, same as the push
-    # direction: only pull if the live credentials really do belong to this
-    # account.
-    [[ "$(get_current_account)" == "$active_email" ]] || return 0
 
     coord_creds=$(coord_fetch_credential "$active_email" 2>/dev/null) || return 0
     [[ -n "$coord_creds" ]] || return 0
     credential_is_usable "$coord_creds" || return 0
 
     live_creds=$(read_credentials)
-    live_expires=$(credential_expires_epoch "$live_creds")
-    coord_expires=$(credential_expires_epoch "$coord_creds")
+    live_updated=$(echo "$live_creds" | jq -r '.credentialUpdatedAt // .claudeAiOauth.credentialUpdatedAt // 0' 2>/dev/null || echo 0)
+    coord_updated=$(echo "$coord_creds" | jq -r '.credentialUpdatedAt // .claudeAiOauth.credentialUpdatedAt // 0' 2>/dev/null || echo 0)
+    [[ "$live_updated" =~ ^[0-9]+$ ]] || live_updated=0
+    [[ "$coord_updated" =~ ^[0-9]+$ ]] || coord_updated=0
 
-    # Strictly fresher only — never pull an equal-or-older copy. Guards the
-    # symmetric case: a host that just refreshed locally must not have its
-    # own just-published token immediately overwritten by its own stale read.
-    (( coord_expires > live_expires )) || return 0
+    # Strictly fresher only — freshness is the refresh event version, never
+    # OAuth expiry. A token may be revoked server-side while its expiresAt is
+    # still in the future.
+    (( coord_updated > live_updated )) || return 0
 
     if ! acquire_switch_lock 2; then
         return 0
@@ -2093,6 +2098,19 @@ sync_active_credentials_to_backup() {
     backup_token=$(credential_access_token "$backup_creds")
 
     [[ "$live_token" != "$backup_token" ]] || return 0
+
+    # Claude Code may rotate the live token internally without adding our
+    # freshness marker. Stamp that observed rotation before publishing it so
+    # other clients can deterministically prefer this credential.
+    local synced_at
+    synced_at=$(( $(date +%s) * 1000 ))
+    live_creds=$(echo "$live_creds" | jq --argjson updated "$synced_at" '
+        if has("claudeAiOauth") then
+            .claudeAiOauth.credentialUpdatedAt = $updated
+        else
+            .credentialUpdatedAt = $updated
+        end
+    ' 2>/dev/null) || return 0
 
     if ! acquire_switch_lock 2; then
         return 0
@@ -3599,9 +3617,23 @@ perform_switch() {
         fi
     fi
 
-    # Step 2: Retrieve target account
-    local target_creds target_config
+    # Step 2: Retrieve target account. The coordinator is authoritative for
+    # rotated credentials: compare refresh-event versions, not expiresAt.
+    local target_creds target_config coord_creds
     target_creds=$(read_account_credentials "$target_account" "$target_email")
+    coord_creds=$(coord_fetch_credential "$target_email" 2>/dev/null || true)
+    if [[ -n "$coord_creds" ]] && credential_is_usable "$coord_creds"; then
+        local target_updated coord_updated
+        target_updated=$(echo "$target_creds" | jq -r '.credentialUpdatedAt // .claudeAiOauth.credentialUpdatedAt // 0' 2>/dev/null || echo 0)
+        coord_updated=$(echo "$coord_creds" | jq -r '.credentialUpdatedAt // .claudeAiOauth.credentialUpdatedAt // 0' 2>/dev/null || echo 0)
+        [[ "$target_updated" =~ ^[0-9]+$ ]] || target_updated=0
+        [[ "$coord_updated" =~ ^[0-9]+$ ]] || coord_updated=0
+        if [[ -z "$target_creds" ]] || ! credential_is_usable "$target_creds" || (( coord_updated > target_updated )); then
+            target_creds="$coord_creds"
+            write_account_credentials "$target_account" "$target_email" "$target_creds" >/dev/null 2>&1 || true
+            log_credential_event "selected coordinator credential for Account-$target_account ($target_email): version=$coord_updated (caller=perform_switch)"
+        fi
+    fi
     target_config=$(read_account_config "$target_account" "$target_email")
 
     if [[ -z "$target_creds" ]]; then
@@ -4092,9 +4124,21 @@ cmd_rate_check() {
 
         local next_creds
         next_creds=$(read_account_credentials "$next_account" "$next_email")
+        local coord_creds
+        coord_creds=$(coord_fetch_credential "$next_email" 2>/dev/null || true)
+        if [[ -n "$coord_creds" ]] && credential_is_usable "$coord_creds"; then
+            local next_updated coord_updated
+            next_updated=$(echo "$next_creds" | jq -r '.credentialUpdatedAt // .claudeAiOauth.credentialUpdatedAt // 0' 2>/dev/null || echo 0)
+            coord_updated=$(echo "$coord_creds" | jq -r '.credentialUpdatedAt // .claudeAiOauth.credentialUpdatedAt // 0' 2>/dev/null || echo 0)
+            [[ "$next_updated" =~ ^[0-9]+$ ]] || next_updated=0
+            [[ "$coord_updated" =~ ^[0-9]+$ ]] || coord_updated=0
+            if [[ -z "$next_creds" ]] || ! credential_is_usable "$next_creds" || (( coord_updated > next_updated )); then
+                next_creds="$coord_creds"
+                write_account_credentials "$next_account" "$next_email" "$next_creds" >/dev/null 2>&1 || true
+                log_credential_event "selected coordinator credential for Account-$next_account ($next_email): version=$coord_updated (caller=cmd_rate_check)"
+            fi
+        fi
         if ! credential_is_usable "$next_creds"; then
-            local coord_creds
-            coord_creds=$(coord_fetch_credential "$next_email" 2>/dev/null || true)
             if [[ -n "$coord_creds" ]] && credential_is_usable "$coord_creds"; then
                 log_credential_event "recovered Account-$next_account ($next_email) backup from coordinator (caller=cmd_rate_check)"
                 next_creds="$coord_creds"

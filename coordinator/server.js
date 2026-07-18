@@ -304,6 +304,8 @@ const server = http.createServer(async (req, res) => {
       const accessToken = String(body.accessToken || '');
       const refreshToken = String(body.refreshToken || '');
       const expiresAt = Number(body.expiresAt || 0);
+      const refreshTokenExpiresAt = Number(body.refreshTokenExpiresAt || 0);
+      const credentialUpdatedAt = Number(body.credentialUpdatedAt || 0);
       const scopes = Array.isArray(body.scopes) ? body.scopes : [];
       if (!email || !accessToken || !refreshToken) {
         return send(res, 400, { error: 'email, accessToken, refreshToken required' });
@@ -312,16 +314,16 @@ const server = http.createServer(async (req, res) => {
       // atomic-claim pattern as /v1/leases/claim, closes the same race.
       const fresh = loadState();
       const existing = fresh.credentials[email];
-      // Freshness compare on expiresAt (not wall-clock updatedAt): a host that
-      // just refreshed always has a later expiresAt than a stale copy, so this
-      // is safe even if server clocks disagree slightly.
+      // Freshness is the client-observed refresh event, not OAuth expiry.
+      // OAuth tokens can be revoked before expiresAt, and expiry is not a
+      // reliable ordering signal for rotated refresh tokens.
       if (existing) {
         const existingPlain = decryptCredential(existing);
-        if (Number(existingPlain.expiresAt || 0) >= expiresAt) {
+        if (Number(existingPlain.credentialUpdatedAt || 0) >= credentialUpdatedAt) {
           return send(res, 200, { ok: true, accepted: false, reason: 'existing credential is fresher or equal' });
         }
       }
-      fresh.credentials[email] = encryptCredential({ accessToken, refreshToken, expiresAt, scopes, updatedAt: now });
+      fresh.credentials[email] = encryptCredential({ accessToken, refreshToken, expiresAt, refreshTokenExpiresAt, scopes, credentialUpdatedAt, updatedAt: now });
       saveState(fresh);
       return send(res, 200, { ok: true, accepted: true });
     }
