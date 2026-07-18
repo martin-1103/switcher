@@ -41,6 +41,8 @@ EOF
     [ "$(jq -r '.accounts["1"].quarantineReason' "$SEQUENCE_FILE")" = "http_401" ]
     [ "$(jq -r '.accounts["1"].expiresAt' "$SEQUENCE_FILE")" = "keep" ]
     [ "$(jq -r '.accounts["1"].credential' "$SEQUENCE_FILE")" = "do-not-touch" ]
+    [ "$(jq -r '.accounts["1"].credentialHealth.status' "$SEQUENCE_FILE")" = "invalid" ]
+    [ "$(jq -r '.accounts["1"].credentialHealth.fingerprint | length' "$SEQUENCE_FILE")" -eq 64 ]
     ! grep -q 'secret-token' "$BACKUP_DIR/autoswitch.log"
 }
 
@@ -60,6 +62,7 @@ EOF
     record_probe_failure 1 "$SWITCH_PROBE_RESULT" "$SWITCH_PROBE_STATUS" "$SWITCH_PROBE_REASON"
     [ "$(jq -r '.accounts["1"].quarantineReason' "$SEQUENCE_FILE")" = "http_429" ]
     [ "$(jq -r '(.accounts["1"].quarantineUntil - now) | floor' "$SEQUENCE_FILE")" -le 31 ]
+    [ "$(jq -r '.accounts["1"].credentialHealth.status' "$SEQUENCE_FILE")" = "throttled" ]
 
     export MOCK_CURL_RESULT=200
     probe_account_credential 1 '{"access_token":"secret-token"}'
@@ -78,4 +81,39 @@ EOF
     [ "$status" -eq 0 ]
     [[ "$output" != *"2"* ]]
     [[ "$output" == *"3"* ]]
+}
+
+@test "credential event auto-add stores switchable config" {
+    source_ccswitch_functions
+    setup_fake_account "current@example.com" "uuid-current"
+    mkdir -p "$BACKUP_DIR"
+    cat > "$SEQUENCE_FILE" <<'EOF'
+{"activeAccountNumber":null,"sequence":[],"accounts":{}}
+EOF
+    coord_fetch_credential() {
+        printf '%s\n' '{"sourceServer":"remote-a","claudeAiOauth":{"accessToken":"at-remote@example.com","refreshToken":"rt-remote@example.com"}}'
+    }
+    fetch_oauth_profile() {
+        printf '%s\n' 'remote@example.com	uuid-remote'
+    }
+
+    coord_reconcile_credential_email "remote@example.com"
+    local num config_email
+    num=$(jq -r '.sequence[0]' "$SEQUENCE_FILE")
+    config_email=$(jq -r '.oauthAccount.emailAddress' "$BACKUP_DIR/configs/.claude-config-${num}-remote@example.com.json")
+    [ "$config_email" = "remote@example.com" ]
+    [ -n "$(jq -r '.oauthAccount.accountUuid' "$BACKUP_DIR/configs/.claude-config-${num}-remote@example.com.json")" ]
+}
+
+@test "credential event reconciliation fetches the event source" {
+    source_ccswitch_functions
+    add_account_to_sequence "1" "known@example.com" "uuid-known" "false"
+    local source_capture="$TEST_HOME/source-server"
+    coord_fetch_credential() {
+        printf '%s' "${2:-legacy}" > "$source_capture"
+        printf '%s\n' '{"sourceServer":"server-a","claudeAiOauth":{"accessToken":"at-known","refreshToken":"rt-known","credentialUpdatedAt":2}}'
+    }
+
+    coord_reconcile_credential_email "known@example.com" "server-a"
+    [ "$(cat "$source_capture")" = "server-a" ]
 }

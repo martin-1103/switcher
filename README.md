@@ -252,6 +252,7 @@ ccs coord-client-command
 ccs status
 ccs rate-check --refresh
 ccs coord-sync
+ccs coord-push --baseline
 ```
 
 Healthy signs:
@@ -259,6 +260,12 @@ Healthy signs:
 - `Coordination:    http (...)`
 - hook and statusline already installed
 - account lease appears on coordinator after `ccs coord-sync`
+- `coord-push --baseline` publishes usable local credentials for this server only;
+  coordinator records are source-aware and a healthy source is never overwritten
+  by an unprobed baseline credential
+- `ccs ls` shows local/remote credential health; a locally confirmed 401 is shown
+  as `RELOGIN_REQUIRED`. 429 is `throttled`; timeout and network failures are
+  `unknown`, never invalid.
 
 ## Commands
 

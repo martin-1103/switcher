@@ -55,6 +55,20 @@ function decryptCredential(record) {
   return JSON.parse(plaintext.toString('utf8'));
 }
 
+function isEncryptedCredential(record) {
+  return Boolean(record && record.iv && record.tag && record.ciphertext);
+}
+
+function normalizeCredentialStore(state) {
+  for (const [email, value] of Object.entries(state.credentials || {})) {
+    if (isEncryptedCredential(value)) {
+      state.credentials[email] = { sources: { legacy: value } };
+    } else if (!value || typeof value !== 'object' || !value.sources || typeof value.sources !== 'object') {
+      state.credentials[email] = { sources: {} };
+    }
+  }
+}
+
 fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
 
 function loadState() {
@@ -69,6 +83,10 @@ function loadState() {
     if (!state.credentials || typeof state.credentials !== 'object') {
       state.credentials = {};
     }
+    if (!state.credentialHealth || typeof state.credentialHealth !== 'object') {
+      state.credentialHealth = {};
+    }
+    normalizeCredentialStore(state);
     if (!Array.isArray(state.events)) {
       state.events = [];
     }
@@ -77,7 +95,7 @@ function loadState() {
     }
     return state;
   } catch {
-    return { leases: {}, usageSnapshots: {}, credentials: {}, events: [], eventSeq: 0 };
+    return { leases: {}, usageSnapshots: {}, credentials: {}, credentialHealth: {}, events: [], eventSeq: 0 };
   }
 }
 
@@ -174,6 +192,52 @@ function emitEvent(state, type, payload) {
     }
   }
   return event;
+}
+
+function eventAlreadyEmitted(state, type, email, sourceServer, credentialUpdatedAt) {
+  return (state.events || []).some(event =>
+    event.type === type && event.email === email && event.sourceServer === sourceServer &&
+    Number(event.credentialUpdatedAt || 0) === Number(credentialUpdatedAt || 0));
+}
+
+function healthEventAlreadyEmitted(state, email, sourceServer, status, fingerprint, observedAt) {
+  return (state.events || []).some(event =>
+    event.type === 'credential.health.updated' && event.email === email &&
+    event.sourceServer === sourceServer && event.status === status &&
+    event.fingerprint === fingerprint && Number(event.observedAt || 0) === Number(observedAt || 0));
+}
+
+function credentialSources(state, email) {
+  const entry = state.credentials[email];
+  if (!entry) return {};
+  if (isEncryptedCredential(entry)) return { legacy: entry };
+  return entry.sources || {};
+}
+
+function credentialHealth(state, email, sourceServer) {
+  return state.credentialHealth[email]?.[sourceServer] || { status: 'unknown' };
+}
+
+function credentialVersion(record) {
+  try {
+    return Number(decryptCredential(record).credentialUpdatedAt || 0);
+  } catch {
+    return 0;
+  }
+}
+
+function credentialHealthView(state, email) {
+  return Object.entries(credentialSources(state, email)).map(([sourceServer, record]) => {
+    const health = credentialHealth(state, email, sourceServer);
+    return {
+      sourceServer,
+      status: health.status || 'unknown',
+      reason: health.reason || null,
+      fingerprint: health.fingerprint || null,
+      observedAt: Number(health.observedAt || 0),
+      credentialUpdatedAt: credentialVersion(record),
+    };
+  });
 }
 
 function normalizeLease(input) {
@@ -368,6 +432,7 @@ const server = http.createServer(async (req, res) => {
       const expiresAt = Number(body.expiresAt || 0);
       const refreshTokenExpiresAt = Number(body.refreshTokenExpiresAt || 0);
       const credentialUpdatedAt = Number(body.credentialUpdatedAt || 0);
+      const sourceServer = String(body.sourceServer || body.serverId || 'legacy').trim() || 'legacy';
       const scopes = Array.isArray(body.scopes) ? body.scopes : [];
       if (!email || !accessToken || !refreshToken) {
         return send(res, 400, { error: 'email, accessToken, refreshToken required' });
@@ -375,21 +440,78 @@ const server = http.createServer(async (req, res) => {
       // Reload fresh AFTER the await, mutate+save synchronously — same
       // atomic-claim pattern as /v1/leases/claim, closes the same race.
       const fresh = loadState();
-      const existing = fresh.credentials[email];
+      const sources = credentialSources(fresh, email);
+      const existing = sources[sourceServer];
       // Freshness is the client-observed refresh event, not OAuth expiry.
       // OAuth tokens can be revoked before expiresAt, and expiry is not a
       // reliable ordering signal for rotated refresh tokens.
       if (existing) {
         const existingPlain = decryptCredential(existing);
         if (Number(existingPlain.credentialUpdatedAt || 0) >= credentialUpdatedAt) {
-          logEvent(`credential_reject email=${email} incoming_version=${credentialUpdatedAt} existing_version=${existingPlain.credentialUpdatedAt || 0}`);
-          return send(res, 200, { ok: true, accepted: false, reason: 'existing credential is fresher or equal' });
+          return send(res, 200, { ok: true, accepted: false, sourceServer, reason: 'existing credential is fresher or equal' });
         }
       }
-      fresh.credentials[email] = encryptCredential({ accessToken, refreshToken, expiresAt, refreshTokenExpiresAt, scopes, credentialUpdatedAt, updatedAt: now });
-      emitEvent(fresh, 'credential.updated', { email, credentialUpdatedAt });
+      if (!fresh.credentials[email] || isEncryptedCredential(fresh.credentials[email])) {
+        fresh.credentials[email] = { sources: sources };
+      }
+      fresh.credentials[email].sources[sourceServer] = encryptCredential({ accessToken, refreshToken, expiresAt, refreshTokenExpiresAt, scopes, credentialUpdatedAt, updatedAt: now });
+      fresh.credentialHealth[email] = fresh.credentialHealth[email] || {};
+      const healthStatus = body.healthStatus === 'healthy' ? 'healthy' : 'unknown';
+      fresh.credentialHealth[email][sourceServer] = {
+        ...(fresh.credentialHealth[email][sourceServer] || {}),
+        status: healthStatus,
+        reason: healthStatus === 'healthy' ? 'publish_health_proof' : null,
+        fingerprint: String(body.fingerprint || '').slice(0, 128) || null,
+        observedAt: now,
+        updatedAt: now,
+      };
+      const eventType = existing ? 'credential.updated' : 'credential.add';
+      if (!eventAlreadyEmitted(fresh, eventType, email, sourceServer, credentialUpdatedAt)) {
+        emitEvent(fresh, eventType, { email, sourceServer, credentialUpdatedAt });
+      }
       saveState(fresh);
-      return send(res, 200, { ok: true, accepted: true });
+      return send(res, 200, { ok: true, accepted: true, sourceServer, event: eventType });
+    }
+
+    if (req.method === 'GET' && url.pathname === '/v1/credentials/health') {
+      const email = String(url.searchParams.get('email') || '').trim();
+      if (!email) return send(res, 400, { error: 'email required' });
+      return send(res, 200, { email, sources: credentialHealthView(state, email) });
+    }
+
+    if (req.method === 'POST' && url.pathname === '/v1/credentials/health') {
+      const body = await readJson(req);
+      const email = String(body.email || '').trim();
+      const sourceServer = String(body.sourceServer || body.serverId || 'legacy').trim() || 'legacy';
+      let status = String(body.status || '').trim();
+      if (status === 'transient') {
+        status = 'unknown';
+      }
+      if (!email || !['healthy', 'invalid', 'throttled', 'unknown'].includes(status)) {
+        return send(res, 400, { error: 'email and valid status required' });
+      }
+      const fresh = loadState();
+      fresh.credentialHealth[email] = fresh.credentialHealth[email] || {};
+      fresh.credentialHealth[email][sourceServer] = {
+        status,
+        reason: String(body.reason || '').slice(0, 200) || null,
+        fingerprint: String(body.fingerprint || '').slice(0, 128) || null,
+        observedAt: Number(body.observedAt || Date.now()),
+        updatedAt: Date.now(),
+      };
+      const health = fresh.credentialHealth[email][sourceServer];
+      if (!healthEventAlreadyEmitted(fresh, email, sourceServer, status, health.fingerprint, health.observedAt)) {
+        emitEvent(fresh, 'credential.health.updated', {
+          email,
+          sourceServer,
+          status,
+          reason: health.reason,
+          fingerprint: health.fingerprint,
+          observedAt: health.observedAt,
+        });
+      }
+      saveState(fresh);
+      return send(res, 200, { ok: true, email, sourceServer, status });
     }
 
     if (req.method === 'GET' && url.pathname === '/v1/credentials/fetch') {
@@ -397,15 +519,25 @@ const server = http.createServer(async (req, res) => {
         return send(res, 501, { error: 'credential store not configured (CCS_COORD_CRED_KEY unset)' });
       }
       const email = String(url.searchParams.get('email') || '').trim();
+      const requestedSource = String(url.searchParams.get('sourceServer') || '').trim();
       if (!email) {
         return send(res, 400, { error: 'email required' });
       }
-      const record = state.credentials[email];
-      if (!record) {
+      const sources = credentialSources(state, email);
+      const candidates = Object.entries(sources)
+        .filter(([sourceServer]) => !requestedSource || sourceServer === requestedSource)
+        .filter(([sourceServer]) => credentialHealth(state, email, sourceServer).status !== 'invalid')
+        .sort(([a, recordA], [b, recordB]) => {
+          const aHealthy = credentialHealth(state, email, a).status === 'healthy' ? 1 : 0;
+          const bHealthy = credentialHealth(state, email, b).status === 'healthy' ? 1 : 0;
+          return bHealthy - aHealthy || credentialVersion(recordB) - credentialVersion(recordA);
+        });
+      if (candidates.length === 0) {
         return send(res, 404, { error: 'not found' });
       }
+      const [sourceServer, record] = candidates[0];
       const credential = decryptCredential(record);
-      return send(res, 200, { ...credential, updatedAt: Number(credential.updatedAt || 0) });
+      return send(res, 200, { ...credential, sourceServer, health: credentialHealth(state, email, sourceServer), updatedAt: Number(credential.updatedAt || 0) });
     }
 
     if (req.method === 'POST' && url.pathname === '/v1/leases/release') {

@@ -129,6 +129,11 @@ get_claude_config_path() {
         echo "$dotconfig"
         return
     fi
+    local nested_config="$config_dir/.claude.json"
+    if [[ -f "$nested_config" ]]; then
+        echo "$nested_config"
+        return
+    fi
     echo "${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json"
 }
 
@@ -220,6 +225,10 @@ coord_mode() {
 }
 
 coord_server_id() {
+    if [[ -n "${CCS_SERVER_ID:-}" ]]; then
+        printf '%s\n' "$CCS_SERVER_ID"
+        return 0
+    fi
     local configured
     configured=$(coord_config_value '.coordination.serverId' 2>/dev/null || true)
     if [[ -n "$configured" ]]; then
@@ -1622,6 +1631,34 @@ credential_is_usable() {
     [[ "$expires" -eq 0 || "$expires" -gt "$now" ]]
 }
 
+credential_fingerprint() {
+    local access_token
+    access_token=$(credential_access_token "$1")
+    [[ -n "$access_token" ]] || { printf '%s\n' ""; return 0; }
+    if command -v sha256sum >/dev/null 2>&1; then
+        printf '%s' "$access_token" | sha256sum | cut -d' ' -f1
+    else
+        printf '%s' "$access_token" | shasum -a 256 | cut -d' ' -f1
+    fi
+}
+
+record_local_credential_health() {
+    local account_num="$1" status="$2" reason="$3" source_server="$4" fingerprint="$5" observed_at="$6"
+    [[ -f "$SEQUENCE_FILE" ]] || return 0
+    local updated
+    updated=$(jq --arg num "$account_num" --arg status "$status" --arg reason "$reason" \
+        --arg source "$source_server" --arg fingerprint "$fingerprint" --argjson observedAt "${observed_at:-0}" '
+        .accounts[$num].credentialHealth = {
+            status: $status,
+            reason: $reason,
+            sourceServer: $source,
+            fingerprint: $fingerprint,
+            observedAt: $observedAt
+        }
+    ' "$SEQUENCE_FILE" 2>/dev/null) || return 0
+    write_json "$SEQUENCE_FILE" "$updated" >/dev/null 2>&1 || true
+}
+
 account_quarantine_active() {
     local account_num="$1"
     local until now
@@ -1660,21 +1697,34 @@ clear_account_quarantine() {
 }
 
 # Probe the same OAuth usage endpoint used by fetch_usage_data. Returns:
-# 0=healthy, 1=invalid credential, 2=transient failure. No response body or
+# 0=healthy, 1=invalid credential, 2=transient failure. Health metadata uses
+# healthy, invalid, throttled, or unknown. No response body or
 # credential is logged; callers only receive a safe status/reason pair.
 probe_account_credential() {
     local account_num="$1"
     local credentials="$2"
+    local source_server="${3:-${CCS_SERVER_ID:-legacy}}"
+    [[ -n "${3:-${CCS_SERVER_ID:-}}" || ! coord_enabled ]] || source_server=$(coord_server_id)
+    local probe_email
+    probe_email=$(jq -r --arg num "$account_num" '.accounts[$num].email // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
     local access_token response http_code body lower_body
     SWITCH_PROBE_RESULT=""
     SWITCH_PROBE_STATUS=""
     SWITCH_PROBE_REASON=""
+
+    report_probe_health() {
+        local health_status="$1" health_reason="$2" probe_at="$3" probe_fp
+        probe_fp=$(credential_fingerprint "$credentials")
+        record_local_credential_health "$account_num" "$health_status" "$health_reason" "$source_server" "$probe_fp" "$probe_at"
+        [[ -n "$probe_email" ]] && coord_report_credential_health "$probe_email" "$health_status" "$health_reason" "$source_server" "$probe_fp" "$probe_at" || true
+    }
 
     access_token=$(credential_access_token "$credentials")
     if [[ -z "$access_token" ]]; then
         SWITCH_PROBE_RESULT=invalid
         SWITCH_PROBE_STATUS=none
         SWITCH_PROBE_REASON=missing_access_token
+        report_probe_health invalid "$SWITCH_PROBE_REASON" "$(( $(date +%s) * 1000 ))"
         return 1
     fi
 
@@ -1687,6 +1737,7 @@ probe_account_credential() {
         SWITCH_PROBE_RESULT=transient
         SWITCH_PROBE_STATUS=network
         SWITCH_PROBE_REASON=network_or_timeout
+        report_probe_health unknown "$SWITCH_PROBE_REASON" "$(( $(date +%s) * 1000 ))"
         return 2
     }
 
@@ -1698,15 +1749,19 @@ probe_account_credential() {
             if echo "$body" | jq . >/dev/null 2>&1; then
                 SWITCH_PROBE_RESULT=healthy
                 SWITCH_PROBE_REASON=ok
+                report_probe_health healthy "$SWITCH_PROBE_REASON" "$(( $(date +%s) * 1000 ))"
+                clear_account_auth_invalid "$account_num"
                 return 0
             fi
             SWITCH_PROBE_RESULT=transient
             SWITCH_PROBE_REASON=invalid_response
+            report_probe_health unknown "$SWITCH_PROBE_REASON" "$(( $(date +%s) * 1000 ))"
             return 2
             ;;
         401|403)
             SWITCH_PROBE_RESULT=invalid
             SWITCH_PROBE_REASON="http_$http_code"
+            report_probe_health invalid "$SWITCH_PROBE_REASON" "$(( $(date +%s) * 1000 ))"
             return 1
             ;;
     esac
@@ -1715,11 +1770,17 @@ probe_account_credential() {
     if [[ "$lower_body" == *"unauthorized"* || "$lower_body" == *"authentication"* || "$lower_body" == *"invalid token"* || "$lower_body" == *"invalid access token"* ]]; then
         SWITCH_PROBE_RESULT=invalid
         SWITCH_PROBE_REASON=explicit_auth_failure
+        report_probe_health invalid "$SWITCH_PROBE_REASON" "$(( $(date +%s) * 1000 ))"
         return 1
     fi
 
     SWITCH_PROBE_RESULT=transient
     SWITCH_PROBE_REASON="http_${http_code:-network}"
+    if [[ "$http_code" == "429" ]]; then
+        report_probe_health throttled "$SWITCH_PROBE_REASON" "$(( $(date +%s) * 1000 ))"
+    else
+        report_probe_health unknown "$SWITCH_PROBE_REASON" "$(( $(date +%s) * 1000 ))"
+    fi
     return 2
 }
 
@@ -1730,6 +1791,7 @@ record_probe_failure() {
     local reason="$4"
     if [[ "$result" == invalid ]]; then
         set_account_quarantine "$account_num" "$SWITCH_INVALID_QUARANTINE_S" "$reason"
+        mark_account_auth_invalid "$account_num" "$reason"
     else
         set_account_quarantine "$account_num" "$SWITCH_TRANSIENT_COOLDOWN_S" "$reason"
     fi
@@ -2098,22 +2160,45 @@ coord_publish_credential() {
     local email="$1"
     local creds="$2"
     coord_http_ready || return 1
-    local access_token refresh_token expires_at refresh_expires_at scopes updated_at
+    local access_token refresh_token expires_at refresh_expires_at scopes updated_at source_server health_status
     access_token=$(credential_access_token "$creds")
     refresh_token=$(credential_refresh_token "$creds")
     expires_at=$(echo "$creds" | jq -r '.expires_at // .claudeAiOauth.expiresAt // 0' 2>/dev/null || echo 0)
     refresh_expires_at=$(echo "$creds" | jq -r '.refreshTokenExpiresAt // .claudeAiOauth.refreshTokenExpiresAt // 0' 2>/dev/null || echo 0)
     scopes=$(echo "$creds" | jq -c '.scopes // .claudeAiOauth.scopes // []' 2>/dev/null || echo '[]')
     updated_at=$(echo "$creds" | jq -r '.credentialUpdatedAt // .claudeAiOauth.credentialUpdatedAt // 0' 2>/dev/null || echo 0)
+    source_server=$(coord_server_id)
+    health_status=$(jq -r --arg email "$email" --arg source "$source_server" --arg fingerprint "$(credential_fingerprint "$creds")" '
+        .accounts | to_entries[] | select(.value.email == $email) |
+        if .value.credentialHealth.status == "healthy" and
+           .value.credentialHealth.sourceServer == $source and
+           .value.credentialHealth.fingerprint == $fingerprint then "healthy" else "unknown" end
+    ' "$SEQUENCE_FILE" 2>/dev/null | head -n1 || echo unknown)
+    [[ -n "$health_status" ]] || health_status=unknown
     [[ -n "$access_token" && -n "$refresh_token" ]] || return 1
     local payload response
-    payload=$(jq -n --arg email "$email" --arg at "$access_token" --arg rt "$refresh_token" --argjson exp "${expires_at:-0}" --argjson refreshExp "${refresh_expires_at:-0}" --argjson sc "$scopes" --argjson updated "${updated_at:-0}" \
-        '{email: $email, accessToken: $at, refreshToken: $rt, expiresAt: $exp, refreshTokenExpiresAt: $refreshExp, scopes: $sc, credentialUpdatedAt: $updated}')
+    payload=$(jq -n --arg email "$email" --arg at "$access_token" --arg rt "$refresh_token" --arg source "$source_server" --arg health "$health_status" --argjson exp "${expires_at:-0}" --argjson refreshExp "${refresh_expires_at:-0}" --argjson sc "$scopes" --argjson updated "${updated_at:-0}" \
+        '{email: $email, sourceServer: $source, accessToken: $at, refreshToken: $rt, expiresAt: $exp, refreshTokenExpiresAt: $refreshExp, scopes: $sc, credentialUpdatedAt: $updated, healthStatus: $health}')
     response=$(coord_http_request POST "/v1/credentials/publish" "$payload" 2>/dev/null) || return 2
     if [[ "$(echo "$response" | jq -r '.accepted // false' 2>/dev/null)" == "true" ]]; then
         return 0
     fi
     return 3
+}
+
+coord_cache_remote_health() {
+    local email="$1" source_server="$2" status="$3" reason="$4" fingerprint="$5" observed_at="$6"
+    local account_num updated
+    account_num=$(resolve_account_identifier "$email" 2>/dev/null || true)
+    [[ -n "$account_num" && -f "$SEQUENCE_FILE" ]] || return 0
+    updated=$(jq --arg num "$account_num" --arg source "$source_server" --arg status "$status" --arg reason "$reason" \
+        --arg fingerprint "$fingerprint" --argjson observedAt "${observed_at:-0}" '
+        .accounts[$num].remoteCredentialHealth = (.accounts[$num].remoteCredentialHealth // {}) |
+        .accounts[$num].remoteCredentialHealth[$source] = {
+            status: $status, reason: $reason, fingerprint: $fingerprint, observedAt: $observedAt
+        }
+    ' "$SEQUENCE_FILE" 2>/dev/null) || return 0
+    write_json "$SEQUENCE_FILE" "$updated" >/dev/null 2>&1 || true
 }
 
 # Pull a credential from the coordinator's encrypted store. Returns the same
@@ -2129,9 +2214,13 @@ coord_publish_credential() {
 #   3 = coordinator responded but with no usable credential (confirmed)
 coord_fetch_credential() {
     local email="$1"
+    local requested_source="${2:-}"
     coord_http_ready || return 1
     local url token response http_code payload
     url="$(coord_config_value '.coordination.http.url')/v1/credentials/fetch?email=$(printf '%s' "$email" | jq -sRr @uri)"
+    if [[ -n "$requested_source" ]]; then
+        url="${url}&sourceServer=$(printf '%s' "$requested_source" | jq -sRr @uri)"
+    fi
     token=$(coord_config_value '.coordination.http.token')
     response=$(curl -sS -w "\n%{http_code}" \
         --connect-timeout "${CCS_CURL_CONNECT_TIMEOUT:-$DEFAULT_CURL_CONNECT_TIMEOUT}" \
@@ -2141,8 +2230,57 @@ coord_fetch_credential() {
     http_code=$(echo "$response" | tail -n1)
     payload=$(echo "$response" | sed '$d')
     [[ "$http_code" == "200" ]] || return 3
+    local source_server health_status health_reason health_fingerprint health_observed
+    source_server=$(jq -r '.sourceServer // "legacy"' <<< "$payload" 2>/dev/null || echo legacy)
+    health_status=$(jq -r '.health.status // "unknown"' <<< "$payload" 2>/dev/null || echo unknown)
+    health_reason=$(jq -r '.health.reason // ""' <<< "$payload" 2>/dev/null || true)
+    health_fingerprint=$(jq -r '.health.fingerprint // ""' <<< "$payload" 2>/dev/null || true)
+    health_observed=$(jq -r '.health.observedAt // 0' <<< "$payload" 2>/dev/null || echo 0)
+    coord_cache_remote_health "$email" "$source_server" "$health_status" "$health_reason" "$health_fingerprint" "$health_observed"
     jq -n --argjson r "$payload" \
-        '{claudeAiOauth: {accessToken: $r.accessToken, refreshToken: $r.refreshToken, expiresAt: $r.expiresAt, refreshTokenExpiresAt: ($r.refreshTokenExpiresAt // 0), scopes: ($r.scopes // []), credentialUpdatedAt: ($r.credentialUpdatedAt // $r.updatedAt // 0)}}' 2>/dev/null || return 3
+        '{sourceServer: ($r.sourceServer // "legacy"), claudeAiOauth: {accessToken: $r.accessToken, refreshToken: $r.refreshToken, expiresAt: $r.expiresAt, refreshTokenExpiresAt: ($r.refreshTokenExpiresAt // 0), scopes: ($r.scopes // []), credentialUpdatedAt: ($r.credentialUpdatedAt // $r.updatedAt // 0)}}' 2>/dev/null || return 3
+}
+
+coord_report_credential_health() {
+    local email="$1" status="$2" reason="${3:-}" source_server="${4:-${CCS_SERVER_ID:-legacy}}" fingerprint="${5:-}" observed_at="${6:-$(( $(date +%s) * 1000 ))}"
+    coord_http_ready || return 1
+    [[ -n "${4:-${CCS_SERVER_ID:-}}" ]] || source_server=$(coord_server_id)
+    local payload
+    payload=$(jq -n --arg email "$email" --arg source "$source_server" --arg status "$status" --arg reason "$reason" --arg fingerprint "$fingerprint" --argjson observedAt "$observed_at" \
+        '{email: $email, sourceServer: $source, status: $status, reason: $reason, fingerprint: $fingerprint, observedAt: $observedAt}')
+    coord_http_request POST "/v1/credentials/health" "$payload" >/dev/null 2>&1 || true
+}
+
+coord_credential_health() {
+    local email="$1"
+    coord_http_ready || return 1
+    local encoded
+    encoded=$(printf '%s' "$email" | jq -sRr @uri)
+    coord_http_request GET "/v1/credentials/health?email=${encoded}"
+}
+
+# Recover only from a coordinator source explicitly marked healthy. The
+# candidate is probed before it is written locally; 401 marks that source
+# invalid, while 429 is throttled and network/timeout remains unknown; neither
+# is treated as invalid.
+coord_recover_credential() {
+    local account_num="$1" email="$2"
+    local health sources source candidate probe_rc
+    health=$(coord_credential_health "$email" 2>/dev/null) || return 1
+    sources=$(printf '%s' "$health" | jq -r --arg local "$(coord_server_id)" '.sources[]? | select(.status == "healthy" and .sourceServer != $local) | .sourceServer' 2>/dev/null || true)
+    while IFS= read -r source; do
+        [[ -n "$source" ]] || continue
+        candidate=$(coord_fetch_credential "$email" "$source" 2>/dev/null) || continue
+        credential_is_usable "$candidate" || continue
+        probe_account_credential "$account_num" "$candidate" "$source" || probe_rc=$?
+        probe_rc=${probe_rc:-0}
+        if [[ "$probe_rc" -eq 0 ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+        unset probe_rc
+    done <<< "$sources"
+    return 1
 }
 
 # Pull the active account's credential from the coordinator into the LIVE
@@ -2204,28 +2342,77 @@ pull_coordinator_credentials_if_fresher() {
     fi
     if [[ "$candidate_source" == coordinator ]]; then
         write_account_credentials "$active_num" "$active_email" "$candidate_creds"
+        clear_account_auth_invalid "$active_num"
     fi
     release_switch_lock
 
-    local live_token coord_token old_hash new_hash
-    live_token=$(credential_access_token "$live_creds")
-    coord_token=$(credential_access_token "$candidate_creds")
-    old_hash=$(printf '%s' "$live_token" | sha256sum | cut -c1-8)
-    new_hash=$(printf '%s' "$coord_token" | sha256sum | cut -c1-8)
-    log_credential_event "restored $candidate_source credentials for Account-$active_num ($active_email): token ${old_hash}->${new_hash} (caller=pull_coordinator_credentials_if_fresher)"
+    log_credential_event "restored $candidate_source credentials for Account-$active_num ($active_email) (caller=pull_coordinator_credentials_if_fresher)"
+}
+
+# Cache health metadata from SSE without fetching credentials. Health events
+# never contain tokens and do not trigger per-account coordinator requests.
+coord_reconcile_health_event() {
+    local email="$1" data="$2" local_num updated source status reason fingerprint observed
+    local_num=$(resolve_account_identifier "$email" 2>/dev/null || true)
+    [[ -n "$local_num" ]] || return 0
+    source=$(jq -r '.sourceServer // "legacy"' <<< "$data" 2>/dev/null || echo legacy)
+    status=$(jq -r '.status // "unknown"' <<< "$data" 2>/dev/null || echo unknown)
+    reason=$(jq -r '.reason // ""' <<< "$data" 2>/dev/null || true)
+    fingerprint=$(jq -r '.fingerprint // ""' <<< "$data" 2>/dev/null || true)
+    observed=$(jq -r '.observedAt // 0' <<< "$data" 2>/dev/null || echo 0)
+    coord_cache_remote_health "$email" "$source" "$status" "$reason" "$fingerprint" "$observed"
 }
 
 # Reconcile one account after a coordinator credential.updated event. Events
 # carry metadata only; tokens are fetched through the authenticated API.
 coord_reconcile_credential_email() {
     local email="$1"
+    local source_server="${2:-}"
     [[ -n "$email" ]] || return 1
 
     local coord_creds local_num local_creds local_updated coord_updated
-    coord_creds=$(coord_fetch_credential "$email" 2>/dev/null) || return 1
+    if [[ -n "$source_server" ]]; then
+        coord_creds=$(coord_fetch_credential "$email" "$source_server" 2>/dev/null) || return 1
+    else
+        coord_creds=$(coord_fetch_credential "$email" 2>/dev/null) || return 1
+    fi
     credential_is_usable "$coord_creds" || return 1
     local_num=$(resolve_account_identifier "$email" 2>/dev/null || true)
-    [[ -n "$local_num" ]] || return 0
+    if [[ -z "$local_num" ]]; then
+        local synth_token synth_profile synth_email synth_uuid current_config target_config
+        synth_token=$(credential_access_token "$coord_creds")
+        synth_profile=$(fetch_oauth_profile "$synth_token" 2>/dev/null || true)
+        synth_email=$(cut -f1 <<< "$synth_profile")
+        synth_uuid=$(cut -f2 <<< "$synth_profile")
+        [[ "$synth_email" == "$email" && -n "$synth_uuid" ]] || return 1
+        current_config=$(cat "$(get_claude_config_path)" 2>/dev/null || echo '{}')
+        target_config=$(jq --arg accountEmail "$synth_email" --arg accountUuid "$synth_uuid" \
+            '.oauthAccount = {emailAddress: $accountEmail, accountUuid: $accountUuid}' <<< "$current_config" 2>/dev/null) || return 1
+        if ! acquire_switch_lock 2; then
+            return 1
+        fi
+        local_num=$(resolve_account_identifier "$email" 2>/dev/null || true)
+        if [[ -z "$local_num" ]]; then
+            mkdir -p "$BACKUP_DIR"/{configs,credentials}
+            chmod 700 "$BACKUP_DIR" "$BACKUP_DIR/configs" "$BACKUP_DIR/credentials" 2>/dev/null || true
+            local_num=$(get_next_account_number)
+            local updated now
+            now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+            updated=$(jq --arg num "$local_num" --arg email "$email" --arg now "$now" '
+                .accounts[$num] = (.accounts[$num] // {}) + {email: $email, added: $now, importedFromCoordinator: true} |
+                .sequence = ((.sequence // []) + [$num | tonumber] | unique) |
+                .lastUpdated = $now
+            ' "$SEQUENCE_FILE" 2>/dev/null) || updated=""
+            if [[ -n "$updated" ]]; then
+                write_json "$SEQUENCE_FILE" "$updated"
+                write_account_credentials "$local_num" "$email" "$coord_creds"
+                write_account_config "$local_num" "$email" "$target_config"
+                clear_account_auth_invalid "$local_num"
+            fi
+        fi
+        release_switch_lock
+        return 0
+    fi
     local_creds=$(read_account_credentials "$local_num" "$email")
     local_updated=$(echo "$local_creds" | jq -r '.credentialUpdatedAt // .claudeAiOauth.credentialUpdatedAt // 0' 2>/dev/null || echo 0)
     coord_updated=$(echo "$coord_creds" | jq -r '.credentialUpdatedAt // .claudeAiOauth.credentialUpdatedAt // 0' 2>/dev/null || echo 0)
@@ -2237,6 +2424,7 @@ coord_reconcile_credential_email() {
         return 1
     fi
     write_account_credentials "$local_num" "$email" "$coord_creds"
+    clear_account_auth_invalid "$local_num"
     if [[ "$(get_current_account)" == "$email" ]]; then
         write_credentials "$coord_creds" >/dev/null 2>&1 || true
     fi
@@ -2248,7 +2436,7 @@ coord_reconcile_credential_email() {
 # from the last durable event id; rate-check remains the periodic fallback.
 cmd_coord_listen() {
     coord_http_ready || { echo "Error: HTTP coordinator is not configured" >&2; return 1; }
-    local cursor=0 line pending_id data email event_type url token
+    local cursor=0 line pending_id data email source_server event_type url token
     cursor=$(cat "$COORD_EVENT_CURSOR_FILE" 2>/dev/null || echo 0)
     [[ "$cursor" =~ ^[0-9]+$ ]] || cursor=0
     while true; do
@@ -2262,9 +2450,16 @@ cmd_coord_listen() {
                 data:*)
                     data="${line#data: }"
                     email=$(echo "$data" | jq -r '.email // empty' 2>/dev/null || true)
+                    source_server=$(echo "$data" | jq -r '.sourceServer // empty' 2>/dev/null || true)
                     event_type=$(echo "$data" | jq -r '.type // "unknown"' 2>/dev/null || echo unknown)
                     log_credential_event "coord_listen event id=${pending_id:-unknown} type=$event_type email=${email:-unknown}"
-                    if [[ -n "$email" ]] && coord_reconcile_credential_email "$email"; then
+                    if [[ -n "$email" ]] && [[ "$event_type" == "credential.health.updated" ]] && coord_reconcile_health_event "$email" "$data"; then
+                        if [[ "$pending_id" =~ ^[0-9]+$ ]]; then
+                            cursor="$pending_id"
+                            printf '%s\n' "$cursor" > "$COORD_EVENT_CURSOR_FILE"
+                        fi
+                        log_credential_event "coord_listen cached_health id=${pending_id:-unknown} email=${email:-unknown} cursor=$cursor"
+                    elif [[ -n "$email" ]] && [[ "$event_type" == "credential.add" || "$event_type" == "credential.updated" ]] && coord_reconcile_credential_email "$email" "$source_server"; then
                         if [[ "$pending_id" =~ ^[0-9]+$ ]]; then
                             cursor="$pending_id"
                             printf '%s\n' "$cursor" > "$COORD_EVENT_CURSOR_FILE"
@@ -2358,10 +2553,7 @@ sync_active_credentials_to_backup() {
     # publishes there), which no longer happens proactively now that keepalive is
     # dead. Fail-open: coord_publish_credential already no-ops on any error.
     coord_publish_credential "$active_email" "$live_creds" || true
-    local old_hash new_hash
-    old_hash=$(printf '%s' "$backup_token" | sha256sum | cut -c1-8)
-    new_hash=$(printf '%s' "$live_token" | sha256sum | cut -c1-8)
-    log_credential_event "synced live credentials to backup for Account-$active_num ($active_email): token ${old_hash}->${new_hash} (caller=sync_active_credentials_to_backup)"
+    log_credential_event "synced live credentials to backup for Account-$active_num ($active_email) (caller=sync_active_credentials_to_backup)"
 }
 
 # Write account credentials to backup
@@ -2672,10 +2864,16 @@ cmd_coord_push() {
     fi
 
     local push_all=false
+    local baseline=false
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --all)
                 push_all=true
+                shift
+                ;;
+            --baseline)
+                push_all=true
+                baseline=true
                 shift
                 ;;
             *)
@@ -2686,6 +2884,7 @@ cmd_coord_push() {
 
     local num email creds
     if [[ "$push_all" == true ]]; then
+        [[ "$baseline" == true ]] && echo "Credential baseline push: usable local credentials only; coordinator healthy sources are protected."
         local nums
         nums=$(jq -r '.accounts | keys[]' "$SEQUENCE_FILE" 2>/dev/null || true)
         while IFS= read -r num; do
@@ -3341,7 +3540,7 @@ cmd_add_account() {
 
     local access_token profile current_email account_uuid
     access_token=$(credential_access_token "$current_creds")
-    profile=$(fetch_oauth_profile "$access_token")
+    profile=$(fetch_oauth_profile "$access_token" || true)
     current_email=$(cut -f1 <<< "$profile")
     account_uuid=$(cut -f2 <<< "$profile")
     if [[ -z "$current_email" ]]; then
@@ -3630,17 +3829,31 @@ cmd_list() {
 
     while IFS='|' read -r num email profile account_type; do
         [[ -z "$num" ]] && continue
-        local prof="" type="" active_tag="" usage_line reset_line status_tag creds
+        local prof="" type="" active_tag="" usage_line reset_line status_tag creds auth_state local_health health_reason health_source health_fingerprint health_observed remote_health_line
         [[ -n "$profile" ]] && prof=" [$profile]"
         [[ -n "$account_type" ]] && type=" {$account_type}"
         [[ "$num" == "$active_account_num" ]] && active_tag="[ACTIVE] "
 
         creds=$(read_account_credentials "$num" "$email")
-        if credential_is_usable "$creds"; then
+        auth_state=$(jq -r --arg num "$num" '.accounts[$num].authState // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
+        if [[ "$auth_state" == "invalid" ]]; then
+            status_tag="[RELOGIN_REQUIRED]"
+            local_health="invalid"
+        elif credential_is_usable "$creds"; then
             status_tag="[OK]     "
+            local_health="healthy"
         else
             status_tag="[EXPIRED]"
+            local_health="unknown"
         fi
+        health_reason=$(jq -r --arg num "$num" '.accounts[$num].credentialHealth.reason // ""' "$SEQUENCE_FILE" 2>/dev/null || true)
+        health_source=$(jq -r --arg num "$num" '.accounts[$num].credentialHealth.sourceServer // ""' "$SEQUENCE_FILE" 2>/dev/null || true)
+        health_fingerprint=$(jq -r --arg num "$num" '.accounts[$num].credentialHealth.fingerprint // ""' "$SEQUENCE_FILE" 2>/dev/null || true)
+        health_observed=$(jq -r --arg num "$num" '.accounts[$num].credentialHealth.observedAt // 0' "$SEQUENCE_FILE" 2>/dev/null || true)
+        remote_health_line=$(jq -r --arg num "$num" '
+            (.accounts[$num].remoteCredentialHealth // {}) | to_entries |
+            map(.key + "=" + (.value.status // "unknown")) | join(",")
+        ' "$SEQUENCE_FILE" 2>/dev/null || true)
 
         echo "  ${active_tag}${status_tag} ${num}: ${email}${prof}${type}"
 
@@ -3648,6 +3861,8 @@ cmd_list() {
         reset_line=$(format_usage_resets_snapshot "$num")
         [[ -n "$usage_line" ]] && echo "      usage: ${usage_line}"
         [[ -n "$reset_line" ]] && echo "      reset: ${reset_line}"
+
+        echo "      health: local=${local_health} remote=${remote_health_line:-unknown} source=${health_source:-unknown} reason=${health_reason:-unknown} observed=${health_observed:-0} fingerprint=${health_fingerprint:-none}"
     done <<< "$accounts"
     return 0
 }
@@ -3749,6 +3964,22 @@ cmd_switch() {
         local probe_rc=0
         probe_account_credential "$next_account" "$next_creds" || probe_rc=$?
         if [[ "$probe_rc" -ne 0 ]]; then
+            if [[ "$SWITCH_PROBE_RESULT" == "invalid" ]] && recovered_creds=$(coord_recover_credential "$next_account" "$next_email" 2>/dev/null); then
+                next_creds="$recovered_creds"
+                write_account_credentials "$next_account" "$next_email" "$next_creds" >/dev/null 2>&1 || true
+                CCS_SWITCH_REASON=manual
+                CCS_SILENT=1
+                CCS_SKIP_ACCOUNT_PROBE=1
+                if ! perform_switch "$next_account"; then
+                    unset CCS_SILENT CCS_SKIP_ACCOUNT_PROBE
+                    record_probe_failure "$next_account" invalid 401 remote_recovery_failed
+                    continue
+                fi
+                unset CCS_SILENT CCS_SKIP_ACCOUNT_PROBE
+                echo "Switched to Account-$next_account ($next_email)"
+                handle_restart_after_switch
+                return 0
+            fi
             record_probe_failure "$next_account" "$SWITCH_PROBE_RESULT" "$SWITCH_PROBE_STATUS" "$SWITCH_PROBE_REASON"
             log_switch_event "candidate Account-$next_account ($next_email) skipped by manual switch probe"
             continue
@@ -4002,6 +4233,7 @@ perform_switch() {
             log_credential_event "recovered Account-$target_account ($target_email) backup from coordinator (caller=perform_switch)"
             target_creds="$coord_creds"
             write_account_credentials "$target_account" "$target_email" "$target_creds" >/dev/null 2>&1 || true
+            clear_account_auth_invalid "$target_account"
             clear_switch_cooldown "$target_account"
         else
             log_credential_event "refused to switch to Account-$target_account ($target_email): backup credentials are empty/expired (caller=perform_switch)"
@@ -4027,6 +4259,13 @@ perform_switch() {
     if [[ "${CCS_SKIP_ACCOUNT_PROBE:-0}" != "1" ]]; then
         local probe_rc=0
         probe_account_credential "$target_account" "$target_creds" || probe_rc=$?
+        if [[ "$probe_rc" -ne 0 ]]; then
+            if [[ "$SWITCH_PROBE_RESULT" == "invalid" ]] && recovered_creds=$(coord_recover_credential "$target_account" "$target_email" 2>/dev/null); then
+                target_creds="$recovered_creds"
+                write_account_credentials "$target_account" "$target_email" "$target_creds" >/dev/null 2>&1 || true
+                probe_rc=0
+            fi
+        fi
         if [[ "$probe_rc" -ne 0 ]]; then
             rollback
             record_probe_failure "$target_account" "$SWITCH_PROBE_RESULT" "$SWITCH_PROBE_STATUS" "$SWITCH_PROBE_REASON"

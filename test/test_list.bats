@@ -60,3 +60,21 @@ teardown() {
     [ "$alpha_line" -lt "$bravo_line" ]
     [ "$bravo_line" -lt "$charlie_line" ]
 }
+
+@test "list renders cached credential health without coordinator requests" {
+    setup_fake_account "user1@example.com" "uuid-1"
+    add_account_to_sequence "1" "user1@example.com" "uuid-1" "true"
+    local updated
+    updated=$(jq '.accounts["1"].authState = "invalid" | .accounts["1"].credentialHealth = {status:"invalid", sourceServer:"server-a", reason:"http_401", fingerprint:"fp", observedAt:123}' "$SEQUENCE_FILE")
+    printf '%s\n' "$updated" > "$SEQUENCE_FILE"
+    cat > "$MOCK_BIN/curl" <<'EOF'
+#!/usr/bin/env bash
+exit 99
+EOF
+    chmod +x "$MOCK_BIN/curl"
+
+    run run_ccswitch ls
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"[RELOGIN_REQUIRED]"* ]]
+    [[ "$output" == *"health: local=invalid remote=unknown"* ]]
+}
