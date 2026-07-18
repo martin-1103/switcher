@@ -13,6 +13,7 @@ const STATE_FILE = process.env.CCS_COORD_STATE_FILE || '/var/lib/ccs-coordinator
 const LEASE_TTL = Number(process.env.CCS_COORD_LEASE_TTL || 180);
 const CRED_KEY_HEX = process.env.CCS_COORD_CRED_KEY || '';
 const EVENT_LIMIT = Number(process.env.CCS_COORD_EVENT_LIMIT || 1000);
+const SNAPSHOT_MAX_AGE_MS = Number(process.env.CCS_COORD_SNAPSHOT_MAX_AGE_MS || 15 * 60 * 1000);
 const sseClients = new Set();
 
 if (!TOKEN) {
@@ -80,6 +81,9 @@ function loadState() {
     if (!state.usageSnapshots || typeof state.usageSnapshots !== 'object') {
       state.usageSnapshots = {};
     }
+    if (!state.credentialSnapshots || typeof state.credentialSnapshots !== 'object') {
+      state.credentialSnapshots = {};
+    }
     if (!state.credentials || typeof state.credentials !== 'object') {
       state.credentials = {};
     }
@@ -95,7 +99,7 @@ function loadState() {
     }
     return state;
   } catch {
-    return { leases: {}, usageSnapshots: {}, credentials: {}, credentialHealth: {}, events: [], eventSeq: 0 };
+    return { leases: {}, usageSnapshots: {}, credentialSnapshots: {}, credentials: {}, credentialHealth: {}, events: [], eventSeq: 0 };
   }
 }
 
@@ -200,9 +204,9 @@ function eventAlreadyEmitted(state, type, email, sourceServer, credentialUpdated
     Number(event.credentialUpdatedAt || 0) === Number(credentialUpdatedAt || 0));
 }
 
-function healthEventAlreadyEmitted(state, email, sourceServer, status, fingerprint, observedAt) {
+function healthEventAlreadyEmitted(state, email, sourceServer, status, fingerprint, observedAt, type = 'credential.health.updated') {
   return (state.events || []).some(event =>
-    event.type === 'credential.health.updated' && event.email === email &&
+    event.type === type && event.email === email &&
     event.sourceServer === sourceServer && event.status === status &&
     event.fingerprint === fingerprint && Number(event.observedAt || 0) === Number(observedAt || 0));
 }
@@ -216,6 +220,18 @@ function credentialSources(state, email) {
 
 function credentialHealth(state, email, sourceServer) {
   return state.credentialHealth[email]?.[sourceServer] || { status: 'unknown' };
+}
+
+function snapshotFor(state, email, sourceServer, fingerprint, now = Date.now()) {
+  const snapshot = state.credentialSnapshots[email]?.[sourceServer]?.[fingerprint];
+  if (!snapshot) return null;
+  const age = now - Number(snapshot.observedAt || 0);
+  if (Number(snapshot.observedAt || 0) <= 0 || age < 0 || age > SNAPSHOT_MAX_AGE_MS) return null;
+  return snapshot;
+}
+
+function snapshotFingerprint(accessToken) {
+  return crypto.createHash('sha256').update(accessToken).digest('hex');
 }
 
 function credentialVersion(record) {
@@ -236,6 +252,7 @@ function credentialHealthView(state, email) {
       fingerprint: health.fingerprint || null,
       observedAt: Number(health.observedAt || 0),
       credentialUpdatedAt: credentialVersion(record),
+      snapshot: snapshotFor(state, email, sourceServer, health.fingerprint || ''),
     };
   });
 }
@@ -456,14 +473,26 @@ const server = http.createServer(async (req, res) => {
       if (!fresh.credentials[email] || isEncryptedCredential(fresh.credentials[email])) {
         fresh.credentials[email] = { sources: sources };
       }
+      const fingerprint = snapshotFingerprint(accessToken);
+      let previousFingerprint = String(fresh.credentialHealth[email]?.[sourceServer]?.fingerprint || '');
+      if (existing) {
+        try {
+          previousFingerprint = snapshotFingerprint(decryptCredential(existing).accessToken);
+        } catch {
+          previousFingerprint = '';
+        }
+      }
       fresh.credentials[email].sources[sourceServer] = encryptCredential({ accessToken, refreshToken, expiresAt, refreshTokenExpiresAt, scopes, credentialUpdatedAt, updatedAt: now });
+      if (existing && previousFingerprint !== fingerprint) {
+        delete fresh.credentialSnapshots[email]?.[sourceServer];
+      }
       fresh.credentialHealth[email] = fresh.credentialHealth[email] || {};
       const healthStatus = body.healthStatus === 'healthy' ? 'healthy' : 'unknown';
       fresh.credentialHealth[email][sourceServer] = {
         ...(fresh.credentialHealth[email][sourceServer] || {}),
         status: healthStatus,
         reason: healthStatus === 'healthy' ? 'publish_health_proof' : null,
-        fingerprint: String(body.fingerprint || '').slice(0, 128) || null,
+        fingerprint,
         observedAt: now,
         updatedAt: now,
       };
@@ -516,6 +545,60 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { ok: true, email, sourceServer, status });
     }
 
+    if (req.method === 'POST' && url.pathname === '/v1/credentials/snapshot') {
+      const body = await readJson(req);
+      const email = String(body.email || '').trim();
+      const sourceServer = String(body.sourceServer || body.serverId || 'legacy').trim() || 'legacy';
+      const fingerprint = String(body.fingerprint || '').trim().slice(0, 128);
+      let status = String(body.status || 'unknown').trim();
+      if (status === 'transient') status = 'unknown';
+      if (!email || !fingerprint || !['healthy', 'invalid', 'throttled', 'unknown'].includes(status)) {
+        return send(res, 400, { error: 'email, fingerprint and valid status required' });
+      }
+      const usage = body.usage && typeof body.usage === 'object' ? {
+        activeLimit: Number(body.usage.activeLimit || 0),
+        fiveHour: Number(body.usage.fiveHour || 0),
+        sevenDay: Number(body.usage.sevenDay || 0),
+        resetAt5h: body.usage.resetAt5h || null,
+        resetAt7d: body.usage.resetAt7d || null,
+      } : null;
+      let observedAt = Number(body.observedAt || Date.now());
+      if (observedAt > 0 && observedAt < 1e12) observedAt *= 1000;
+      const fresh = loadState();
+      const currentHealth = credentialHealth(fresh, email, sourceServer);
+      const currentFingerprint = String(currentHealth.fingerprint || '');
+      if (currentFingerprint && currentFingerprint !== fingerprint) {
+        return send(res, 409, { error: 'credential fingerprint mismatch' });
+      }
+      fresh.credentialSnapshots[email] = fresh.credentialSnapshots[email] || {};
+      fresh.credentialSnapshots[email][sourceServer] = fresh.credentialSnapshots[email][sourceServer] || {};
+      const snapshot = {
+        status,
+        reason: String(body.reason || '').slice(0, 200) || null,
+        fingerprint,
+        observedAt,
+        usage,
+        updatedAt: Date.now(),
+      };
+      fresh.credentialSnapshots[email][sourceServer][fingerprint] = snapshot;
+      fresh.credentialHealth[email] = fresh.credentialHealth[email] || {};
+      fresh.credentialHealth[email][sourceServer] = {
+        ...currentHealth,
+        status,
+        reason: snapshot.reason,
+        fingerprint,
+        observedAt,
+        updatedAt: Date.now(),
+      };
+      if (!healthEventAlreadyEmitted(fresh, email, sourceServer, status, fingerprint, observedAt, 'credential.snapshot.updated')) {
+        emitEvent(fresh, 'credential.snapshot.updated', {
+          email, sourceServer, status, reason: snapshot.reason, fingerprint, observedAt, usage,
+        });
+      }
+      saveState(fresh);
+      return send(res, 200, { ok: true, email, sourceServer, fingerprint, status, observedAt });
+    }
+
     if (req.method === 'GET' && url.pathname === '/v1/credentials/fetch') {
       if (!CRED_KEY) {
         return send(res, 501, { error: 'credential store not configured (CCS_COORD_CRED_KEY unset)' });
@@ -539,7 +622,8 @@ const server = http.createServer(async (req, res) => {
       }
       const [sourceServer, record] = candidates[0];
       const credential = decryptCredential(record);
-      return send(res, 200, { ...credential, sourceServer, health: credentialHealth(state, email, sourceServer), updatedAt: Number(credential.updatedAt || 0) });
+      const health = credentialHealth(state, email, sourceServer);
+      return send(res, 200, { ...credential, sourceServer, health, snapshot: snapshotFor(state, email, sourceServer, health.fingerprint || ''), updatedAt: Number(credential.updatedAt || 0) });
     }
 
     if (req.method === 'POST' && url.pathname === '/v1/leases/release') {

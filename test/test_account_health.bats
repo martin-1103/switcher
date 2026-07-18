@@ -70,6 +70,40 @@ EOF
     [ "$(jq -r '.accounts["1"].quarantineUntil // empty' "$SEQUENCE_FILE")" = "" ]
 }
 
+@test "fresh matching remote snapshot avoids a second usage probe" {
+    source_ccswitch_functions
+    export CCS_SERVER_ID=server-a
+    add_account_to_sequence 1 one@example.com uuid-1 true
+    jq '.coordination = {mode:"http",serverId:"server-a",http:{url:"http://coord.test",token:"test-token"}}' \
+        "$SEQUENCE_FILE" > "$SEQUENCE_FILE.tmp"
+    mv "$SEQUENCE_FILE.tmp" "$SEQUENCE_FILE"
+    creds=$(read_account_credentials 1 one@example.com)
+    fp=$(credential_fingerprint "$creds")
+    observed=$(( $(date +%s) * 1000 ))
+    coord_cache_remote_snapshot one@example.com server-a healthy central_probe "$fp" "$observed" \
+        '{"activeLimit":95,"fiveHour":12,"sevenDay":34,"resetAt5h":null,"resetAt7d":null}'
+    export MOCK_CURL_RESULT=500
+
+    set +e
+    probe_account_credential 1 "$creds"
+    probe_status=$?
+    set -e
+    [ "$probe_status" -eq 0 ]
+    [ "$SWITCH_PROBE_STATUS" = "remote" ]
+    [ "$(jq -r '.accounts["1"].credentialHealth.status' "$SEQUENCE_FILE")" = "healthy" ]
+    [ "$(jq -r '.accounts["1"].lastKnownUsage.fiveHour' "$SEQUENCE_FILE")" = "12" ]
+
+    jq 'del(.accounts["1"].remoteCredentialSnapshot["server-a"])' "$SEQUENCE_FILE" > "$SEQUENCE_FILE.tmp"
+    mv "$SEQUENCE_FILE.tmp" "$SEQUENCE_FILE"
+    coord_cache_remote_snapshot one@example.com server-a healthy stale "$fp-mismatch" "$observed" '{}'
+    set +e
+    probe_account_credential 1 "$creds"
+    probe_status=$?
+    set -e
+    [ "$probe_status" -eq 2 ]
+    [ "$SWITCH_PROBE_REASON" = "stale_or_mismatched_snapshot" ]
+}
+
 @test "automatic candidate selection skips active quarantine" {
     source_ccswitch_functions
     add_account_to_sequence 1 one@example.com uuid-1 true

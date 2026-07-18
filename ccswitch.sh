@@ -29,6 +29,7 @@ readonly LOCK_DIR="$BACKUP_DIR/.switch.lock"
 # Override per-install with .rateLimit.cacheTtl in sequence.json.
 readonly DEFAULT_CACHE_TTL=60
 readonly DEFAULT_COORD_LEASE_TTL=150
+readonly DEFAULT_COORD_SNAPSHOT_MAX_AGE_S=900
 readonly DEFAULT_CURL_CONNECT_TIMEOUT=3
 readonly DEFAULT_CURL_MAX_TIME=10
 # How long an account whose backup credentials were just found empty/expired
@@ -964,6 +965,12 @@ update_account_usage_snapshot() {
     [[ -n "$updated" ]] || return 0
     write_json "$SEQUENCE_FILE" "$updated" >/dev/null 2>&1 || true
     coord_publish_account_state "$account_num" "$email"
+    local snapshot_fingerprint snapshot_status snapshot_reason snapshot_observed
+    snapshot_fingerprint=$(credential_fingerprint "$(read_account_credentials "$account_num" "$email")")
+    snapshot_status=$(jq -r --arg num "$account_num" '.accounts[$num].credentialHealth.status // "unknown"' "$SEQUENCE_FILE" 2>/dev/null || echo unknown)
+    snapshot_reason=$(jq -r --arg num "$account_num" '.accounts[$num].credentialHealth.reason // "usage_refresh"' "$SEQUENCE_FILE" 2>/dev/null || echo usage_refresh)
+    snapshot_observed=$(jq -r --arg num "$account_num" '.accounts[$num].lastKnownUsage.observedAt // 0' "$SEQUENCE_FILE" 2>/dev/null || echo 0)
+    [[ -n "$snapshot_fingerprint" ]] && coord_report_credential_snapshot "$email" "$snapshot_status" "$snapshot_reason" "$snapshot_fingerprint" "$snapshot_observed" "$account_num" || true
 }
 
 iso_to_epoch() {
@@ -1739,11 +1746,26 @@ probe_account_credential() {
     SWITCH_PROBE_STATUS=""
     SWITCH_PROBE_REASON=""
 
+    if [[ -n "$probe_email" ]] && coord_remote_snapshot_present "$account_num" "$source_server"; then
+        if coord_apply_remote_snapshot "$account_num" "$probe_email" "$source_server"; then
+            return 0
+        fi
+        if [[ "${SWITCH_PROBE_RESULT:-}" == "invalid" ]]; then
+            return 1
+        fi
+        SWITCH_PROBE_RESULT=transient
+        SWITCH_PROBE_STATUS=remote
+        SWITCH_PROBE_REASON=stale_or_mismatched_snapshot
+        record_local_credential_health "$account_num" unknown "$SWITCH_PROBE_REASON" "$source_server" "$(credential_fingerprint "$credentials")" "$(( $(date +%s) * 1000 ))"
+        return 2
+    fi
+
     report_probe_health() {
         local health_status="$1" health_reason="$2" probe_at="$3" probe_fp
         probe_fp=$(credential_fingerprint "$credentials")
         record_local_credential_health "$account_num" "$health_status" "$health_reason" "$source_server" "$probe_fp" "$probe_at"
         [[ -n "$probe_email" ]] && coord_report_credential_health "$probe_email" "$health_status" "$health_reason" "$source_server" "$probe_fp" "$probe_at" || true
+        [[ -n "$probe_email" && -n "$probe_fp" ]] && coord_report_credential_snapshot "$probe_email" "$health_status" "$health_reason" "$probe_fp" "$probe_at" "$account_num" "$body" || true
     }
 
     access_token=$(credential_access_token "$credentials")
@@ -2263,6 +2285,79 @@ coord_cache_remote_health() {
     write_json "$SEQUENCE_FILE" "$updated" >/dev/null 2>&1 || true
 }
 
+coord_snapshot_max_age_s() {
+    local ttl
+    ttl=$(coord_config_value '.coordination.snapshotMaxAgeSeconds' 2>/dev/null || true)
+    [[ "$ttl" =~ ^[0-9]+$ ]] && [[ "$ttl" -gt 0 ]] && printf '%s\n' "$ttl" || printf '%s\n' "$DEFAULT_COORD_SNAPSHOT_MAX_AGE_S"
+}
+
+coord_cache_remote_snapshot() {
+    local email="$1" source_server="$2" status="$3" reason="$4" fingerprint="$5" observed_at="$6" usage_json="${7:-}"
+    [[ -n "$usage_json" ]] || usage_json='{}'
+    local account_num updated
+    account_num=$(resolve_account_identifier "$email" 2>/dev/null || true)
+    [[ -n "$account_num" && -f "$SEQUENCE_FILE" && -n "$fingerprint" ]] || return 0
+    updated=$(jq --arg num "$account_num" --arg source "$source_server" --arg status "$status" --arg reason "$reason" \
+        --arg fingerprint "$fingerprint" --argjson observedAt "${observed_at:-0}" --argjson usage "$usage_json" '
+        .accounts[$num].remoteCredentialSnapshot = (.accounts[$num].remoteCredentialSnapshot // {}) |
+        .accounts[$num].remoteCredentialSnapshot[$source] = (.accounts[$num].remoteCredentialSnapshot[$source] // {}) |
+        .accounts[$num].remoteCredentialSnapshot[$source][$fingerprint] = {
+            status: $status, reason: $reason, fingerprint: $fingerprint, observedAt: $observedAt,
+            usage: $usage
+        }
+    ' "$SEQUENCE_FILE" 2>/dev/null) || return 0
+    write_json "$SEQUENCE_FILE" "$updated" >/dev/null 2>&1 || true
+}
+
+coord_apply_remote_snapshot() {
+    local account_num="$1" email="$2" source_server="${3:-}" creds fingerprint snapshot observed now age
+    creds=$(read_account_credentials "$account_num" "$email")
+    fingerprint=$(credential_fingerprint "$creds")
+    [[ -n "$fingerprint" ]] || return 1
+    snapshot=$(jq -c --arg num "$account_num" --arg source "$source_server" --arg fingerprint "$fingerprint" '
+        (.accounts[$num].remoteCredentialSnapshot // {}) as $all |
+        if $source == "" then
+            [$all | to_entries[] | .key as $source | (.value // {}) | to_entries[] | .value + {sourceServer: $source} | select(.fingerprint == $fingerprint)] | sort_by(.observedAt) | last
+        else
+            [$all[$source] // {} | to_entries[] | .value | select(.fingerprint == $fingerprint)] | sort_by(.observedAt) | last
+        end // empty
+    ' "$SEQUENCE_FILE" 2>/dev/null || true)
+    [[ -n "$snapshot" ]] || return 1
+    observed=$(jq -r '.observedAt // 0' <<< "$snapshot" 2>/dev/null || echo 0)
+    [[ "$observed" =~ ^[0-9]+$ && "$observed" -gt 0 ]] || return 1
+    now=$(( $(date +%s) * 1000 ))
+    age=$(( now - observed ))
+    (( age >= 0 && age <= $(coord_snapshot_max_age_s) * 1000 )) || return 1
+    [[ "$(jq -r '.fingerprint // empty' <<< "$snapshot")" == "$fingerprint" ]] || return 1
+    local status reason source usage updated
+    status=$(jq -r '.status // "unknown"' <<< "$snapshot")
+    reason=$(jq -r '.reason // ""' <<< "$snapshot")
+    source=$(jq -r '.sourceServer // "remote"' <<< "$snapshot")
+    usage=$(jq -c '.usage // null' <<< "$snapshot")
+    updated=$(jq --arg num "$account_num" --arg status "$status" --arg reason "$reason" --arg source "$source" --arg fingerprint "$fingerprint" --argjson observedAt "$observed" --argjson usage "$usage" '
+        .accounts[$num].credentialHealth = {
+            status: $status, reason: $reason, sourceServer: $source,
+            fingerprint: $fingerprint, observedAt: $observedAt
+        } |
+        if $usage == null then . else .accounts[$num].lastKnownUsage = $usage + {observedAt: $observedAt} end
+    ' "$SEQUENCE_FILE" 2>/dev/null) || return 1
+    write_json "$SEQUENCE_FILE" "$updated" >/dev/null 2>&1 || return 1
+    case "$status" in
+        healthy) SWITCH_PROBE_RESULT=healthy; SWITCH_PROBE_STATUS=remote; SWITCH_PROBE_REASON="$reason"; return 0 ;;
+        invalid) SWITCH_PROBE_RESULT=invalid; SWITCH_PROBE_STATUS=remote; SWITCH_PROBE_REASON="$reason"; return 1 ;;
+        throttled) SWITCH_PROBE_RESULT=transient; SWITCH_PROBE_STATUS=429; SWITCH_PROBE_REASON="$reason"; return 2 ;;
+        *) SWITCH_PROBE_RESULT=transient; SWITCH_PROBE_STATUS=remote; SWITCH_PROBE_REASON="${reason:-remote_unknown}"; return 2 ;;
+    esac
+}
+
+coord_remote_snapshot_present() {
+    local account_num="$1" source_server="${2:-}"
+    jq -e --arg num "$account_num" --arg source "$source_server" '
+        (.accounts[$num].remoteCredentialSnapshot // {}) as $all |
+        if $source == "" then ($all | length > 0) else ($all[$source] != null) end
+    ' "$SEQUENCE_FILE" >/dev/null 2>&1
+}
+
 # Pull a credential from the coordinator's encrypted store. Returns the same
 # shape as read_account_credentials (a claudeAiOauth-wrapped JSON blob) so
 # callers can feed it straight into credential_is_usable/write_credentials.
@@ -2299,8 +2394,18 @@ coord_fetch_credential() {
     health_fingerprint=$(jq -r '.health.fingerprint // ""' <<< "$payload" 2>/dev/null || true)
     health_observed=$(jq -r '.health.observedAt // 0' <<< "$payload" 2>/dev/null || echo 0)
     coord_cache_remote_health "$email" "$source_server" "$health_status" "$health_reason" "$health_fingerprint" "$health_observed"
+    local snapshot_json
+    snapshot_json=$(jq -c '.snapshot // empty' <<< "$payload" 2>/dev/null || true)
+    if [[ -n "$snapshot_json" ]]; then
+        coord_cache_remote_snapshot "$email" "$source_server" \
+            "$(jq -r '.status // "unknown"' <<< "$snapshot_json")" \
+            "$(jq -r '.reason // ""' <<< "$snapshot_json")" \
+            "$(jq -r '.fingerprint // ""' <<< "$snapshot_json")" \
+            "$(jq -r '.observedAt // 0' <<< "$snapshot_json")" \
+            "$(jq -c '.usage // {}' <<< "$snapshot_json")"
+    fi
     jq -n --argjson r "$payload" \
-        '{sourceServer: ($r.sourceServer // "legacy"), credentialHealth: ($r.health // {status: "unknown"}), claudeAiOauth: {accessToken: $r.accessToken, refreshToken: $r.refreshToken, expiresAt: $r.expiresAt, refreshTokenExpiresAt: ($r.refreshTokenExpiresAt // 0), scopes: ($r.scopes // []), credentialUpdatedAt: ($r.credentialUpdatedAt // $r.updatedAt // 0)}}' 2>/dev/null || return 3
+        '{sourceServer: ($r.sourceServer // "legacy"), credentialHealth: ($r.health // {status: "unknown"}), remoteSnapshot: ($r.snapshot // null), claudeAiOauth: {accessToken: $r.accessToken, refreshToken: $r.refreshToken, expiresAt: $r.expiresAt, refreshTokenExpiresAt: ($r.refreshTokenExpiresAt // 0), scopes: ($r.scopes // []), credentialUpdatedAt: ($r.credentialUpdatedAt // $r.updatedAt // 0)}}' 2>/dev/null || return 3
 }
 
 coord_report_credential_health() {
@@ -2311,6 +2416,25 @@ coord_report_credential_health() {
     payload=$(jq -n --arg email "$email" --arg source "$source_server" --arg status "$status" --arg reason "$reason" --arg fingerprint "$fingerprint" --argjson observedAt "$observed_at" \
         '{email: $email, sourceServer: $source, status: $status, reason: $reason, fingerprint: $fingerprint, observedAt: $observedAt}')
     coord_http_request POST "/v1/credentials/health" "$payload" >/dev/null 2>&1 || true
+}
+
+coord_report_credential_snapshot() {
+    local email="$1" status="$2" reason="${3:-}" fingerprint="$4" observed_at="${5:-$(( $(date +%s) * 1000 ))}" account_num="${6:-}" usage_body="${7:-}"
+    coord_http_ready || return 1
+    local source_server payload usage
+    source_server=$(coord_server_id)
+    if [[ "$observed_at" =~ ^[0-9]+$ ]] && [[ "$observed_at" -lt 1000000000000 ]]; then
+        observed_at=$((observed_at * 1000))
+    fi
+    usage='null'
+    if [[ -n "$usage_body" ]] && echo "$usage_body" | jq -e . >/dev/null 2>&1; then
+        usage=$(echo "$usage_body" | jq -c '{activeLimit: ([.limits // [] | .[] | select((.is_active // false) == true) | .percent? | select(type == "number")] | max // 0), fiveHour: (.five_hour.utilization // 0), sevenDay: (.seven_day.utilization // 0), resetAt5h: (.five_hour.resets_at // null), resetAt7d: (.seven_day.resets_at // null)}')
+    elif [[ -n "$account_num" && -f "$SEQUENCE_FILE" ]]; then
+        usage=$(jq -c --arg num "$account_num" '.accounts[$num].lastKnownUsage // null' "$SEQUENCE_FILE" 2>/dev/null || echo null)
+    fi
+    payload=$(jq -n --arg email "$email" --arg source "$source_server" --arg status "$status" --arg reason "$reason" --arg fingerprint "$fingerprint" --argjson observedAt "$observed_at" --argjson usage "$usage" \
+        '{email: $email, sourceServer: $source, status: $status, reason: $reason, fingerprint: $fingerprint, observedAt: $observedAt, usage: $usage}')
+    coord_http_request POST "/v1/credentials/snapshot" "$payload" >/dev/null 2>&1 || true
 }
 
 coord_credential_health() {
@@ -2425,6 +2549,20 @@ coord_reconcile_health_event() {
     coord_cache_remote_health "$email" "$source" "$status" "$reason" "$fingerprint" "$observed"
 }
 
+coord_reconcile_snapshot_event() {
+    local email="$1" data="$2" source status reason fingerprint observed usage local_num
+    source=$(jq -r '.sourceServer // "legacy"' <<< "$data" 2>/dev/null || echo legacy)
+    status=$(jq -r '.status // "unknown"' <<< "$data" 2>/dev/null || echo unknown)
+    reason=$(jq -r '.reason // ""' <<< "$data" 2>/dev/null || true)
+    fingerprint=$(jq -r '.fingerprint // ""' <<< "$data" 2>/dev/null || true)
+    observed=$(jq -r '.observedAt // 0' <<< "$data" 2>/dev/null || echo 0)
+    usage=$(jq -c '.usage // {}' <<< "$data" 2>/dev/null || echo '{}')
+    [[ -n "$fingerprint" ]] || return 0
+    coord_cache_remote_snapshot "$email" "$source" "$status" "$reason" "$fingerprint" "$observed" "$usage"
+    local_num=$(resolve_account_identifier "$email" 2>/dev/null || true)
+    [[ -n "${local_num:-}" ]] && coord_apply_remote_snapshot "$local_num" "$email" "$source" >/dev/null 2>&1 || true
+}
+
 # Reconcile one account after a coordinator credential.updated event. Events
 # carry metadata only; tokens are fetched through the authenticated API.
 coord_reconcile_credential_email() {
@@ -2473,6 +2611,7 @@ coord_reconcile_credential_email() {
                 write_account_config "$local_num" "$email" "$target_config"
                 clear_account_credential_health "$local_num"
                 [[ "$coord_health_status" == "healthy" ]] && clear_account_auth_invalid "$local_num"
+                coord_apply_remote_snapshot "$local_num" "$email" "$source_server" >/dev/null 2>&1 || true
             fi
         fi
         release_switch_lock
@@ -2493,6 +2632,7 @@ coord_reconcile_credential_email() {
     [[ "$local_updated" =~ ^[0-9]+$ ]] || local_updated=0
     [[ "$coord_updated" =~ ^[0-9]+$ ]] || coord_updated=0
     if (( local_usable == 1 && coord_updated <= local_updated )); then
+        coord_apply_remote_snapshot "$local_num" "$email" "$source_server" >/dev/null 2>&1 || true
         return 0
     fi
 
@@ -2508,6 +2648,7 @@ coord_reconcile_credential_email() {
         write_credentials "$coord_creds" >/dev/null 2>&1 || true
     fi
     release_switch_lock
+    coord_apply_remote_snapshot "$local_num" "$email" "$source_server" >/dev/null 2>&1 || true
     log_credential_event "reconciled coordinator credential for Account-$local_num ($email): version=$coord_updated (caller=coord_listen)"
 }
 
@@ -2532,7 +2673,13 @@ cmd_coord_listen() {
                     source_server=$(echo "$data" | jq -r '.sourceServer // empty' 2>/dev/null || true)
                     event_type=$(echo "$data" | jq -r '.type // "unknown"' 2>/dev/null || echo unknown)
                     log_credential_event "coord_listen event id=${pending_id:-unknown} type=$event_type email=${email:-unknown}"
-                    if [[ -n "$email" ]] && [[ "$event_type" == "credential.health.updated" ]] && coord_reconcile_health_event "$email" "$data"; then
+                    if [[ -n "$email" ]] && [[ "$event_type" == "credential.snapshot.updated" ]] && coord_reconcile_snapshot_event "$email" "$data"; then
+                        if [[ "$pending_id" =~ ^[0-9]+$ ]]; then
+                            cursor="$pending_id"
+                            printf '%s\n' "$cursor" > "$COORD_EVENT_CURSOR_FILE"
+                        fi
+                        log_credential_event "coord_listen cached_snapshot id=${pending_id:-unknown} email=${email:-unknown} cursor=$cursor"
+                    elif [[ -n "$email" ]] && [[ "$event_type" == "credential.health.updated" ]] && coord_reconcile_health_event "$email" "$data"; then
                         if [[ "$pending_id" =~ ^[0-9]+$ ]]; then
                             cursor="$pending_id"
                             printf '%s\n' "$cursor" > "$COORD_EVENT_CURSOR_FILE"
@@ -3987,6 +4134,7 @@ cmd_list() {
         [[ "$num" == "$active_account_num" ]] && active_tag="[ACTIVE] "
 
         creds=$(read_account_credentials "$num" "$email")
+        coord_apply_remote_snapshot "$num" "$email" "" >/dev/null 2>&1 || true
         cached_health=$(jq -r --arg num "$num" '.accounts[$num].credentialHealth.status // "unknown"' "$SEQUENCE_FILE" 2>/dev/null || echo unknown)
         auth_state=$(jq -r --arg num "$num" '.accounts[$num].authState // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
         if ! credential_is_usable "$creds"; then

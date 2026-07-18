@@ -107,3 +107,22 @@ publish_manual() {
     [ "$(jq -r '.reason' <<<"$response")" = "existing credential is fresher or equal" ]
     [ "$(coord "http://127.0.0.1:$PORT/v1/credentials/fetch?email=user%40example.com&sourceServer=server-a" | jq -r '.accessToken')" = "at-server-a-10" ]
 }
+
+@test "credential snapshots are token-free, fingerprint-bound, and invalidated on replacement" {
+    publish server-a 1 >/dev/null
+    fp=$(printf '%s' 'at-server-a-1' | sha256sum | cut -d' ' -f1)
+    now=$(date +%s000)
+    curl -sf -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+        -d "{\"email\":\"user@example.com\",\"sourceServer\":\"server-a\",\"status\":\"healthy\",\"reason\":\"ok\",\"fingerprint\":\"$fp\",\"observedAt\":$now,\"usage\":{\"fiveHour\":12,\"sevenDay\":34,\"activeLimit\":95,\"resetAt5h\":\"2026-07-18T12:00:00Z\"}}" \
+        "http://127.0.0.1:$PORT/v1/credentials/snapshot" >/dev/null
+
+    snapshot=$(coord "http://127.0.0.1:$PORT/v1/credentials/fetch?email=user%40example.com&sourceServer=server-a")
+    [ "$(jq -r '.snapshot.status' <<<"$snapshot")" = "healthy" ]
+    [ "$(jq -r '.snapshot.usage.fiveHour' <<<"$snapshot")" = "12" ]
+    [ "$(jq -r '.snapshot.accessToken // empty, .snapshot.refreshToken // empty' <<<"$snapshot")" = "" ]
+    [ "$(jq '[.events[] | select(.type == "credential.snapshot.updated")] | length' "$STATE_FILE")" = "1" ]
+
+    publish server-a 2 >/dev/null
+    [ "$(coord "http://127.0.0.1:$PORT/v1/credentials/fetch?email=user%40example.com&sourceServer=server-a" | jq -r '.snapshot // empty')" = "" ]
+    [ "$(jq -r '.credentialSnapshots["user@example.com"]["server-a"] // empty' "$STATE_FILE")" = "" ]
+}
