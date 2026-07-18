@@ -118,6 +118,32 @@ EOF
     [ "$(cat "$source_capture")" = "server-a" ]
 }
 
+@test "credential event replaces expired local credential with older coordinator version" {
+    source_ccswitch_functions
+    add_account_to_sequence "1" "known@example.com" "uuid-known" "false"
+    security add-generic-password -U -s "Claude Code-Account-1-known@example.com" -a "$USER" \
+        -w '{"claudeAiOauth":{"accessToken":"expired-local","refreshToken":"expired-local-rt","expiresAt":1,"credentialUpdatedAt":20}}'
+    coord_fetch_credential() {
+        printf '%s\n' '{"sourceServer":"server-a","credentialHealth":{"status":"healthy"},"claudeAiOauth":{"accessToken":"remote-good","refreshToken":"remote-good-rt","expiresAt":4102444800,"credentialUpdatedAt":10}}'
+    }
+
+    coord_reconcile_credential_email "known@example.com" "server-a"
+    [ "$(read_account_credentials 1 known@example.com | jq -r '.claudeAiOauth.accessToken')" = "remote-good" ]
+}
+
+@test "credential event does not overwrite fresher usable local credential" {
+    source_ccswitch_functions
+    add_account_to_sequence "1" "known@example.com" "uuid-known" "false"
+    security add-generic-password -U -s "Claude Code-Account-1-known@example.com" -a "$USER" \
+        -w '{"claudeAiOauth":{"accessToken":"local-good","refreshToken":"local-good-rt","expiresAt":4102444800,"credentialUpdatedAt":20}}'
+    coord_fetch_credential() {
+        printf '%s\n' '{"sourceServer":"server-a","credentialHealth":{"status":"healthy"},"claudeAiOauth":{"accessToken":"remote-old","refreshToken":"remote-old-rt","expiresAt":4102444800,"credentialUpdatedAt":10}}'
+    }
+
+    coord_reconcile_credential_email "known@example.com" "server-a"
+    [ "$(read_account_credentials 1 known@example.com | jq -r '.claudeAiOauth.accessToken')" = "local-good" ]
+}
+
 @test "unknown coordinator baseline does not clear invalid auth state" {
     source_ccswitch_functions
     add_account_to_sequence "1" "known@example.com" "uuid-known" "false"

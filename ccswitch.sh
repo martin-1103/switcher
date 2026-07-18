@@ -2416,11 +2416,21 @@ coord_reconcile_credential_email() {
         return 0
     fi
     local_creds=$(read_account_credentials "$local_num" "$email")
+    local local_usable=0 local_auth_state local_health_status
+    if credential_is_usable "$local_creds"; then
+        local_auth_state=$(jq -r --arg num "$local_num" '.accounts[$num].authState // ""' "$SEQUENCE_FILE" 2>/dev/null || true)
+        local_health_status=$(jq -r --arg num "$local_num" '.accounts[$num].credentialHealth.status // ""' "$SEQUENCE_FILE" 2>/dev/null || true)
+        if [[ "$local_auth_state" != "invalid" && "$local_health_status" != "invalid" ]]; then
+            local_usable=1
+        fi
+    fi
     local_updated=$(echo "$local_creds" | jq -r '.credentialUpdatedAt // .claudeAiOauth.credentialUpdatedAt // 0' 2>/dev/null || echo 0)
     coord_updated=$(echo "$coord_creds" | jq -r '.credentialUpdatedAt // .claudeAiOauth.credentialUpdatedAt // 0' 2>/dev/null || echo 0)
     [[ "$local_updated" =~ ^[0-9]+$ ]] || local_updated=0
     [[ "$coord_updated" =~ ^[0-9]+$ ]] || coord_updated=0
-    (( coord_updated > local_updated )) || return 0
+    if (( local_usable == 1 && coord_updated <= local_updated )); then
+        return 0
+    fi
 
     if ! acquire_switch_lock 2; then
         return 1
@@ -3587,6 +3597,11 @@ cmd_add_account() {
             added: (.accounts[$num].added // $now)
         } |
         (if ($type | length) > 0 then .accounts[$num].accountType = $type else . end) |
+        # Fresh login: stale invalid markers from the old credential no longer apply.
+        del(.accounts[$num].authState) |
+        del(.accounts[$num].lastAuthError) |
+        del(.accounts[$num].lastAuthErrorAt) |
+        del(.accounts[$num].credentialHealth) |
         .sequence = ((.sequence // []) + [$num | tonumber] | unique) |
         .activeAccountNumber = ($num | tonumber) |
         .lastUpdated = $now
