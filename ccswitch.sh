@@ -3809,14 +3809,24 @@ first_run_setup() {
 # List accounts
 cmd_list() {
     local show_health=false
-    if [[ "${1:-}" == "--health" ]]; then
-        show_health=true
-    fi
+    local repair=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --health) show_health=true ;;
+            --repair) repair=true ;;
+            *) echo "Error: Unknown ls option '$1'" >&2; return 1 ;;
+        esac
+        shift
+    done
 
     if [[ ! -f "$SEQUENCE_FILE" ]]; then
         echo "No accounts are managed yet."
         first_run_setup
         exit 0
+    fi
+
+    if [[ "$repair" == true ]]; then
+        cmd_repair_invalid_accounts
     fi
 
     # Get current active account from .claude.json
@@ -3880,6 +3890,73 @@ cmd_list() {
             echo "      health: local=${local_health} remote=${remote_health_line:-unknown} source=${health_source:-unknown} reason=${health_reason:-unknown} observed=${health_observed:-0} fingerprint=${health_fingerprint:-none}"
         fi
     done <<< "$accounts"
+    return 0
+}
+
+# Repair only locally invalid, non-expired accounts from one explicitly healthy
+# remote coordinator source. One health lookup, one source fetch, and one API
+# probe per account; no switching and no retry loop.
+cmd_repair_invalid_accounts() {
+    if ! acquire_switch_lock 10; then
+        echo "Error: another account switch is in progress (could not acquire lock)." >&2
+        return 1
+    fi
+    local lock_owned=true
+    trap 'if [[ "${lock_owned:-false}" == true ]]; then release_switch_lock; fi' RETURN
+
+    local local_source num email creds auth_state cached_health health source candidate probe_rc
+    local_source=$(coord_server_id 2>/dev/null || echo "local")
+    while IFS= read -r num; do
+        [[ -n "$num" ]] || continue
+        email=$(jq -r --arg num "$num" '.accounts[$num].email // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
+        [[ -n "$email" ]] || { echo "SKIP account=$num reason=missing"; continue; }
+        creds=$(read_account_credentials "$num" "$email")
+        if ! credential_is_usable "$creds"; then
+            echo "SKIP account=$num email=$email reason=expired_or_missing"
+            continue
+        fi
+
+        auth_state=$(jq -r --arg num "$num" '.accounts[$num].authState // empty' "$SEQUENCE_FILE" 2>/dev/null || true)
+        cached_health=$(jq -r --arg num "$num" '.accounts[$num].credentialHealth.status // "unknown"' "$SEQUENCE_FILE" 2>/dev/null || echo unknown)
+        if [[ "$auth_state" != invalid && "$cached_health" != invalid ]]; then
+            echo "SKIP account=$num email=$email reason=not_invalid"
+            continue
+        fi
+
+        health=$(coord_credential_health "$email" 2>/dev/null || true)
+        source=$(printf '%s' "$health" | jq -r --arg local "$local_source" '
+            [.sources[]? | select(.status == "healthy" and .sourceServer != $local)] |
+            sort_by(.observedAt // 0) | reverse | .[0].sourceServer // empty
+        ' 2>/dev/null || true)
+        if [[ -z "$source" ]]; then
+            echo "NO_SOURCE account=$num email=$email"
+            continue
+        fi
+
+        candidate=$(coord_fetch_credential "$email" "$source" 2>/dev/null || true)
+        if [[ -z "$candidate" ]] || ! credential_is_usable "$candidate"; then
+            echo "NO_SOURCE account=$num email=$email source=$source"
+            continue
+        fi
+
+        probe_rc=0
+        probe_account_credential "$num" "$candidate" "$source" || probe_rc=$?
+        if [[ "$probe_rc" -ne 0 || "${SWITCH_PROBE_RESULT:-}" != healthy ]]; then
+            echo "NO_SOURCE account=$num email=$email source=$source reason=${SWITCH_PROBE_REASON:-probe_failed}"
+            continue
+        fi
+
+        write_account_credentials "$num" "$email" "$candidate"
+        local config
+        config=$(read_account_config "$num" "$email")
+        [[ -n "$config" ]] && write_account_config "$num" "$email" "$config"
+        clear_account_auth_invalid "$num"
+        echo "REPAIRED account=$num email=$email source=$source"
+    done < <(jq -r '.sequence[]' "$SEQUENCE_FILE" 2>/dev/null)
+
+    lock_owned=false
+    release_switch_lock
+    trap - RETURN
     return 0
 }
 
@@ -5214,7 +5291,7 @@ show_usage() {
     echo "  add [--type team|max20]          Add current account to managed accounts"
     echo "  login [--email X] [--console]    Log in (lock-held) then add, atomically"
     echo "  rm <num|email>                   Remove account by number or email"
-    echo "  ls [--health]                    List all managed accounts"
+    echo "  ls [--health] [--repair]         List accounts; repair local invalid from coordinator"
     echo "  health-check [--all]             Probe local credentials once; never switch"
     echo ""
     echo "Switching:"
