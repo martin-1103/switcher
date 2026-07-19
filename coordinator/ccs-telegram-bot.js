@@ -184,11 +184,19 @@ function formatTelegramAccountList(stdout) {
     THROTTLED: '🟡',
   };
   const lines = [];
-  for (const line of String(stdout).split('\n')) {
+  const rawLines = String(stdout).split('\n');
+  for (let i = 0; i < rawLines.length; i++) {
+    const line = rawLines[i];
     const match = line.match(/^\s*(?:\[[A-Z_]+\]\s+)?\[([A-Z_]+)\]\s+(\d+):\s+(\S+@\S+?)(?:\s|$)/);
     if (!match) continue;
     const [, status, num, email] = match;
     lines.push(`${icons[status] || '⚠️'} ${num}: ${email}`);
+    // `ccs ls` puts a "usage: 5h X% | 7d Y% | ..." line directly after the
+    // account line — pull just the 5h/7d percents, drop the rest (reset
+    // timers, "limit" duplicate) to keep each account to two short lines.
+    const usageLine = rawLines[i + 1];
+    const usageMatch = usageLine && usageLine.match(/usage:\s*5h\s+(\d+%)\s*\|\s*7d\s+(\d+%)/);
+    if (usageMatch) lines.push(`    5h ${usageMatch[1]} · 7d ${usageMatch[2]}`);
   }
   return lines.join('\n') || '(no accounts)';
 }
