@@ -88,9 +88,43 @@ if [[ "$AUTO_CLICK" == true ]]; then
     # with Python triple quotes. Variables expand here.
     tmpfile=$(mktemp /tmp/ccs-autoclick-XXXXXX.py)
     cat > "$tmpfile" <<PYEOF
-import asyncio, websockets, json, sys, time, urllib.parse
+import asyncio, websockets, json, sys, time, urllib.parse, urllib.request
 
 URI = 'ws://localhost:${CDP_PORT}/devtools/page/${tab_id}'
+CDP_HTTP = 'http://localhost:${CDP_PORT}'
+
+
+def extract_code_from_url(url):
+    if '?' not in url or '/oauth/code/callback' not in url:
+        return None
+    qs = url.split('?', 1)[1]
+    params = urllib.parse.parse_qs(qs)
+    code = params.get('code', [None])[0]
+    state = params.get('state', [None])[0]
+    if code and code != 'true':
+        return code + ('#' + state if state else '')
+    return None
+
+
+def poll_targets_for_code(deadline):
+    # Authorizing can navigate cross-origin (claude.ai -> platform.claude.com),
+    # which makes Chrome open a NEW CDP target and tear down the old one — any
+    # websocket still attached to the old page id dies with
+    # ConnectionClosedError before the code is ever read. /json/list is a
+    # fresh HTTP call each time, so it sees whatever target currently holds
+    # the callback URL regardless of what happened to the original page.
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(CDP_HTTP + '/json/list', timeout=5) as resp:
+                targets = json.load(resp)
+            for t in targets:
+                code = extract_code_from_url(t.get('url', ''))
+                if code:
+                    return code
+        except Exception:
+            pass
+        time.sleep(0.5)
+    return None
 
 async def autoclick(uri, timeout=90):
     async with websockets.connect(uri, max_size=10_000_000) as ws:
@@ -102,6 +136,39 @@ async def autoclick(uri, timeout=90):
         await asyncio.sleep(0.5)
 
         deadline = time.time() + timeout
+
+        # --- Step A0: some flows show a Login/Sign in gate before the
+        # Authorize page (e.g. account picker). Click it once if present so
+        # the loop below doesn't spin waiting on a page that never shows
+        # Authorize because Login was never clicked.
+        login_clicked = False
+        login_deadline = time.time() + 15
+        while time.time() < login_deadline and not login_clicked:
+            await send_msg(ws, 10, 'Runtime.evaluate', {
+                'expression': """
+                    (() => {
+                        const btns = document.querySelectorAll('button, input[type="submit"], a[role="button"], a');
+                        for (const b of btns) {
+                            const t = (b.textContent || b.value || '').trim().toLowerCase();
+                            if (t === 'log in' || t === 'login' || t === 'sign in') { b.click(); return 'clicked'; }
+                        }
+                        return null;
+                    })()
+                """,
+                'returnByValue': True,
+                'userGesture': True,
+            })
+            while time.time() < login_deadline:
+                m = json.loads(await ws.recv())
+                if m.get('id') == 10:
+                    val = m.get('result', {}).get('result', {}).get('value')
+                    if val == 'clicked':
+                        login_clicked = True
+                        print('LOGIN_CLICKED', flush=True)
+                        await asyncio.sleep(1.5)  # let the page navigate/render
+                    break
+            if not login_clicked:
+                await asyncio.sleep(0.5)
 
         # --- Step A: find and click Authorize button ---
         found = False
@@ -133,73 +200,40 @@ async def autoclick(uri, timeout=90):
             print('ERROR: Authorize button not found within timeout.', flush=True)
             sys.exit(1)
 
-        # Click
-        await send_msg(ws, 3, 'Runtime.evaluate', {
-            'expression': """
-                (() => {
-                    const btns = document.querySelectorAll('button, input[type="submit"], a[role="button"]');
-                    for (const b of btns) {
-                        const t = (b.textContent || b.value || '').trim().toLowerCase();
-                        if (t.includes('authorize')) { b.click(); return 'clicked'; }
-                    }
-                    return 'not_found';
-                })()
-            """,
-            'returnByValue': True,
-            'userGesture': True,
-        })
-        while time.time() < deadline:
-            m = json.loads(await ws.recv())
-            if m.get('id') == 3:
-                break
+        # Click. The click itself can trigger the cross-origin navigation
+        # that kills this websocket mid-flight, so a ConnectionClosed here
+        # just means the click landed and we move straight to HTTP polling.
+        try:
+            await send_msg(ws, 3, 'Runtime.evaluate', {
+                'expression': """
+                    (() => {
+                        const btns = document.querySelectorAll('button, input[type="submit"], a[role="button"]');
+                        for (const b of btns) {
+                            const t = (b.textContent || b.value || '').trim().toLowerCase();
+                            if (t.includes('authorize')) { b.click(); return 'clicked'; }
+                        }
+                        return 'not_found';
+                    })()
+                """,
+                'returnByValue': True,
+                'userGesture': True,
+            })
+            while time.time() < deadline:
+                m = json.loads(await ws.recv())
+                if m.get('id') == 3:
+                    break
+        except websockets.exceptions.ConnectionClosed:
+            pass
 
         print('CLICKED', flush=True)
 
-        # --- Step B: wait for redirect to callback page and extract code ---
-        while time.time() < deadline:
-            await send_msg(ws, 4, 'Runtime.evaluate', {
-                'expression': 'window.location.href',
-                'returnByValue': True,
-            })
-            m = json.loads(await ws.recv())
-            if m.get('id') == 4:
-                url = m.get('result', {}).get('result', {}).get('value', '')
-                # Only parse the code from the callback URL — the authorize URL
-                # itself carries a bogus 'code=true' query param.
-                if '?' in url and '/oauth/code/callback' in url:
-                    qs = url.split('?', 1)[1]
-                    params = urllib.parse.parse_qs(qs)
-                    code = params.get('code', [None])[0]
-                    state = params.get('state', [None])[0]
-                    if code and code != 'true':
-                        # CLI paste prompt expects code#state, same as the
-                        # string the callback page shows for manual copy.
-                        print('CODE:' + code + ('#' + state if state else ''), flush=True)
-                        return
-                # Also check page body for code element
-                await send_msg(ws, 5, 'Runtime.evaluate', {
-                    'expression': """
-                        (() => {
-                            const el = document.querySelector('[data-testid="oauth-code"], .oauth-code, code, pre');
-                            if (el) return el.textContent.trim();
-                            // Look for any element whose text matches a code pattern
-                            const all = document.querySelectorAll('p, span, div, h1, h2, h3');
-                            for (const e of all) {
-                                const t = (e.textContent || '').trim();
-                                if (/^[A-Za-z0-9_-]{20,}$/.test(t)) return t;
-                            }
-                            return null;
-                        })()
-                    """,
-                    'returnByValue': True,
-                })
-                m = json.loads(await ws.recv())
-                if m.get('id') == 5:
-                    code = m.get('result', {}).get('result', {}).get('value')
-                    if code and len(code) >= 10:
-                        print('CODE:' + code, flush=True)
-                        return
-            await asyncio.sleep(0.5)
+        # --- Step B: wait for redirect to the callback page and extract the
+        # code via HTTP /json/list (see poll_targets_for_code) — the original
+        # page's websocket may already be dead from the cross-origin jump.
+        code = poll_targets_for_code(deadline)
+        if code:
+            print('CODE:' + code, flush=True)
+            return
 
         print('ERROR: No authorization code found after clicking Authorize.', flush=True)
         sys.exit(1)
