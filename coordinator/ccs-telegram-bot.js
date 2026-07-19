@@ -353,13 +353,19 @@ async function pollForStrayCodes() {
     if (!code) return;
     const sub = await run('bash', [BRIDGE, 'submit', email, code]);
     const out = (sub.stdout.trim() + '\n' + sub.stderr.trim()).trim();
+    // bridge submit kills the tmux session on both success AND failure (see
+    // ccs-login-bridge.sh cmd_submit), so pending must clear either way —
+    // otherwise a failed submit leaves pending stuck pointing at a dead
+    // session and this poller retries it every tick forever.
+    delete state.pending[email];
+    saveState();
     if (parseCcsAddResult(out, email).localAdded) {
-      delete state.pending[email];
       state.notified = state.notified.filter((e) => e !== email);
       saveState();
       await send(`✅ Code auto-recovered for ${email} (found in browser, no script was watching) and submitted successfully.`);
     } else {
       console.log(`pollForStrayCodes: submit failed for ${email}:`, out);
+      await send(`❌ Auto-recovered code for ${email} but submit failed (likely expired by the time it was found). Run /login ${email} again.`);
     }
   } catch (e) {
     console.error('pollForStrayCodes error:', e.message);
