@@ -1753,11 +1753,15 @@ probe_account_credential() {
         if [[ "${SWITCH_PROBE_RESULT:-}" == "invalid" ]]; then
             return 1
         fi
-        SWITCH_PROBE_RESULT=transient
-        SWITCH_PROBE_STATUS=remote
-        SWITCH_PROBE_REASON=stale_or_mismatched_snapshot
-        record_local_credential_health "$account_num" unknown "$SWITCH_PROBE_REASON" "$source_server" "$(credential_fingerprint "$credentials")" "$(( $(date +%s) * 1000 ))"
-        return 2
+        # Stale/mismatched remote snapshot is inconclusive, not a verdict — fall
+        # through to a direct HTTP probe below instead of trusting stale remote
+        # metadata. Otherwise a coordinator with a lagging/mismatched snapshot
+        # permanently quarantines a possibly-healthy account every rate-check
+        # tick, since it's never actually tested against the real API.
+        SWITCH_PROBE_RESULT=""
+        SWITCH_PROBE_STATUS=""
+        SWITCH_PROBE_REASON=""
+        record_local_credential_health "$account_num" unknown stale_or_mismatched_snapshot "$source_server" "$(credential_fingerprint "$credentials")" "$(( $(date +%s) * 1000 ))"
     fi
 
     report_probe_health() {
