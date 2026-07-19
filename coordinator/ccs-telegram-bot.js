@@ -45,9 +45,9 @@ if (require.main === module && (!TOKEN || !CHAT_ID)) {
 // pending:  email -> true, awaiting a code reply.
 // users:    authorized chat IDs (strings). Seeded once from TELEGRAM_CHAT_ID
 //           (bootstrap owner), then managed at runtime via /adduser /deluser.
-let state = { notified: [], pending: {}, users: [] };
+let state = { notified: [], pending: {}, users: [], autologinAttempted: [] };
 try {
-  state = { notified: [], pending: {}, users: [], ...JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')) };
+  state = { notified: [], pending: {}, users: [], autologinAttempted: [], ...JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')) };
 } catch { /* first run: defaults */ }
 
 // Bootstrap the owner from env on first run (or if the list was emptied).
@@ -55,9 +55,14 @@ if (state.users.length === 0) {
   state.users.push(CHAT_ID);
 }
 
-// Email of an in-flight /autologin, or null. One at a time: the flow owns the
+// Email of an in-flight autologin, or null. One at a time: the flow owns the
 // single remote Chrome/CDP port, two runs would stomp each other's tabs.
 let autologinRunning = null;
+
+// Auto-queue for expired accounts (detect() feeds this). No retry: an email
+// that fails autologin is marked in `autologinAttempted` and won't be
+// re-queued until it recovers and expires again (mirrors `notified`).
+let autologinQueue = [];
 
 function saveState() {
   try {
@@ -211,6 +216,55 @@ function emailToNum(accounts, email) {
   return hit ? hit.num : '?';
 }
 
+// Run automated re-login for one account and notify start/result. Shared by
+// the manual /autologin command and the auto-queue worker. No retry on
+// failure — caller decides whether to mark it as attempted (queue does;
+// manual /autologin doesn't, so a human can immediately retry).
+async function runAutologin(email, num, { manual } = {}) {
+  autologinRunning = email;
+  const source = manual ? '/autologin' : 'auto-queue';
+  await send(`🤖 Autologin (${source}) started for account ${num} (${email})… (~1-2 min)`);
+  try {
+    const r = await run('bash', [OPEN_OAUTH, '--auto-click', email], 300000);
+    autologinRunning = null;
+    const out = (r.stdout.trim() + '\n' + r.stderr.trim()).trim();
+    if (parseCcsAddResult(out, email).localAdded) {
+      const publish = await verifyCoordinatorPublish(out, email);
+      if (publish.localAdded && publish.coordinator === 'accepted') {
+        delete state.pending[email];
+        state.notified = state.notified.filter((e) => e !== email);
+        saveState();
+        await send(`✅ Autologin OK: account ${num} (${email}) re-logged in and published.`);
+        return true;
+      }
+      await send(coordinatorFailureMessage(email, `/autologin ${num}`, publish.coordinator));
+      return false;
+    }
+    await send(`❌ Autologin failed for account ${num} (${email}). No retry queued — run /autologin ${num} or /login ${num} manually.`);
+    return false;
+  } catch (e) {
+    autologinRunning = null;
+    await send(`❌ Autologin crashed for account ${num} (${email}): ${e.message}. No retry queued — fallback: /login ${num}`);
+    return false;
+  }
+}
+
+// Drain autologinQueue one at a time (autologinRunning is the mutex already
+// enforced by runAutologin's single Chrome/CDP port). Each entry attempted
+// exactly once: success or failure both mark it done, never re-enqueued
+// until the account recovers and expires again.
+async function processAutologinQueue() {
+  if (autologinRunning) return; // a manual /autologin or prior queue run owns it
+  const next = autologinQueue.shift();
+  if (!next) return;
+  if (!state.autologinAttempted.includes(next.email)) {
+    state.autologinAttempted.push(next.email);
+    saveState();
+  }
+  await runAutologin(next.email, next.num, { manual: false });
+  setImmediate(processAutologinQueue); // pick up whatever queued while we ran
+}
+
 // ---- detect loop ----
 const REAP_AGE = Number(process.env.CCS_BOT_REAP_AGE || 900); // seconds
 
@@ -236,18 +290,22 @@ async function detect() {
   try { ({ expired, all, accounts } = await listExpired()); }
   catch (e) { console.error('detect: ccs ls failed:', e.message); return; }
 
-  // Recovered accounts drop out of `notified` so re-expiry re-notifies.
+  // Recovered accounts drop out of `notified`/`autologinAttempted` so a later
+  // re-expiry re-notifies and re-queues.
   state.notified = state.notified.filter((e) => expired.has(e));
+  state.autologinAttempted = state.autologinAttempted.filter((e) => expired.has(e));
 
   for (const email of expired) {
     if (state.notified.includes(email)) continue; // already announced this expiry
     state.notified.push(email);
     saveState();
     const num = emailToNum(accounts, email);
-    // Notify only — do NOT auto-start a login (an unanswered auto-URL just
-    // spawns zombie sessions). The user triggers login explicitly with /login.
-    await send(`⚠️ Account ${num} expired: ${email}\nPlease re-login: /login ${num}`);
+    await send(`⚠️ Account ${num} expired: ${email}\nQueuing automated re-login…`);
+    if (!state.autologinAttempted.includes(email) && !autologinQueue.some((q) => q.email === email)) {
+      autologinQueue.push({ email, num });
+    }
   }
+  processAutologinQueue();
 }
 
 // Run `bridge start <email>`, DM the URL + instructions, mark pending. Shared
@@ -343,28 +401,7 @@ async function handleCommand(text, from) {
       const email = await numToEmail(arg);
       if (!email) { await reply(`No account numbered ${arg}. See /status.`); return true; }
       if (autologinRunning) { await reply(`Autologin already running for ${autologinRunning} — wait for it to finish.`); return true; }
-      autologinRunning = email;
-      await send(`🤖 Autologin started for account ${arg} (${email})… (~1-2 min)`);
-      // Async: don't block the reply loop while the flow runs.
-      run('bash', [OPEN_OAUTH, '--auto-click', email], 300000).then(async (r) => {
-        autologinRunning = null;
-        const out = (r.stdout.trim() + '\n' + r.stderr.trim()).trim();
-        if (parseCcsAddResult(out, email).localAdded) {
-          const publish = await verifyCoordinatorPublish(out, email);
-          if (publish.localAdded && publish.coordinator === 'accepted') {
-            delete state.pending[email];
-            saveState();
-            await send(`✅ Autologin OK: account ${arg} (${email}) re-logged in and published.`);
-          } else {
-            await send(coordinatorFailureMessage(email, `/autologin ${arg}`, publish.coordinator));
-          }
-        } else {
-          await send(`❌ Autologin failed for account ${arg} (${email}). Retry: /autologin ${arg} or /login ${arg}`);
-        }
-      }).catch(async (e) => {
-        autologinRunning = null;
-        await send(`❌ Autologin crashed for account ${arg} (${email}). Fallback: /login ${arg}`);
-      });
+      runAutologin(email, arg, { manual: true }); // async, don't block the reply loop
       return true;
     }
     case '/pending': {
