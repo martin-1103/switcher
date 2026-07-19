@@ -33,6 +33,9 @@ const OPEN_OAUTH = process.env.CCS_OPEN_OAUTH ||
 const STATE_FILE = process.env.CCS_BOT_STATE_FILE ||
   '/var/lib/ccs-coordinator/telegram-bot-state.json';
 const DETECT_INTERVAL_MS = Number(process.env.CCS_BOT_DETECT_INTERVAL || 300) * 1000;
+const GASS_SSH = process.env.CCS_GASS_SSH || '/root/cc-account-switcher/connectgass.sh';
+const CDP_PORT = process.env.CCS_CDP_PORT || '9333';
+const CODE_POLL_INTERVAL_MS = Number(process.env.CCS_BOT_CODE_POLL_INTERVAL || 5) * 1000;
 
 if (require.main === module && (!TOKEN || !CHAT_ID)) {
   console.error('TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are required');
@@ -316,6 +319,55 @@ async function detect() {
   processAutologinQueue();
 }
 
+// Independent poller for OAuth codes that never got auto-submitted — e.g. a
+// human clicked Authorize manually (captcha blocked the scripted click) after
+// the --auto-click script that would have caught it already exited. Only one
+// remote Chrome/CDP instance exists (same constraint as runAutologin), so a
+// code found there can only belong to whichever single email is pending; with
+// more than one pending, attribution is ambiguous and this poller skips it —
+// same ambiguity the rest of this codebase already accepts for one CDP port.
+let codePollBusy = false;
+async function pollForStrayCodes() {
+  if (codePollBusy) return;
+  const pendingEmails = Object.keys(state.pending);
+  if (pendingEmails.length !== 1) return;
+  const email = pendingEmails[0];
+  if (autologinRunning === email) return; // --auto-click script already owns this code
+  codePollBusy = true;
+  try {
+    const r = await run('bash', [GASS_SSH, `curl -s --max-time 5 http://localhost:${CDP_PORT}/json/list`], 15000);
+    if (r.code !== 0) return;
+    let targets;
+    try { targets = JSON.parse(r.stdout); } catch { return; }
+    let code = null;
+    for (const t of targets) {
+      const url = t.url || '';
+      if (!url.includes('/oauth/code/callback')) continue;
+      const qs = url.split('?', 2)[1];
+      if (!qs) continue;
+      const params = new URLSearchParams(qs);
+      const c = params.get('code');
+      const s = params.get('state');
+      if (c && c !== 'true') { code = c + (s ? '#' + s : ''); break; }
+    }
+    if (!code) return;
+    const sub = await run('bash', [BRIDGE, 'submit', email, code]);
+    const out = (sub.stdout.trim() + '\n' + sub.stderr.trim()).trim();
+    if (parseCcsAddResult(out, email).localAdded) {
+      delete state.pending[email];
+      state.notified = state.notified.filter((e) => e !== email);
+      saveState();
+      await send(`✅ Code auto-recovered for ${email} (found in browser, no script was watching) and submitted successfully.`);
+    } else {
+      console.log(`pollForStrayCodes: submit failed for ${email}:`, out);
+    }
+  } catch (e) {
+    console.error('pollForStrayCodes error:', e.message);
+  } finally {
+    codePollBusy = false;
+  }
+}
+
 // Run `bridge start <email>`, DM the URL + instructions, mark pending. Shared
 // by the detect loop and the /login command. Returns true on success.
 async function startLogin(email, num, header) {
@@ -566,6 +618,7 @@ if (require.main === module) {
   console.log(`ccs-telegram-bot up. detect every ${DETECT_INTERVAL_MS / 1000}s, ${state.users.length} authorized user(s).`);
   detect();
   setInterval(detect, DETECT_INTERVAL_MS);
+  setInterval(pollForStrayCodes, CODE_POLL_INTERVAL_MS);
   poll();
 }
 
