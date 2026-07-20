@@ -355,7 +355,7 @@ async function logoutAndCloseBrowser(email) {
   const profile = email.split('@')[0];
   try {
     await run('bash', [GASS_SSH, `curl -s --max-time 30 -X PUT 'http://localhost:${CDP_PORT}/json/new?https%3A%2F%2Fclaude.ai%2Flogout'`], 35000);
-    await new Promise((res) => setTimeout(res, 2000));
+    await new Promise((res) => setTimeout(res, 3000));
   } catch (e) {
     console.error(`logoutAndCloseBrowser: logout nav failed for ${email}:`, e.message);
   }

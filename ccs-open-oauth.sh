@@ -259,7 +259,7 @@ PYEOF
             # doesn't stay signed in as this account (next open/oauth for a
             # different account would otherwise silently authorize as this one).
             bash "$SSH" "curl -s --max-time 30 -X PUT 'http://localhost:${CDP_PORT}/json/new?https%3A%2F%2Fclaude.ai%2Flogout'" >/dev/null
-            sleep 2
+            sleep 3
         else
             echo "✗ Bridge submit failed (exit $submit_exit)"
         fi
