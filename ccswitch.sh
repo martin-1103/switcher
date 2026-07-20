@@ -45,14 +45,6 @@ readonly SWITCH_TRANSIENT_COOLDOWN_S=30
 readonly SWITCH_INVALID_QUARANTINE_S=86400
 readonly SWITCH_COOLDOWN_DIR="$BACKUP_DIR/.switch-cooldown"
 readonly COORD_EVENT_CURSOR_FILE="$BACKUP_DIR/coord-event-cursor"
-# Keepalive backoff state: once the OAuth refresh endpoint (POST
-# /v1/oauth/token) returns 429, back off the WHOLE keepalive run (not just
-# that account) since observed 429s rotate across different accounts on this
-# host — proof the limit is shared (client_id/IP), not per-token. Retrying
-# every fixed 15min just wastes calls into a still-blocked window.
-readonly KEEPALIVE_BACKOFF_FILE="$BACKUP_DIR/keepalive-backoff.json"
-readonly KEEPALIVE_BACKOFF_BASE_S=900
-readonly KEEPALIVE_BACKOFF_MAX_S=14400
 
 # Global flags (set during argument parsing)
 DRY_RUN=false
@@ -1035,11 +1027,11 @@ write_account_credentials_if_active() {
     fi
 }
 
-# Note: does NOT refresh on 401. Token refresh is owned solely by cmd_keepalive
-# (see its header comment) so there is exactly one place that calls
-# platform.claude.com/v1/oauth/token and one cooldown/lead-window governing it.
-# A 401 here just means the access token is expired; the caller gets a plain
-# failure and the next keepalive run (<=15min away) will refresh it.
+# Note: does NOT refresh on 401. There is no reactive/proactive refresh path
+# left — Claude Code itself owns the live token and rotates it in place;
+# sync_active_credentials_to_backup mirrors that rotation to the backup and
+# coordinator. A 401 here just means the live access token is expired; the
+# caller gets a plain failure and the next live rotation heals it.
 # ===== USAGE FETCH =====
 fetch_usage_for_account() {
     local email="$1"
@@ -1587,8 +1579,8 @@ fetch_oauth_profile_email() {
 # Same live endpoint as fetch_oauth_profile_email, but returns email and
 # uuid together (tab-separated) from a single call. Use this over calling
 # fetch_oauth_profile_email + fetch_oauth_profile_uuid separately whenever a
-# caller needs both — two separate calls can straddle a token change (e.g.
-# keepalive/re-login landing between them) and pair up the wrong account's
+# caller needs both — two separate calls can straddle a token change (e.g. a
+# re-login landing between them) and pair up the wrong account's
 # uuid with the wrong account's email.
 fetch_oauth_profile() {
     local access_token="$1"
@@ -1898,35 +1890,6 @@ clear_switch_cooldown() {
     rm -rf "$SWITCH_COOLDOWN_DIR-$account_num" 2>/dev/null || true
 }
 
-# mkdir-based lock guarding keepalive-backoff.json's read-modify-write.
-# Without it, two overlapping `ccs keepalive` runs (manual invocation racing
-# the timer) can both read lastBackoffS=0 and both write 900 (backoff never
-# escalates), or a run that just succeeded can rm the backoff file right
-# after a still-blocked run wrote a fresh one (undoing the backoff entirely).
-KEEPALIVE_BACKOFF_LOCK_DIR="$BACKUP_DIR/.keepalive-backoff.lock"
-acquire_keepalive_backoff_lock() {
-    local timeout_s="${1:-5}"
-    local max_iters=$(( timeout_s * 5 ))
-    local i=0
-    mkdir -p "$BACKUP_DIR" 2>/dev/null || true
-    while ! mkdir "$KEEPALIVE_BACKOFF_LOCK_DIR" 2>/dev/null; do
-        local owner=""
-        owner=$(cat "$KEEPALIVE_BACKOFF_LOCK_DIR/pid" 2>/dev/null || true)
-        if [[ -n "$owner" ]] && ! kill -0 "$owner" 2>/dev/null; then
-            rm -rf "$KEEPALIVE_BACKOFF_LOCK_DIR" 2>/dev/null || true
-            continue
-        fi
-        i=$(( i + 1 ))
-        [[ "$i" -ge "$max_iters" ]] && return 1
-        sleep 0.2
-    done
-    echo "$$" > "$KEEPALIVE_BACKOFF_LOCK_DIR/pid" 2>/dev/null || true
-    return 0
-}
-release_keepalive_backoff_lock() {
-    rm -rf "$KEEPALIVE_BACKOFF_LOCK_DIR" 2>/dev/null || true
-}
-
 mark_account_auth_invalid() {
     local account_num="$1"
     local reason="$2"
@@ -1970,222 +1933,6 @@ headless_auth_smoke() {
     out=$(claude -p 'Reply exactly: HEADLESS_OK' 2>&1)
     rc=$?
     [[ "$rc" -eq 0 && "$out" == *"HEADLESS_OK"* ]]
-}
-
-# Update tokens while preserving the credential JSON shape Claude Code expects.
-update_credential_tokens() {
-    local creds="$1"
-    local access_token="$2"
-    local refresh_token="$3"
-
-    local refreshed_at
-    refreshed_at=$(( $(date +%s) * 1000 ))
-
-    echo "$creds" | jq \
-        --arg at "$access_token" \
-        --arg rt "$refresh_token" \
-        --argjson refreshedAt "$refreshed_at" '
-        if has("claudeAiOauth") then
-            .claudeAiOauth.accessToken = $at |
-            .claudeAiOauth.refreshToken = $rt |
-            .claudeAiOauth.credentialUpdatedAt = $refreshedAt
-        else
-            .access_token = $at |
-            .refresh_token = $rt |
-            .credentialUpdatedAt = $refreshedAt
-        end
-    ' 2>/dev/null
-}
-
-# Call the OAuth refresh endpoint directly for one credential blob (no usage
-# API call first). Returns the updated credentials JSON on stdout on success.
-# Exit codes distinguish WHY it failed, since "no new token" alone conflates a
-# dead refresh_token with the endpoint's own rate limit:
-#   0 = success
-#   1 = no refresh_token to use (setup-token account, or malformed creds)
-#   2 = 429 from the refresh endpoint itself — transient, NOT proof the token
-#       is dead; retry on a later keepalive run
-#   3 = definitive rejection (4xx other than 429, e.g. invalid_grant) — the
-#       refresh_token is actually dead
-#   4 = network/other failure (timeout, 5xx, malformed response) — transient
-refresh_credential_tokens() {
-    local creds="$1"
-    local connect_timeout="${CCS_CURL_CONNECT_TIMEOUT:-$DEFAULT_CURL_CONNECT_TIMEOUT}"
-    local max_time="${CCS_CURL_MAX_TIME:-$DEFAULT_CURL_MAX_TIME}"
-    local client_id="9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-
-    local refresh_token
-    refresh_token=$(credential_refresh_token "$creds")
-    [[ -n "$refresh_token" ]] || return 1
-
-    local refresh_response refresh_code refresh_body new_access new_refresh
-    refresh_response=$(curl -sS -w "\n%{http_code}" \
-        --connect-timeout "$connect_timeout" \
-        --max-time "$max_time" \
-        -X POST \
-        --data-urlencode "grant_type=refresh_token" \
-        --data-urlencode "refresh_token=$refresh_token" \
-        --data-urlencode "client_id=$client_id" \
-        "https://platform.claude.com/v1/oauth/token" 2>/dev/null) || return 4
-    refresh_code=$(echo "$refresh_response" | tail -n1)
-    refresh_body=$(echo "$refresh_response" | sed '$d')
-    if [[ "$refresh_code" != "200" ]]; then
-        [[ "$refresh_code" == "429" ]] && return 2
-        [[ "$refresh_code" =~ ^4[0-9][0-9]$ ]] && return 3
-        return 4
-    fi
-
-    new_access=$(echo "$refresh_body" | jq -r '.access_token // empty' 2>/dev/null)
-    new_refresh=$(echo "$refresh_body" | jq -r '.refresh_token // empty' 2>/dev/null)
-    [[ -n "$new_access" ]] || return 4
-
-    update_credential_tokens "$creds" "$new_access" "${new_refresh:-$refresh_token}"
-}
-
-# Refresh every managed account's refresh_token before its access token expires.
-# This is the SOLE refresh path (fetch_usage_for_account no longer refreshes
-# reactively on 401 — see its header comment). The timer runs every 15min
-# (coordinator/ccs-keepalive.timer) so it catches tokens well before their
-# ~4h access-token lifetime runs out, instead of a fixed 6h schedule that could
-# leave a token dead for hours after it expired.
-#
-# --min-age is now a pure anti-hammer floor (default 5min), NOT the refresh
-# trigger: the actual trigger is "expiresAt within lead_seconds" below. This
-# guards against overlapping/duplicate keepalive runs re-refreshing the same
-# account seconds apart, nothing more.
-# ===== KEEPALIVE (sole OAuth refresh path) =====
-cmd_keepalive() {
-    local min_age=300
-    local lead_seconds=1800
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --min-age)
-                min_age="$2"
-                shift 2
-                ;;
-            --lead-seconds)
-                lead_seconds="$2"
-                shift 2
-                ;;
-            *)
-                shift
-                ;;
-        esac
-    done
-
-    [[ -f "$SEQUENCE_FILE" ]] || { echo "Error: No accounts configured"; exit 1; }
-
-    local now_epoch
-    now_epoch=$(date +%s)
-
-    # Global backoff gate: a 429 on ANY account in a prior run means the whole
-    # bucket (client_id/IP-shared, per observed rotation across accounts
-    # 13/16/17/12) is blocked, not just that one token. Skip the entire run
-    # until next_allowed_epoch instead of burning calls into a still-blocked
-    # window every fixed 15min. Locked so an overlapping run (manual `ccs
-    # keepalive` racing the timer) can't read a stale value mid-write by
-    # another run.
-    acquire_keepalive_backoff_lock 5 || true
-    trap 'release_keepalive_backoff_lock' RETURN
-    if [[ -f "$KEEPALIVE_BACKOFF_FILE" ]]; then
-        local backoff_next
-        backoff_next=$(jq -r '.nextAllowedEpoch // 0' "$KEEPALIVE_BACKOFF_FILE" 2>/dev/null || echo 0)
-        [[ "$backoff_next" =~ ^[0-9]+$ ]] || backoff_next=0
-        if (( now_epoch < backoff_next )); then
-            echo "Skipped entire run: refresh endpoint backoff active until $(date -u -d "@$backoff_next" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "$backoff_next")"
-            return 0
-        fi
-    fi
-    release_keepalive_backoff_lock
-
-    local nums
-    nums=$(jq -r '.accounts | keys[]' "$SEQUENCE_FILE" 2>/dev/null)
-
-    # Order candidates: still-alive tokens first (soonest expiry first),
-    # already-expired ones last. A dead account whose refresh 429s aborts the
-    # whole run (shared bucket, see above), so zombies must not burn the run
-    # before healthy tokens get their refresh in.
-    # ponytail: re-reads each credential file once for ordering; cache it in the loop if account count ever hurts.
-    local order_num order_email order_creds order_exp order_flag ordered
-    ordered=$(for order_num in $nums; do
-        order_email=$(jq -r --arg num "$order_num" '.accounts[$num].email // empty' "$SEQUENCE_FILE")
-        [[ -n "$order_email" ]] || continue
-        order_creds=$(read_account_credentials "$order_num" "$order_email")
-        order_exp=$(credential_expires_epoch "$order_creds")
-        [[ "$order_exp" =~ ^[0-9]+$ ]] || order_exp=0
-        order_flag=0
-        (( order_exp != 0 && order_exp < now_epoch )) && order_flag=1
-        printf '%s %020d %s\n' "$order_flag" "$order_exp" "$order_num"
-    done | sort | awk '{print $3}')
-
-    local num email creds last_refresh updated_creds expires_at refresh_status
-    for num in $ordered; do
-        email=$(jq -r --arg num "$num" '.accounts[$num].email // empty' "$SEQUENCE_FILE")
-        [[ -n "$email" ]] || continue
-
-        last_refresh=$(jq -r --arg num "$num" '.accounts[$num].lastKeepaliveAt // 0' "$SEQUENCE_FILE" 2>/dev/null || echo 0)
-        [[ "$last_refresh" =~ ^[0-9]+$ ]] || last_refresh=0
-        if [[ $((now_epoch - last_refresh)) -lt "$min_age" ]]; then
-            echo "Account-$num ($email): skipped, refreshed recently"
-            continue
-        fi
-
-        creds=$(read_account_credentials "$num" "$email")
-        if [[ -z "$(credential_access_token "$creds")" ]]; then
-            log_credential_event "keepalive Account-$num ($email): skipped, no usable local credential"
-            echo "Account-$num ($email): skipped, no usable local credential"
-            continue
-        fi
-        if [[ -z "$(credential_refresh_token "$creds")" ]]; then
-            echo "Account-$num ($email): skipped, long-lived setup-token (no refresh needed)"
-            continue
-        fi
-
-        expires_at=$(credential_expires_epoch "$creds")
-        if [[ "$expires_at" -ne 0 && $((expires_at - now_epoch)) -gt "$lead_seconds" ]]; then
-            echo "Account-$num ($email): skipped, not near expiry yet (expires in $((expires_at - now_epoch))s)"
-            continue
-        fi
-
-        updated_creds=$(refresh_credential_tokens "$creds") && refresh_status=0 || refresh_status=$?
-        if [[ "$refresh_status" -eq 0 ]] && credential_is_usable "$updated_creds"; then
-            write_account_credentials "$num" "$email" "$updated_creds"
-            write_account_credentials_if_active "$email" "$updated_creds"
-            coord_publish_credential "$email" "$updated_creds" || true
-            local seq
-            seq=$(jq --arg num "$num" --arg now "$now_epoch" '.accounts[$num].lastKeepaliveAt = ($now | tonumber)' "$SEQUENCE_FILE")
-            write_json "$SEQUENCE_FILE" "$seq"
-            log_credential_event "keepalive Account-$num ($email): refreshed"
-            echo "Account-$num ($email): refreshed"
-            acquire_keepalive_backoff_lock 5 || true
-            rm -f "$KEEPALIVE_BACKOFF_FILE" 2>/dev/null || true
-            release_keepalive_backoff_lock
-        elif [[ "$refresh_status" -eq 2 ]]; then
-            local prev_backoff next_backoff next_allowed
-            acquire_keepalive_backoff_lock 5 || true
-            prev_backoff=$(jq -r '.lastBackoffS // 0' "$KEEPALIVE_BACKOFF_FILE" 2>/dev/null || echo 0)
-            [[ "$prev_backoff" =~ ^[0-9]+$ ]] || prev_backoff=0
-            if (( prev_backoff <= 0 )); then
-                next_backoff=$KEEPALIVE_BACKOFF_BASE_S
-            else
-                next_backoff=$(( prev_backoff * 2 ))
-                (( next_backoff > KEEPALIVE_BACKOFF_MAX_S )) && next_backoff=$KEEPALIVE_BACKOFF_MAX_S
-            fi
-            next_allowed=$(( now_epoch + next_backoff ))
-            jq -n --argjson n "$next_allowed" --argjson b "$next_backoff" \
-                '{nextAllowedEpoch: $n, lastBackoffS: $b}' > "$KEEPALIVE_BACKOFF_FILE" 2>/dev/null || true
-            release_keepalive_backoff_lock
-            log_credential_event "keepalive Account-$num ($email): refresh endpoint rate-limited (429), backing off ${next_backoff}s, aborting run"
-            echo "Account-$num ($email): refresh endpoint rate-limited (429), backing off ${next_backoff}s, aborting run"
-            break
-        elif [[ "$refresh_status" -eq 3 ]]; then
-            log_credential_event "keepalive Account-$num ($email): refresh_token rejected (invalid_grant, likely dead)"
-            echo "Account-$num ($email): refresh_token rejected (invalid_grant, likely dead)"
-        else
-            log_credential_event "keepalive Account-$num ($email): refresh failed (network/transient error)"
-            echo "Account-$num ($email): refresh failed (network/transient error)"
-        fi
-    done
 }
 
 # Write credentials based on platform
@@ -2731,8 +2478,8 @@ read_account_credentials() {
 }
 
 # Copy ~/.claude/.credentials.json into the active account's backup whenever
-# Claude Code itself has silently refreshed the live token (no network call
-# here — this is pure local file sync, NOT the killed keepalive refresh path).
+# Claude Code itself has silently rotated the live token (no network call here
+# — pure local file sync; this is the ONLY path that keeps backups fresh).
 # Piggybacked onto cmd_rate_check (already invoked by statusline every ~10s
 # and by the hook) instead of a new timer/daemon: an extra unit to keep alive
 # forever isn't worth it when the existing polling cadence gets the backup
@@ -2779,9 +2526,9 @@ sync_active_credentials_to_backup() {
     write_account_credentials "$active_num" "$active_email" "$live_creds"
     release_switch_lock
     # Publish to the coordinator too — without this, other hosts sharing this
-    # account only learn of the refresh at the next explicit switch (perform_switch
-    # publishes there), which no longer happens proactively now that keepalive is
-    # dead. Fail-open: coord_publish_credential already no-ops on any error.
+    # account only learn of the rotation at the next explicit switch
+    # (perform_switch publishes there), which may not happen for a long time.
+    # Fail-open: coord_publish_credential already no-ops on any error.
     coord_publish_credential "$active_email" "$live_creds" || true
     log_credential_event "synced live credentials to backup for Account-$active_num ($active_email) (caller=sync_active_credentials_to_backup)"
 }
@@ -3790,7 +3537,7 @@ cmd_add_account() {
     # Read credentials ONCE and derive both email and uuid from that same
     # token via a single live-profile call. Reading credentials twice (once
     # for email, once for uuid) leaves a window where a concurrent
-    # login/keepalive swaps the token in between, pairing one account's
+    # login swaps the token in between, pairing one account's
     # email with a different account's uuid in the backup.
     local current_creds current_config
     current_creds=$(read_credentials)
@@ -4667,8 +4414,8 @@ perform_switch() {
         log_credential_event "synthesized missing config for Account-$target_account ($target_email) from live profile (caller=perform_switch)"
     fi
 
-    # Local backup is usable outright (e.g. keepalive refreshed it, or the
-    # user re-logged in and a fresh backup was written since the account was
+    # Local backup is usable outright (e.g. a live-token rotation was mirrored
+    # to it, or the user re-logged in and a fresh backup was written since the account was
     # last marked in cooldown) — clear any stale marker so reclaim isn't
     # blocked from switching back to a now-healthy account.
     credential_is_usable "$target_creds" && clear_switch_cooldown "$target_account"
@@ -4910,9 +4657,9 @@ fetch_usage_data() {
     local body
     body=$(echo "$response" | sed '$d')
 
-    # No reactive refresh here: cmd_keepalive is the sole refresh path (see its
-    # header comment). A 401 just means the access token expired; keepalive
-    # picks it up within its lead window (<=15min via the timer).
+    # No reactive refresh here. Claude Code owns the live token and rotates it
+    # in place; sync_active_credentials_to_backup mirrors that. A 401 just means
+    # the live access token expired and will heal on the next live rotation.
     if [[ "$http_code" != "200" ]]; then
         return 1
     fi
