@@ -354,8 +354,31 @@ async function pendingLoginEmails() {
 async function logoutAndCloseBrowser(email) {
   const profile = email.split('@')[0];
   try {
-    await run('bash', [GASS_SSH, `curl -s --max-time 30 -X PUT 'http://localhost:${CDP_PORT}/json/new?https%3A%2F%2Fclaude.ai%2Flogout'`], 35000);
-    await new Promise((res) => setTimeout(res, 3000));
+    const r = await run('bash', [GASS_SSH, `curl -s --max-time 30 -X PUT 'http://localhost:${CDP_PORT}/json/new?https%3A%2F%2Fclaude.ai%2Flogout'`], 35000);
+    const tabId = JSON.parse(r.stdout).id;
+    // Wait for the logout page's own load event (capped at 10s) instead of a
+    // blind delay, so a slow network doesn't close the browser before the
+    // logout request actually lands.
+    const waitCmd = `python3 - <<'PYEOF'
+import asyncio, websockets, json
+async def main():
+    uri = 'ws://localhost:${CDP_PORT}/devtools/page/${tabId}'
+    try:
+        async with websockets.connect(uri, max_size=10_000_000) as ws:
+            await ws.send(json.dumps({'id': 1, 'method': 'Page.enable', 'params': {}}))
+            await ws.recv()
+            deadline = asyncio.get_event_loop().time() + 10
+            while asyncio.get_event_loop().time() < deadline:
+                remaining = deadline - asyncio.get_event_loop().time()
+                m = json.loads(await asyncio.wait_for(ws.recv(), timeout=max(remaining, 0.1)))
+                if m.get('method') == 'Page.loadEventFired':
+                    print('logout page load event fired')
+                    return
+    except Exception as e:
+        print('logout wait: ' + str(e))
+asyncio.run(main())
+PYEOF`;
+    await run('bash', [GASS_SSH, waitCmd], 15000);
   } catch (e) {
     console.error(`logoutAndCloseBrowser: logout nav failed for ${email}:`, e.message);
   }
