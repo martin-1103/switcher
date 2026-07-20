@@ -35,6 +35,7 @@ const STATE_FILE = process.env.CCS_BOT_STATE_FILE ||
 const DETECT_INTERVAL_MS = Number(process.env.CCS_BOT_DETECT_INTERVAL || 300) * 1000;
 const GASS_SSH = process.env.CCS_GASS_SSH || '/root/cc-account-switcher/connectgass.sh';
 const CDP_PORT = process.env.CCS_CDP_PORT || '9333';
+const CHROME_SVC_PORT = process.env.CCS_CHROME_SVC_PORT || '9334';
 const CODE_POLL_INTERVAL_MS = Number(process.env.CCS_BOT_CODE_POLL_INTERVAL || 5) * 1000;
 
 if (require.main === module && (!TOKEN || !CHAT_ID)) {
@@ -344,6 +345,27 @@ async function pendingLoginEmails() {
   return emails;
 }
 
+// After a successful code submit, log the remote Chrome profile out of
+// claude.ai and close it — same cleanup ccs-open-oauth.sh does for the
+// --auto-click path, needed here too since pollForStrayCodes/handleText
+// submit codes without ever touching the browser afterward (profile was
+// staying signed in as this account, so the next login for a different
+// account risked silently authorizing as this one instead).
+async function logoutAndCloseBrowser(email) {
+  const profile = email.split('@')[0];
+  try {
+    await run('bash', [GASS_SSH, `curl -s --max-time 30 -X PUT 'http://localhost:${CDP_PORT}/json/new?https%3A%2F%2Fclaude.ai%2Flogout'`], 35000);
+    await new Promise((res) => setTimeout(res, 2000));
+  } catch (e) {
+    console.error(`logoutAndCloseBrowser: logout nav failed for ${email}:`, e.message);
+  }
+  try {
+    await run('bash', [GASS_SSH, `curl -s --max-time 30 -X POST 'http://localhost:${CHROME_SVC_PORT}/close?profile=${profile}'`], 35000);
+  } catch (e) {
+    console.error(`logoutAndCloseBrowser: close failed for ${email}:`, e.message);
+  }
+}
+
 // The `state` query param the OAuth URL for a live login session was started
 // with, read straight from the tmux pane ccs-login-bridge.sh's cmd_start left
 // behind (same regex it uses to find the URL). Returns null if no state is
@@ -416,6 +438,7 @@ async function pollForStrayCodes() {
     if (parseCcsAddResult(out, email).localAdded) {
       state.notified = state.notified.filter((e) => e !== email);
       saveState();
+      await logoutAndCloseBrowser(email);
       await send(`✅ Code auto-recovered for ${email} (found in browser, no script was watching) and submitted successfully.`);
     } else {
       console.log(`pollForStrayCodes: submit failed for ${email}:`, out);

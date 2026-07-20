@@ -255,6 +255,11 @@ PYEOF
         submit_exit=$?
         if [[ $submit_exit -eq 0 ]]; then
             echo "✓ Account added successfully for $EMAIL"
+            # Log the browser session out of claude.ai so the profile's Chrome
+            # doesn't stay signed in as this account (next open/oauth for a
+            # different account would otherwise silently authorize as this one).
+            bash "$SSH" "curl -s --max-time 30 -X PUT 'http://localhost:${CDP_PORT}/json/new?https%3A%2F%2Fclaude.ai%2Flogout'" >/dev/null
+            sleep 2
         else
             echo "✗ Bridge submit failed (exit $submit_exit)"
         fi
