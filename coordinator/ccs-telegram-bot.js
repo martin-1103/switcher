@@ -344,6 +344,20 @@ async function pendingLoginEmails() {
   return emails;
 }
 
+// The `state` query param the OAuth URL for a live login session was started
+// with, read straight from the tmux pane ccs-login-bridge.sh's cmd_start left
+// behind (same regex it uses to find the URL). Returns null if no state is
+// found — caller must not guess.
+async function sessionOAuthState(sess) {
+  const r = await run('tmux', ['capture-pane', '-J', '-p', '-t', sess]);
+  if (r.code !== 0) return null;
+  const m = r.stdout.match(/https:\/\/claude\.com\/cai\/oauth\/authorize[^\s]*/);
+  if (!m) return null;
+  const qs = m[0].split('?', 2)[1];
+  if (!qs) return null;
+  return new URLSearchParams(qs).get('state');
+}
+
 // Independent poller for OAuth codes that never got auto-submitted — e.g. a
 // human clicked Authorize manually (captcha blocked the scripted click) after
 // the --auto-click script that would have caught it already exited, OR a
@@ -366,6 +380,15 @@ async function pollForStrayCodes() {
   if (autologinRunning === email) return; // --auto-click script already owns this code
   codePollBusy = true;
   try {
+    // /json/list can still hold a stale target from a PRIOR attempt for this
+    // same email (old tab never closed) — matching by state ties the code to
+    // THIS session's own OAuth request, not just any callback URL that exists
+    // (a stale match here submits an old/already-dead code, which bridge
+    // submit's failure path then uses to kill the brand-new tmux session,
+    // making a fresh `bridge start` look like it "died on its own").
+    const sess = `ccslogin-${sanitizeForSession(email)}`;
+    const expectedState = await sessionOAuthState(sess);
+    if (!expectedState) return;
     const r = await run('bash', [GASS_SSH, `curl -s --max-time 5 http://localhost:${CDP_PORT}/json/list`], 15000);
     if (r.code !== 0) return;
     let targets;
@@ -379,7 +402,7 @@ async function pollForStrayCodes() {
       const params = new URLSearchParams(qs);
       const c = params.get('code');
       const s = params.get('state');
-      if (c && c !== 'true') { code = c + (s ? '#' + s : ''); break; }
+      if (c && c !== 'true' && s === expectedState) { code = c + '#' + s; break; }
     }
     if (!code) return;
     const sub = await run('bash', [BRIDGE, 'submit', email, code]);
