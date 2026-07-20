@@ -319,19 +319,50 @@ async function detect() {
   processAutologinQueue();
 }
 
+// Sanitize an email the same way ccs-login-bridge.sh's session_name() does
+// (`tr -c 'a-zA-Z0-9' '_'`), so a tmux session name can be mapped back to
+// the email that owns it.
+function sanitizeForSession(email) {
+  return String(email).replace(/[^a-zA-Z0-9]/g, '_');
+}
+
+// Find every live `ccslogin-*` tmux session and resolve it back to an email
+// via listAccounts() (so we only match known accounts, not garbage names).
+async function pendingLoginEmails() {
+  const r = await run('tmux', ['list-sessions', '-F', '#{session_name}']);
+  if (r.code !== 0) return [];
+  const sessions = r.stdout.split('\n').filter((l) => l.startsWith('ccslogin-'));
+  if (!sessions.length) return [];
+  let accounts = [];
+  try { accounts = await listAccounts(); } catch { return []; }
+  const emails = [];
+  for (const s of sessions) {
+    const name = s.slice('ccslogin-'.length);
+    const hit = accounts.find((a) => sanitizeForSession(a.email) === name);
+    if (hit) emails.push(hit.email);
+  }
+  return emails;
+}
+
 // Independent poller for OAuth codes that never got auto-submitted — e.g. a
 // human clicked Authorize manually (captcha blocked the scripted click) after
-// the --auto-click script that would have caught it already exited. Only one
-// remote Chrome/CDP instance exists (same constraint as runAutologin), so a
-// code found there can only belong to whichever single email is pending; with
-// more than one pending, attribution is ambiguous and this poller skips it —
-// same ambiguity the rest of this codebase already accepts for one CDP port.
+// the --auto-click script that would have caught it already exited, OR a
+// login was started outside the bot entirely (direct `ccs login`, a stray
+// bridge `start`). Detection is driven by the live `ccslogin-*` tmux session
+// itself (source of truth for "a login is in flight"), not state.pending —
+// state.pending is only ever set by the bot's own startLogin(), so it stays
+// blind to logins started any other way (this blind spot lost account 28's
+// code once already). Only one remote Chrome/CDP instance exists (same
+// constraint as runAutologin), so a code found there can only belong to
+// whichever single login session is in flight; with more than one, which tab
+// belongs to which email is ambiguous and this poller skips it — same
+// ambiguity the rest of this codebase already accepts for one CDP port.
 let codePollBusy = false;
 async function pollForStrayCodes() {
   if (codePollBusy) return;
-  const pendingEmails = Object.keys(state.pending);
-  if (pendingEmails.length !== 1) return;
-  const email = pendingEmails[0];
+  const emails = await pendingLoginEmails();
+  if (emails.length !== 1) return;
+  const email = emails[0];
   if (autologinRunning === email) return; // --auto-click script already owns this code
   codePollBusy = true;
   try {
