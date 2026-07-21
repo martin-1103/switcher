@@ -32,9 +32,23 @@ CDP_PORT="${CDP_PORT:-9333}"
 CHROME_SVC_PORT="${CHROME_SVC_PORT:-9334}"
 CHROME_PROFILE="${CHROME_PROFILE:-${EMAIL%%@*}}"
 
-# 0. Ask the ccs-chrome-service on the remote to open Chrome with this profile
-#    (kills any Chrome holding the CDP port with a wrong profile or headless
-#    mode, starts non-headless on the VNC display, waits for CDP).
+# 0. If a browser is already open (any profile), close it first — /open
+#    reuses a running Chrome for the SAME profile as-is (already_running:
+#    true, no restart), which leaves old tabs/targets around from a prior
+#    attempt. A stale tab's oauth callback URL got matched by the poller
+#    instead of the fresh one before (see commit d768c2b) — starting from a
+#    guaranteed-closed state avoids that class of bug entirely.
+status=$(bash "$SSH" "curl -s --max-time 10 http://localhost:${CHROME_SVC_PORT}/status")
+if [[ "$status" == *'"cdp_alive": true'* ]]; then
+    echo "chrome already open, closing first: $status"
+    running_profile=$(python3 -c "import json,sys; p=json.load(sys.stdin).get('profile') or ''; print(p.rsplit('/',1)[-1])" <<<"$status" 2>/dev/null)
+    [[ -n "$running_profile" ]] && bash "$SSH" "curl -s --max-time 30 -X POST 'http://localhost:${CHROME_SVC_PORT}/close?profile=${running_profile}'"
+    echo
+fi
+
+# Ask the ccs-chrome-service on the remote to open Chrome with this profile
+# (kills any Chrome holding the CDP port with a wrong profile or headless
+# mode, starts non-headless on the VNC display, waits for CDP).
 resp=$(bash "$SSH" "curl -s --max-time 60 -X POST -d 'profile=${CHROME_PROFILE}' http://localhost:${CHROME_SVC_PORT}/open")
 echo "chrome-service: $resp"
 [[ "$resp" == *'"started": true'* ]] \
