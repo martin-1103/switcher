@@ -114,6 +114,16 @@ function send(text, to) {
   ));
 }
 
+// One message with a tappable inline keyboard, private to `to`. `rows` is an
+// array of button rows, each row an array of {text, callback_data}.
+function sendKeyboard(text, rows, to) {
+  return tg('sendMessage', {
+    chat_id: String(to),
+    text,
+    reply_markup: { inline_keyboard: rows },
+  }).catch((e) => console.error(`sendKeyboard to ${to} failed:`, e.message));
+}
+
 // ---- bridge / ccs shell-outs ----
 function run(cmd, args, timeoutMs = 60000) {
   return new Promise((resolve) => {
@@ -564,6 +574,20 @@ async function handleCommand(text, from) {
       // Fully automated re-login: ccs-open-oauth --auto-click opens Chrome on
       // the gass server (chrome-service), clicks Authorize via CDP, captures
       // the code, submits it to the bridge, and closes Chrome. Takes ~1-2 min.
+      if (!arg) {
+        // No number given: offer expired accounts as tappable inline buttons
+        // instead of forcing the user to cross-reference /status by hand.
+        let expired, accounts;
+        try { ({ expired, accounts } = await listExpired()); }
+        catch (e) { await reply(`ccs ls failed: ${e.message}`); return true; }
+        if (!expired.size) { await reply('No expired accounts.'); return true; }
+        const buttons = [...expired].map((email) => {
+          const num = emailToNum(accounts, email);
+          return [{ text: `${num}: ${email}`, callback_data: `autologin:${num}` }];
+        });
+        await sendKeyboard('Pick an account to autologin:', buttons, from);
+        return true;
+      }
       if (!/^\d+$/.test(arg)) { await reply('Usage: /autologin <num> (account number from /status)'); return true; }
       const email = await numToEmail(arg);
       if (!email) { await reply(`No account numbered ${arg}. See /status.`); return true; }
@@ -714,9 +738,23 @@ async function handleText(text, from) {
 let offset = 0;
 async function poll() {
   try {
-    const updates = await tg('getUpdates', { offset, timeout: 50, allowed_updates: ['message'] });
+    const updates = await tg('getUpdates', { offset, timeout: 50, allowed_updates: ['message', 'callback_query'] });
     for (const u of updates) {
       offset = u.update_id + 1;
+      if (u.callback_query) {
+        const cq = u.callback_query;
+        const from = String(cq.from.id);
+        tg('answerCallbackQuery', { callback_query_id: cq.id }).catch((e) => console.error('answerCallbackQuery failed:', e.message));
+        if (!state.users.includes(from)) continue; // ignore taps from non-authorized chats
+        const m = /^autologin:(\d+)$/.exec(cq.data || '');
+        if (!m) continue;
+        const num = m[1];
+        const email = await numToEmail(num);
+        if (!email) { await send(`No account numbered ${num}. See /status.`, from); continue; }
+        if (autologinRunning) { await send(`Autologin already running for ${autologinRunning} — wait for it to finish.`, from); continue; }
+        runAutologin(email, num, { manual: true }); // async, don't block the reply loop
+        continue;
+      }
       const msg = u.message;
       if (!msg || !msg.text) continue;
       const from = String(msg.chat.id);
