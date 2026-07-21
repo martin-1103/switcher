@@ -780,9 +780,29 @@ async function poll() {
   setImmediate(poll);
 }
 
+// Registers Telegram's native "/" menu button with our command list. Runs
+// once at startup — not user-triggered, so a failure here is non-fatal.
+function registerCommands() {
+  const commands = [
+    { command: 'status', description: 'accounts + which are expired/pending' },
+    { command: 'login', description: 're-login <num|email>, or add a NEW account by email' },
+    { command: 'autologin', description: 'automated re-login <num>, or tap-to-pick if omitted' },
+    { command: 'retry', description: 're-queue expired accounts whose autologin already failed' },
+    { command: 'switch', description: 'switch active account to <num>' },
+    { command: 'pending', description: 'logins awaiting a code' },
+    { command: 'cancel', description: 'abandon a pending login <num>' },
+    { command: 'ids', description: 'list authorized users' },
+    { command: 'adduser', description: 'authorize another user <chat_id>' },
+    { command: 'deluser', description: 'remove an authorized user <chat_id>' },
+    { command: 'help', description: 'this message' },
+  ];
+  tg('setMyCommands', { commands }).catch((e) => console.error('setMyCommands failed:', e.message));
+}
+
 if (require.main === module) {
   saveState(); // persist bootstrapped user list
   console.log(`ccs-telegram-bot up. detect every ${DETECT_INTERVAL_MS / 1000}s, ${state.users.length} authorized user(s).`);
+  registerCommands();
   detect();
   setInterval(detect, DETECT_INTERVAL_MS);
   setInterval(pollForStrayCodes, CODE_POLL_INTERVAL_MS);
