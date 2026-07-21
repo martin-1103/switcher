@@ -500,6 +500,7 @@ const HELP = [
   '/status — accounts + which are expired/pending',
   '/login <num|email> — re-login an account, or add a NEW account by email',
   '/autologin <num> — fully automated re-login (remote Chrome + auto-click)',
+  '/retry — re-queue all expired accounts whose autologin already failed once',
   '/switch <num> — switch active account to <num>',
   '/pending — logins awaiting a code',
   '/cancel <num> — abandon a pending login',
@@ -568,6 +569,28 @@ async function handleCommand(text, from) {
       if (!email) { await reply(`No account numbered ${arg}. See /status.`); return true; }
       if (autologinRunning) { await reply(`Autologin already running for ${autologinRunning} — wait for it to finish.`); return true; }
       runAutologin(email, arg, { manual: true }); // async, don't block the reply loop
+      return true;
+    }
+    case '/retry': {
+      // Re-queue expired accounts whose autologin already failed once
+      // (autologinAttempted blocks them from the normal detect-loop
+      // auto-queue — see runAutologin's no-retry-on-failure comment).
+      // Skips accounts already running or already queued.
+      let expired, accounts;
+      try { ({ expired, accounts } = await listExpired()); }
+      catch (e) { await reply(`ccs ls failed: ${e.message}`); return true; }
+      const requeued = [];
+      for (const email of expired) {
+        if (email === autologinRunning) continue;
+        if (autologinQueue.some((q) => q.email === email)) continue;
+        state.autologinAttempted = state.autologinAttempted.filter((e) => e !== email);
+        const num = emailToNum(accounts, email);
+        autologinQueue.push({ email, num });
+        requeued.push(`${num}: ${email}`);
+      }
+      if (!requeued.length) { await reply('Nothing to retry — no expired accounts eligible (already running or queued).'); return true; }
+      await reply(`Re-queued for autologin:\n${requeued.join('\n')}`);
+      processAutologinQueue();
       return true;
     }
     case '/pending': {
