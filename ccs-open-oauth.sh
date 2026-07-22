@@ -298,6 +298,7 @@ PYEOF"
         else
             echo "✗ Bridge submit failed (exit $submit_exit)"
         fi
+        sleep 2
         # Done with the browser — close it via chrome-service.
         resp=$(bash "$SSH" "curl -s --max-time 30 -X POST 'http://localhost:${CHROME_SVC_PORT}/close?profile=${CHROME_PROFILE}'")
         echo "chrome-service: $resp"

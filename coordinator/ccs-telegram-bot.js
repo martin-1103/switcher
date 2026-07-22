@@ -393,6 +393,7 @@ PYEOF`;
     console.error(`logoutAndCloseBrowser: logout nav failed for ${email}:`, e.message);
   }
   try {
+    await new Promise((res) => setTimeout(res, 2000));
     await run('bash', [GASS_SSH, `curl -s --max-time 30 -X POST 'http://localhost:${CHROME_SVC_PORT}/close?profile=${profile}'`], 35000);
   } catch (e) {
     console.error(`logoutAndCloseBrowser: close failed for ${email}:`, e.message);
